@@ -1,0 +1,22 @@
+# 密钥与本地配置（绝不入库）
+keystore.properties
+local.properties
+release.keystore
+*.jks
+*.keystore
+
+# 构建产物
+app/build/
+build/
+.gradle/
+**/build/
+*.apk
+*.aab
+
+# 编译期生成文件
+*.flat
+*.class
+*.dex
+.idea/
+*.iml
+captures/

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- TV Banner - 320x180 dp for leanback launcher -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+
+    <!-- Background -->
+    <path
+        android:fillColor="#0C0E13"
+        android:pathData="M0,0h320v180H0z" />
+
+    <!-- Logo background -->
+    <path
+        android:fillColor="#E11D48"
+        android:pathData="M120,60h80v60h-80z" />
+
+    <!-- Play triangle -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M145,75l40,15l-40,15V75z" />
+
+    <!-- App name -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M120,135h80v10h-80z" />
+</vector>

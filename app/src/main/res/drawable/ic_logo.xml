@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 侧边栏 LOGO：圆角方块 + 播放三角，与 app 主题色一致 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="36dp"
+    android:height="36dp"
+    android:viewportWidth="36"
+    android:viewportHeight="36">
+    <!-- 圆角背景 -->
+    <path
+        android:fillColor="#E11D48"
+        android:pathData="M8,2 L28,2 A6,6 0 0 1 34,8 L34,28 A6,6 0 0 1 28,34 L8,34 A6,6 0 0 1 2,28 L2,8 A6,6 0 0 1 8,2 Z" />
+    <!-- 白色播放三角 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M14,11 L27,18 L14,25 Z" />
+</vector>
