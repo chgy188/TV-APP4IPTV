@@ -43,6 +43,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.focusTarget
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.foundation.focusable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -68,6 +70,7 @@ import com.example.composedtv.R
 import com.example.composedtv.player.PlayerEngine
 import com.example.composedtv.player.PlayerState
 import com.example.composedtv.player.PlaylistItem
+import com.example.composedtv.ui.components.SettingsDrawer
 import com.example.composedtv.ui.components.SidePanel
 import com.example.composedtv.viewmodel.ChannelEntry
 import com.example.composedtv.viewmodel.PlayerViewModel
@@ -108,6 +111,12 @@ fun PlayerScreen(
             Log.d("PlayerScreen", "收到重载信号，执行 manualReload")
             engine.manualReload()
         }
+    }
+
+    // 播放参数设置变化（或初始加载）→ 同步给 engine（MENU 设置抽屉调整即时生效）
+    LaunchedEffect(uiState.playbackSettings) {
+        Log.d("PlayerScreen", "applyPlaybackSettings: ${uiState.playbackSettings}")
+        engine.applyPlaybackSettings(uiState.playbackSettings)
     }
     val currentPlayer by engine.playerFlow.collectAsState()
     var engineInitialized by remember { mutableStateOf(false) }
@@ -153,9 +162,9 @@ fun PlayerScreen(
         runCatching { focusRequester.requestFocus() }
     }
 
-    // 侧边栏关闭时重新请求焦点（侧边栏内部的列表项会抢焦点，关闭后需归还）
-    LaunchedEffect(uiState.sidePanelVisible) {
-        if (!uiState.sidePanelVisible) {
+    // 侧边栏 / 设置抽屉关闭时重新请求焦点（内部列表项会抢焦点，关闭后需归还播放器容器）
+    LaunchedEffect(uiState.sidePanelVisible, uiState.settingsVisible) {
+        if (!uiState.sidePanelVisible && !uiState.settingsVisible) {
             kotlinx.coroutines.delay(150)
             runCatching { focusRequester.requestFocus() }
         }
@@ -191,9 +200,14 @@ fun PlayerScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            // 焦点管理：确保容器可聚焦并持有焦点
+            // 焦点管理：容器持有焦点；但面板/抽屉打开时禁止自己作为焦点目标(canFocus=false)，
+            // 让焦点留在面板/抽屉内部列表项上。注意不能用 focusable()，它会拦截 D-pad 做焦点导航，
+            // 导致 onPreviewKeyEvent 收不到上下键、切台失效。focusProperties 只控制焦点归属，不影响按键派发。
             .focusRequester(focusRequester)
             .focusTarget()
+            .focusProperties {
+                canFocus = !uiState.settingsVisible && !uiState.sidePanelVisible
+            }
             // 双重按键监听：onPreviewKeyEvent（事件下沉阶段）+ onKeyEvent（事件上浮阶段）
             // 某些 Android TV 设备/PlayerView 可能在下沉阶段消费掉事件，此时上浮阶段仍能捕获
             .onPreviewKeyEvent { event ->
@@ -201,6 +215,7 @@ fun PlayerScreen(
                     event = event,
                     playerState = playerState,
                     sidePanelVisible = uiState.sidePanelVisible,
+                    settingsVisible = uiState.settingsVisible,
                     engine = engine,
                     vm = vm,
                     onExit = onExit,
@@ -216,6 +231,7 @@ fun PlayerScreen(
                     event = event,
                     playerState = playerState,
                     sidePanelVisible = uiState.sidePanelVisible,
+                    settingsVisible = uiState.settingsVisible,
                     engine = engine,
                     vm = vm,
                     onExit = onExit,
@@ -280,7 +296,10 @@ fun PlayerScreen(
                 view.isFocusableInTouchMode = false
                 view.isClickable = false
             },
-            modifier = Modifier.fillMaxSize()
+            // 设置抽屉打开时，连 Compose 焦点层也阻断播放器，确保焦点不会留在播放器上
+            modifier = Modifier
+                .fillMaxSize()
+                .focusable(enabled = !uiState.settingsVisible)
         )
 
         // 加载中 spinner
@@ -334,18 +353,19 @@ fun PlayerScreen(
 
         // 底部遥控器操作说明（与信息条同显隐，避免常驻遮挡画面）
         if (playerState.showInfo && playerState.playlistSize > 0) {
-            RemoteHint(
-                items = listOf(
-                    "←" to "收藏",
-                    "→" to "重载",
-                    "↑↓" to "切台",
-                    "确定" to "节目栏",
-                    "返回" to "退出"
-                ),
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(16.dp)
-            )
+                RemoteHint(
+                    items = listOf(
+                        "←" to "收藏",
+                        "→" to "重载",
+                        "↑↓" to "切台",
+                        "确定" to "节目栏",
+                        "MENU" to "设置",
+                        "返回" to "退出"
+                    ),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(16.dp)
+                )
         }
 
         // 面板打开时的遮罩：点击面板外空白区域关闭面板（绘制在 SidePanel 之下）
@@ -390,6 +410,16 @@ fun PlayerScreen(
             onAutoHide = { vm.hideSidePanel() },
             onSearchQueryChange = { q -> vm.updateSearchQuery(q) },
             onExitSearch = { vm.exitSearchMode() }
+        )
+
+        // 右侧配置抽屉（MENU 键唤出）：调整播放参数
+        SettingsDrawer(
+            visible = uiState.settingsVisible,
+            settings = uiState.playbackSettings,
+            onStuckTimeoutChange = { vm.updateStuckTimeout(it) },
+            onHedgeChange = { vm.updateHedge(it) },
+            onReviveChange = { vm.updateReviveMax(it) },
+            onClose = { vm.hideSettingsDrawer() }
         )
 
         // 初始加载中
@@ -496,6 +526,7 @@ private fun handlePlayerKeyEvent(
     event: androidx.compose.ui.input.key.KeyEvent,
     playerState: PlayerState,
     sidePanelVisible: Boolean,
+    settingsVisible: Boolean,
     engine: PlayerEngine,
     vm: PlayerViewModel,
     onExit: () -> Unit,
@@ -510,7 +541,10 @@ private fun handlePlayerKeyEvent(
         KeyEvent.KEYCODE_DPAD_CENTER,
         KeyEvent.KEYCODE_ENTER,
         KeyEvent.KEYCODE_NUMPAD_ENTER -> {
-            if (sidePanelVisible) {
+            if (settingsVisible) {
+                // 配置抽屉打开时：不拦截，让焦点项处理选择
+                false
+            } else if (sidePanelVisible) {
                 // 侧边栏打开时：不拦截，让事件传递给有焦点的列表项
                 false
             } else {
@@ -525,7 +559,8 @@ private fun handlePlayerKeyEvent(
         KeyEvent.KEYCODE_DPAD_UP,
         KeyEvent.KEYCODE_CHANNEL_UP,
         KeyEvent.KEYCODE_MEDIA_NEXT -> {
-            if (!sidePanelVisible) {
+            if (settingsVisible) false
+            else if (!sidePanelVisible) {
                 engine.playPrev()
                 true
             } else false
@@ -535,7 +570,8 @@ private fun handlePlayerKeyEvent(
         KeyEvent.KEYCODE_DPAD_DOWN,
         KeyEvent.KEYCODE_CHANNEL_DOWN,
         KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
-            if (!sidePanelVisible) {
+            if (settingsVisible) false
+            else if (!sidePanelVisible) {
                 engine.playNext()
                 true
             } else false
@@ -543,7 +579,8 @@ private fun handlePlayerKeyEvent(
 
         // 左键：收藏/取消收藏（面板关闭时）
         KeyEvent.KEYCODE_DPAD_LEFT -> {
-            if (!sidePanelVisible) {
+            if (settingsVisible) false
+            else if (!sidePanelVisible) {
                 engine.toggleFavorite()
                 true
             } else false
@@ -551,23 +588,25 @@ private fun handlePlayerKeyEvent(
 
         // 右键：手动重载当前频道（面板关闭时）
         KeyEvent.KEYCODE_DPAD_RIGHT -> {
-            if (!sidePanelVisible) {
+            if (settingsVisible) false
+            else if (!sidePanelVisible) {
                 engine.manualReload()
                 true
             } else false
         }
 
-        // 菜单键：收藏/取消收藏（备用，部分遥控器左键被系统拦截时可用）
+        // 菜单键：唤出/收起右侧配置抽屉（与侧边栏互斥）
         KeyEvent.KEYCODE_MENU -> {
-            if (!sidePanelVisible) {
-                engine.toggleFavorite()
-                true
-            } else false
+            vm.toggleSettingsDrawer()
+            true
         }
 
         // 返回键：先关面板，再退出（退出逻辑由 Activity 处理双击）
         KeyEvent.KEYCODE_BACK -> {
-            if (sidePanelVisible) {
+            if (settingsVisible) {
+                vm.hideSettingsDrawer()
+                true
+            } else if (sidePanelVisible) {
                 vm.hideSidePanel()
                 true
             } else {

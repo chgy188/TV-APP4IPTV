@@ -95,14 +95,15 @@ class MainActivity : ComponentActivity() {
                         }
                         KeyEvent.KEYCODE_MENU -> {
                             if (event.action == KeyEvent.ACTION_DOWN) {
-                                Log.d("MainActivity", "菜单键 → 发送收藏信号")
-                                vm.sendToggleFavorite()
+                                Log.d("MainActivity", "菜单键 → 切换设置抽屉")
+                                vm.toggleSettingsDrawer()
                             }
                             return true
                         }
                     }
-                    // 确定键兜底
-                    if (event.action == KeyEvent.ACTION_DOWN) {
+                    // 确定键兜底：仅在侧边栏和设置抽屉都未显示时，才弹出左侧节目单。
+                    // 设置抽屉打开时必须把确认键交给 Compose 焦点项（确认配置选项），不能拦截。
+                    if (event.action == KeyEvent.ACTION_DOWN && !uiState.settingsVisible) {
                         when (event.keyCode) {
                             KeyEvent.KEYCODE_DPAD_CENTER,
                             KeyEvent.KEYCODE_ENTER,

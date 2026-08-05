@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标前景：居中 logo，留出安全边距（viewport 108，内容在 36~72 内） -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 圆角红底 -->
+    <path
+        android:fillColor="#E11D48"
+        android:pathData="M42,30 L66,30 A6,6 0 0 1 72,36 L72,72 A6,6 0 0 1 66,78 L42,78 A6,6 0 0 1 36,72 L36,36 A6,6 0 0 1 42,30 Z" />
+    <!-- 白色播放三角 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M47,40 L64,54 L47,68 Z" />
+</vector>

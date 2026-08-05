@@ -1,6 +1,8 @@
 package com.example.composedtv.viewmodel
 
 import android.app.Application
+import android.content.Context
+import android.content.SharedPreferences
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -62,6 +64,48 @@ data class ChannelEntry(
     val langs: List<String> = emptyList()
 )
 
+/** 播放参数设置（由 MENU 设置抽屉调整，持久化保存） */
+data class PlaybackSettings(
+    /** 直连胜出后持续缓冲判定 stuck 的时长（毫秒） */
+    val stuckTimeoutMs: Long = 8_000L,
+    /** 副路径（代理）延迟启动毫秒数 */
+    val hedgeMs: Long = 1_500L,
+    /** 直连胜出后 stuck 时最多复活代理候选的次数 */
+    val reviveMax: Int = 1
+) {
+    companion object {
+        private const val PREF_NAME = "playback_settings"
+        private const val KEY_STUCK = "stuck_timeout_ms"
+        private const val KEY_HEDGE = "race_hedge_ms"
+        private const val KEY_REVIVE = "proxy_revive_max"
+
+        fun load(context: Context): PlaybackSettings {
+            val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+            return PlaybackSettings(
+                stuckTimeoutMs = sp.getLong(KEY_STUCK, 8_000L),
+                hedgeMs = sp.getLong(KEY_HEDGE, 1_500L),
+                reviveMax = sp.getInt(KEY_REVIVE, 1)
+            )
+        }
+
+        fun save(context: Context, s: PlaybackSettings) {
+            val sp: SharedPreferences = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+            sp.edit()
+                .putLong(KEY_STUCK, s.stuckTimeoutMs)
+                .putLong(KEY_HEDGE, s.hedgeMs)
+                .putInt(KEY_REVIVE, s.reviveMax)
+                .apply()
+        }
+    }
+}
+
+/** 设置抽屉可选值集合（供 UI 渲染单选列表） */
+object PlaybackSettingOptions {
+    val stuckOptions = listOf(5_000L to "5秒", 8_000L to "8秒(默认)", 12_000L to "12秒")
+    val hedgeOptions = listOf(1_000L to "1秒", 1_500L to "1.5秒(默认)", 2_500L to "2.5秒")
+    val reviveOptions = listOf(0 to "0次(关闭)", 1 to "1次(默认)", 2 to "2次")
+}
+
 /** UI 状态 */
 data class PlayerUiState(
     val isLoading: Boolean = false,
@@ -72,7 +116,11 @@ data class PlayerUiState(
     val errorMessage: String? = null,
     val storedUsers: List<StoredUser> = emptyList(),
     /** 上次成功登录的用户名（用于登录界面预填，null 表示无记录） */
-    val lastLoginUsername: String? = null
+    val lastLoginUsername: String? = null,
+    /** 设置抽屉是否可见（MENU 键切换） */
+    val settingsVisible: Boolean = false,
+    /** 播放参数设置（由 MENU 设置抽屉调整，持久化保存） */
+    val playbackSettings: PlaybackSettings = PlaybackSettings()
 )
 
 class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
@@ -90,7 +138,8 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
         // 启动即读取上次登录用户名（供登录界面预填）
         _uiState.value = _uiState.value.copy(
             lastLoginUsername = ApiClient.getLastLoginUsername(),
-            storedUsers = ApiClient.getStoredUsers()
+            storedUsers = ApiClient.getStoredUsers(),
+            playbackSettings = PlaybackSettings.load(app)
         )
     }
 
@@ -125,7 +174,8 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                         PlaylistItem(
                             name = guestChannel.name,
                             url = guestChannel.url,
-                            sourceId = guestChannel.id
+                            sourceId = guestChannel.id,
+                            country = ""
                         )
                     )
                     currentPlaylist = playlist
@@ -163,7 +213,8 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                             url = fav.url,
                             sourceId = fav.sourceId,
                             favId = fav.id,
-                            isFavorite = true
+                            isFavorite = true,
+                            country = ""
                         )
                     }
                     currentPlaylist = playlist
@@ -231,14 +282,20 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
     fun loadSidePanelSources() {
         viewModelScope.launch {
             try {
-                // 初始显示分类/频道加载 spinner（源列表很快，单独显示 spinner 意义不大）
-                _uiState.value = _uiState.value.copy(
-                    sidePanel = _uiState.value.sidePanel.copy(
-                        isLoadingCategories = true,
-                        isLoadingChannels = true
+                // 若已有源列表（通常来自当天缓存/内存），直接复用，不显示 spinner
+                val existing = _uiState.value.sidePanel.sources
+                val sources = if (existing.isNotEmpty()) {
+                    existing
+                } else {
+                    // 首次/无数据：先显示加载态
+                    _uiState.value = _uiState.value.copy(
+                        sidePanel = _uiState.value.sidePanel.copy(
+                            isLoadingCategories = true,
+                            isLoadingChannels = true
+                        )
                     )
-                )
-                val sources = ApiClient.getAllSources()
+                    ApiClient.getAllSources()
+                }
                 if (sources.isEmpty()) {
                     _uiState.value = _uiState.value.copy(
                         sidePanel = _uiState.value.sidePanel.copy(
@@ -257,8 +314,9 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                     sidePanel = SidePanelData(
                         sources = sources,
                         selectedSourceIndex = prefSourceIdx,
-                        isLoadingCategories = true,
-                        isLoadingChannels = true
+                        // 已有分类/频道（缓存命中）则不显示 spinner；否则加载中
+                        isLoadingCategories = _uiState.value.sidePanel.categories.isEmpty(),
+                        isLoadingChannels = _uiState.value.sidePanel.channels.isEmpty()
                     )
                 )
                 loadCategoriesForSource(prefSourceIdx)
@@ -278,6 +336,12 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
     fun loadCategoriesForSource(sourceIndex: Int) {
         val state = _uiState.value
         val source = state.sidePanel.sources.getOrNull(sourceIndex) ?: return
+        // 同一源且分类已加载（缓存命中）→ 直接复用，不显示 spinner
+        if (state.sidePanel.selectedSourceIndex == sourceIndex &&
+            state.sidePanel.categories.isNotEmpty()
+        ) {
+            return
+        }
         viewModelScope.launch {
             try {
                 _uiState.value = _uiState.value.copy(
@@ -287,6 +351,16 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                     )
                 )
                 val channels = ApiClient.getChannels(source.id)
+                if (channels.isEmpty() && state.sidePanel.channels.isEmpty()) {
+                    // 无频道数据：仅关闭加载态，避免空 spinner
+                    _uiState.value = _uiState.value.copy(
+                        sidePanel = state.sidePanel.copy(
+                            isLoadingCategories = false,
+                            isLoadingChannels = false
+                        )
+                    )
+                    return@launch
+                }
                 val groups = channels.map { it.group.ifEmpty { "未分类" } }.distinct()
                 val categories = mutableListOf<CategoryEntry>()
                 categories.add(CategoryEntry(name = "搜索", isSearch = true))
@@ -342,6 +416,13 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
         val category = state.sidePanel.categories.getOrNull(categoryIndex) ?: return
         if (category.isSearch) {
             enterSearchMode(sourceIndex, categoryIndex)
+            return
+        }
+        // 同一源同一分类且频道已加载（缓存命中）→ 直接复用，不显示 spinner
+        if (state.sidePanel.selectedSourceIndex == sourceIndex &&
+            state.sidePanel.selectedCategoryIndex == categoryIndex &&
+            state.sidePanel.channels.isNotEmpty()
+        ) {
             return
         }
         viewModelScope.launch {
@@ -440,7 +521,8 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                 url = ch.url,
                 sourceId = ch.sourceId,
                 favId = ch.favId,
-                isFavorite = ch.isFavorite
+                isFavorite = ch.isFavorite,
+                country = ch.countryAttr
             )
         }
         currentPlaylist = playlist
@@ -584,6 +666,45 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
      */
     fun toggleSidePanel(currentChannel: PlaylistItem? = null) {
         if (_uiState.value.sidePanelVisible) hideSidePanel() else showSidePanel(currentChannel)
+    }
+
+    // ===== 设置抽屉（MENU 键） =====
+
+    /** 切换右侧配置抽屉可见性（若侧边栏打开则先关侧边栏，避免两者重叠） */
+    fun toggleSettingsDrawer() {
+        _uiState.value = _uiState.value.copy(
+            settingsVisible = !_uiState.value.settingsVisible,
+            sidePanelVisible = false
+        )
+    }
+
+    fun hideSettingsDrawer() {
+        _uiState.value = _uiState.value.copy(settingsVisible = false)
+    }
+
+    fun updateStuckTimeout(ms: Long) {
+        val next = _uiState.value.playbackSettings.copy(stuckTimeoutMs = ms)
+        commitSettings(next)
+    }
+
+    fun updateHedge(ms: Long) {
+        val next = _uiState.value.playbackSettings.copy(hedgeMs = ms)
+        commitSettings(next)
+    }
+
+    fun updateReviveMax(n: Int) {
+        val next = _uiState.value.playbackSettings.copy(reviveMax = n)
+        commitSettings(next)
+    }
+
+    /**
+     * 保存设置到持久化并更新状态。
+     * 注意：composedTV 架构中 engine 在 PlayerScreen 创建，VM 不直接持有 engine，
+     * 由 PlayerScreen 监听 playbackSettings 变化后调用 engine.applyPlaybackSettings()。
+     */
+    private fun commitSettings(next: PlaybackSettings) {
+        PlaybackSettings.save(app, next)
+        _uiState.value = _uiState.value.copy(playbackSettings = next)
     }
 
     /**

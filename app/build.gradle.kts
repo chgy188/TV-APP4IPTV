@@ -2,8 +2,7 @@ import java.util.Properties
 
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-    id("org.jetbrains.kotlin.plugin.compose") version "2.1.20"
+    id("org.jetbrains.kotlin.android") version "1.9.22"
 }
 
 // 从项目根目录读取 keystore.properties（不存在时跳过，仍能构建 unsigned release）
@@ -73,17 +72,24 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
+        // 开启 Java 8 语言特性脱糖，使 Map.putIfAbsent 等 API 在 minSdk<24 上可用
+        isCoreLibraryDesugaringEnabled = true
     }
 
     kotlinOptions {
-        jvmTarget = "17"
+        jvmTarget = "11"
     }
 
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+
+    // Kotlin 1.9.x 通过 compiler extension 接入 Compose（与 Compose BOM 2024.02 / Compose 1.6 配套）
+    composeOptions {
+        kotlinCompilerExtensionVersion = "1.5.10"
     }
 
     packaging {
@@ -123,6 +129,11 @@ dependencies {
     // OkHttp
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
+
+    // Java 8 核心库脱糖：minSdk=21 的设备（API<24）缺少 Map.putIfAbsent 等
+    // Java 8 默认方法，运行时直接 NoSuchMethodError 闪退。需开启脱糖才能在
+    // Android 6.0(API23) 等老系统上运行。
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
