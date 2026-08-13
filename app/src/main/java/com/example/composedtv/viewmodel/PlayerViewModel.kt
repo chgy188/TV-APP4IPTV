@@ -29,6 +29,8 @@ data class SidePanelData(
     val selectedSourceIndex: Int = 0,
     val selectedCategoryIndex: Int = 0,
     val selectedChannelIndex: Int = 0,
+    /** 当前 categories 实际所属源的 id；用于判断缓存是否正确归属，避免换源后分类不刷新 */
+    val loadedSourceId: String? = null,
     /** 搜索模式：第三列显示搜索框 + 实时筛选结果 */
     val isSearchMode: Boolean = false,
     /** 当前搜索查询字符串 */
@@ -332,12 +334,14 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 加载指定源的分类列表（收藏始终是第一个） */
-    fun loadCategoriesForSource(sourceIndex: Int) {
+    /** 加载指定源的分类列表（收藏始终是第一个）
+     * @param force 为 true 时忽略缓存、强制重新加载（用户主动切换源时使用）
+     */
+    fun loadCategoriesForSource(sourceIndex: Int, force: Boolean = false) {
         val state = _uiState.value
         val source = state.sidePanel.sources.getOrNull(sourceIndex) ?: return
-        // 同一源且分类已加载（缓存命中）→ 直接复用，不显示 spinner
-        if (state.sidePanel.selectedSourceIndex == sourceIndex &&
+        // 缓存命中：已加载分类确实属于该源（用源 id 判定，避免 selectedSourceIndex 滞后导致误判）→ 直接复用
+        if (!force && state.sidePanel.loadedSourceId == source.id &&
             state.sidePanel.categories.isNotEmpty()
         ) {
             return
@@ -389,8 +393,12 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                 _uiState.value = _uiState.value.copy(
                     sidePanel = state.sidePanel.copy(
                         categories = categories,
+                        // 换源后必须先清空旧源频道列表，否则后续 loadChannelsForCategory
+                        // 会因 channels 非空命中缓存判断而直接复用旧列表、不刷新
+                        channels = emptyList(),
                         selectedSourceIndex = sourceIndex,
                         selectedCategoryIndex = prefCatIdx,
+                        loadedSourceId = source.id,
                         isLoadingCategories = false
                     )
                 )
@@ -634,7 +642,10 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                         sidePanel = state.sidePanel.copy(selectedSourceIndex = prefSrcIdx)
                     )
                     loadCategoriesForSource(prefSrcIdx)
-                } else if (state.sidePanel.categories.isEmpty()) {
+                } else if (state.sidePanel.categories.isEmpty() ||
+                    state.sidePanel.loadedSourceId != sources.getOrNull(prefSrcIdx)?.id
+                ) {
+                    // 分类为空，或当前分类不属于正在播放的源（换源后未刷新）→ 重新加载
                     loadCategoriesForSource(prefSrcIdx)
                 } else {
                     // 分类也已加载：在当前分类下查找频道 URL，找不到就切换到合适的分类

@@ -246,10 +246,15 @@ fun PlayerScreen(
             .pointerInput(uiState.sidePanelVisible) {
                 if (uiState.sidePanelVisible) return@pointerInput
                 detectTapAndVerticalDragGestures(
-                    onTap = {
-                        // 面板关闭：tap 弹出侧边栏，顺带定位到当前播放的频道
-                        val cur = engine.run { getCurrentPlaylist().getOrNull(getCurrentIndex()) }
-                        vm.toggleSidePanel(cur)
+                    onTap = { isRightSide ->
+                        if (isRightSide) {
+                            // 右半屏 tap：弹出设置抽屉
+                            vm.toggleSettingsDrawer()
+                        } else {
+                            // 左半屏 tap：弹出侧边栏（节目单），定位到当前播放的频道
+                            val cur = engine.run { getCurrentPlaylist().getOrNull(getCurrentIndex()) }
+                            vm.toggleSidePanel(cur)
+                        }
                     },
                     onSwipeUp = {
                         // 上划：上一频道
@@ -386,7 +391,7 @@ fun PlayerScreen(
         SidePanel(
             data = uiState.sidePanel,
             isVisible = uiState.sidePanelVisible,
-            onSourceSelected = { index -> vm.loadCategoriesForSource(index) },
+            onSourceSelected = { index -> vm.loadCategoriesForSource(index, force = true) },
             onCategorySelected = { index ->
                 val state = uiState
                 vm.loadChannelsForCategory(state.sidePanel.selectedSourceIndex, index)
@@ -628,17 +633,19 @@ private fun handlePlayerKeyEvent(
  * - 下划：向下滑动超过 touchSlop → [onSwipeDown]
  */
 private suspend fun PointerInputScope.detectTapAndVerticalDragGestures(
-    onTap: () -> Unit,
+    onTap: (isRightSide: Boolean) -> Unit,
     onSwipeUp: () -> Unit,
     onSwipeDown: () -> Unit,
     onLongPress: () -> Unit = {}
 ) {
     val slop = viewConfiguration.touchSlop
-    // Compose 的 ViewConfiguration 未暴露 longPressTimeout，用系统默认值（约 400ms）
-    val longPressTimeout = android.view.ViewConfiguration.getLongPressTimeout().toLong()
+    // 长按阈值固定为 250ms（系统默认约 400ms+，用户反馈太长）
+    val longPressTimeout = 250L
+    val halfWidth = size.width / 2f
     awaitEachGesture {
         val down = awaitFirstDown(requireUnconsumed = false)
         val downTime = System.currentTimeMillis()
+        val startX = down.position.x
         var totalDy = 0f
         var totalDx = 0f
         var longPressFired = false
@@ -666,7 +673,8 @@ private suspend fun PointerInputScope.detectTapAndVerticalDragGestures(
                         if (totalDy < 0) onSwipeUp() else onSwipeDown()
                     }
                     absDx > slop -> { /* 水平滑动，忽略 */ }
-                    else -> onTap()
+                    // tap：按起始点判定左/右半屏
+                    else -> onTap(startX >= halfWidth)
                 }
                 break
             }

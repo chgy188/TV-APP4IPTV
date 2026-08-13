@@ -67,13 +67,13 @@ class PlayerEngine(private val context: Context) {
 
     companion object {
         private const val TAG = "PlayerEngine"
-        private const val WATCHDOG_TIMEOUT_MS = 15_000L
+        private const val WATCHDOG_TIMEOUT_MS = 8_000L
         private val BROWSER_UA =
             "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) " +
             "Chrome/120.0.0.0 Mobile Safari/537.36"
         // ===== 可被设置抽屉注入的播放参数（下方 var 为运行时值，此处为默认值） =====
         private const val DEFAULT_STUCK_TIMEOUT_MS = 8_000L   // 直连胜出后持续缓冲判定 stuck 的时长
-        private const val DEFAULT_RACE_HEDGE_MS = 1_500L      // 副路径（代理）延迟启动
+        private const val DEFAULT_RACE_HEDGE_MS = 800L         // 副路径（代理）延迟启动
         private const val DEFAULT_PROXY_REVIVE_MAX = 1        // 直连胜出后 stuck 时最多复活代理的次数
         private const val REVIVE_COOLDOWN_MS = 3_000L         // 两次复活最小间隔，防疯抢
 
@@ -179,6 +179,8 @@ class PlayerEngine(private val context: Context) {
     private fun playCurrent() {
         if (playlist.isEmpty()) return
         val item = playlist[currentIndex.coerceIn(0, playlist.lastIndex)]
+        // 进入新一轮竞速：清除重载荷载锁，允许后续（若仍卡死）再次兜底重载
+        isReloading = false
         resetRace()
         stopStuckMonitor()
         proxyReviveBudget = 0
@@ -588,7 +590,10 @@ class PlayerEngine(private val context: Context) {
     private var playbackReviveCount = 0
 
     /** 播放期连续重载上限：达到后改为跳下一台。 */
-    private val PLAYBACK_RELOAD_MAX = 2
+    private val PLAYBACK_RELOAD_MAX = 1
+
+    /** 重载荷载锁：防止播放期兜底与竞速 watchdog 同时/并发触发同一频道多次 reload */
+    private var isReloading = false
 
     private var playbackStuckJob: Job? = null
 
@@ -725,6 +730,16 @@ class PlayerEngine(private val context: Context) {
      */
     private fun reloadCurrentChannel(reason: String) {
         if (playlist.isEmpty()) return
+        // 重载荷载锁：若已在 reload 流程中（竞速 watchdog / 播放期兜底可能同时触发），直接忽略，
+        // 避免同一频道被并发多次 reload（表现为反复重新加载、台名反复闪烁）
+        if (isReloading) {
+            Log.d(TAG, "reloadCurrentChannel 忽略重复请求(reason=$reason)，已有 reload 在进行")
+            return
+        }
+        isReloading = true
+        // 立即终止旧的播放期与竞速层监测，避免旧 player 在其延迟/超时窗口内再次触发 reload
+        stopPlaybackStuckMonitor()
+        stopWatchdog()
         // 点播内容：保存当前播放位置以便重载后恢复
         if (!isLiveStream) {
             val pos = player?.currentPosition ?: 0
@@ -734,10 +749,7 @@ class PlayerEngine(private val context: Context) {
             }
         }
         Log.d(TAG, "reloadCurrentChannel(reason=$reason) idx=$currentIndex url=$currentPlayingUrl isLive=$isLiveStream")
-        scope.launch {
-            delay(300)
-            playCurrent()
-        }
+        playCurrent()
     }
 
     private fun raceCandidateFailed(cand: RaceCandidate) {

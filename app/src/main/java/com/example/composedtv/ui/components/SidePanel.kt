@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -89,6 +90,9 @@ fun SidePanel(
     onExitSearch: () -> Unit = {}
 ) {
     val channelFocusRequester = remember { FocusRequester() }
+    // 分类列（第二列）焦点入口：其顶部固定区包含「收藏 / 搜索」，
+    // 面板打开时把焦点先放到此处，确保遥控能选中收藏 / 搜索（否则它们不在 LazyColumn 焦点链内无法到达）
+    val categoryFocusRequester = remember { FocusRequester() }
 
     // 三个列表的滚动状态提到顶层：用于检测「正在滚动」也算用户活动
     val sourceListState = rememberLazyListState()
@@ -146,10 +150,12 @@ fun SidePanel(
     }
 
     // 面板打开时将焦点移到频道列表
-    LaunchedEffect(isVisible, data.channels) {
-        if (isVisible && data.channels.isNotEmpty()) {
+    LaunchedEffect(isVisible) {
+        if (isVisible) {
             delay(100)
-            runCatching { channelFocusRequester.requestFocus() }
+            // 焦点先落在分类列（收藏 / 搜索所在列），确保遥控可选中它们；
+            // 频道列表的滚动定位由下方 LaunchedEffect 负责（仅滚动，不抢焦点）
+            runCatching { categoryFocusRequester.requestFocus() }
         }
     }
 
@@ -162,7 +168,7 @@ fun SidePanel(
         Box(
             modifier = Modifier
                 .fillMaxHeight()
-                .widthIn(max = 800.dp)
+                .widthIn(min = 300.dp, max = 440.dp)
                 // 毛玻璃感：半透明深色底（alpha ~73%）+ 微白色高光边框 + 圆角
                 .background(
                     color = Color(0xBB1A1C23),
@@ -270,9 +276,16 @@ fun SidePanel(
                         // 分类列拆分：搜索/收藏固定置顶，普通分类在下方 LazyColumn 滚动
                         Column {
                             // 顶部固定区：搜索 + 收藏（不随列表滚动）
+                            // 注意：这里不是 LazyColumn，普通 clickable 的 Surface 不可聚焦，
+                            // 必须显式加 focusable 才能被遥控器选中。
                             data.categories.forEachIndexed { index, category ->
                                 if (category.isSearch || category.isFavorites) {
                                     PanelItem(
+                                        modifier = if (category.isSearch) {
+                                            Modifier.focusable().focusRequester(categoryFocusRequester)
+                                        } else {
+                                            Modifier.focusable()
+                                        },
                                         text = category.name,
                                         isSelected = index == data.selectedCategoryIndex,
                                         icon = when {
@@ -438,6 +451,7 @@ private fun PanelColumn(
 private fun PanelItem(
     text: String,
     isSelected: Boolean,
+    modifier: Modifier = Modifier,
     icon: androidx.compose.ui.graphics.vector.ImageVector? = null,
     iconTint: Color = MaterialTheme.colorScheme.onSurface,
     countryText: String = "",
@@ -450,7 +464,7 @@ private fun PanelItem(
     val interactionSource = remember { MutableInteractionSource() }
 
     androidx.compose.material3.Surface(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .scale(scale)
             .onFocusChanged {
