@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标前景：白色播放三角（居中，安全区内），背景色由 launcher 提供 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 白色播放三角 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M46,38 L70,54 L46,70 Z" />
+</vector>

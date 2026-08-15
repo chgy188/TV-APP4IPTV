@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- TV Banner - 320x180 dp for leanback launcher (普通矢量，兼容 API 21+，含 Android 6.0 TV)
+     注意：不要使用 adaptive-icon（API26+ 才支持），否则 Android 6 海信电视 banner 会缺失 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+
+    <!-- 深色圆角背景 -->
+    <path
+        android:fillColor="#0C0E13"
+        android:pathData="M8,0 H312 A8,8 0 0 1 320,8 V172 A8,8 0 0 1 312,180 H8 A8,8 0 0 1 0,172 V8 A8,8 0 0 1 8,0 Z" />
+
+    <!-- Logo：红色圆角方块（居中偏左） -->
+    <path
+        android:fillColor="#E11D48"
+        android:pathData="M28,45 h104 a16,16 0 0 1 16,16 v58 a16,16 0 0 1 -16,16 H28 a16,16 0 0 1 -16,-16 V61 a16,16 0 0 1 16,-16 Z" />
+
+    <!-- 播放三角（白色） -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M44,62 L92,79 L44,96 Z" />
+
+    <!-- 应用名 "TV"（白色，path 绘制，右侧） -->
+    <!-- T -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M168,52 H236 V68 H212 V124 H196 V68 H168 Z" />
+    <!-- V -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M252,52 H276 L296,124 H274 L264,82 L254,124 H232 Z" />
+</vector>

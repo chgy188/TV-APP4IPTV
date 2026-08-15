@@ -1,0 +1,38 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Android
+*.apk
+*.aab
+*.ap_
+*.dex
+captures/
+app/release/
+app/build/
+local.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# 签名与密钥（切勿提交）
+keystore.properties
+*.jks
+*.keystore
+
+# 构建日志与临时产物
+build_log.txt
+build_log2.txt
+build_release_out.txt
+build_release.txt
+build_release.bat
+build_err.txt
+_apkcheck/
+*.log
+
+# 系统
+Thumbs.db
