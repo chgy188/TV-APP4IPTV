@@ -137,7 +137,7 @@ object ApiClient {
                 ApiUser(
                     id = o.optString("id", ""),
                     username = o.optString("username", ""),
-                    role = o.optString("role", null),
+                    role = o.optString("role", "").takeIf { it.isNotEmpty() },
                     needsDefaultSource = o.optBoolean("needsDefaultSource", false)
                 )
             } catch (e: Exception) { null }
@@ -166,7 +166,7 @@ object ApiClient {
                     username = o.optString("username", ""),
                     token = o.optString("token", ""),
                     userId = o.optString("userId", ""),
-                    role = o.optString("role", null)?.takeIf { it.isNotEmpty() }
+                    role = o.optString("role", "").takeIf { it.isNotEmpty() }
                 ))
             }
             list
@@ -204,20 +204,6 @@ object ApiClient {
         prefs?.edit()?.putString(KEY_STORED_USERS, arr.toString())?.apply()
     }
 
-    /** 切换到已存储的用户会话 */
-    fun switchToStoredUser(username: String): Boolean {
-        val user = getStoredUsers().find { it.username == username } ?: return false
-        token = user.token
-        currentUser = ApiUser(
-            id = user.userId,
-            username = user.username,
-            role = user.role,
-            needsDefaultSource = false
-        )
-        invalidateCache(channels = true, favorites = true, sources = true)
-        return true
-    }
-
     /** 以游客身份进入（清除当前活跃 token，但不删除存储的用户） */
     fun enterAsGuest() {
         token = null
@@ -246,12 +232,6 @@ object ApiClient {
     fun hlsProxyUrl(playUrl: String): String {
         val enc = URLEncoder.encode(playUrl, "UTF-8")
         return "$baseUrl/api/hls?url=$enc"
-    }
-
-    fun imgProxyUrl(logoUrl: String): String {
-        if (logoUrl.isEmpty()) return ""
-        val enc = URLEncoder.encode(logoUrl, "UTF-8")
-        return "$baseUrl/api/img?u=$enc"
     }
 
     /* ====================== 基础请求 ====================== */
@@ -468,8 +448,8 @@ object ApiClient {
                 url = o.optString("url", ""),
                 local = o.optBoolean("local", false),
                 public = o.optBoolean("public", false),
-                ownerId = o.optString("ownerId", null),
-                ownerName = o.optString("ownerName", null)
+                ownerId = o.optString("ownerId", ""),
+                ownerName = o.optString("ownerName", "")
             ))
         }
         return list
@@ -581,13 +561,13 @@ object ApiClient {
             return@withContext try {
                 val o = exec(authedSend("/api/auth", "POST", body))
                 val okField = o.optBoolean("ok", o.optBoolean("success", false))
-                val t = o.optString("token", null).takeIf { !it.isNullOrEmpty() }
+                val t = o.optString("token", "").takeIf { it.isNotEmpty() }
                 val userObj = if (o.has("user")) o.getJSONObject("user") else null
                 val user = userObj?.let {
                     ApiUser(
                         id = it.optString("id", ""),
                         username = it.optString("username", ""),
-                        role = it.optString("role", null).takeIf { r -> r.isNotEmpty() },
+                        role = it.optString("role", "").takeIf { r -> r.isNotEmpty() },
                         needsDefaultSource = it.optBoolean("needsDefaultSource", false)
                     )
                 }
@@ -612,8 +592,8 @@ object ApiClient {
                         clearLastLoginUsername()
                     }
                 }
-                val msg = o.optString("message", null).takeIf { !it.isNullOrEmpty() }
-                    ?: o.optString("error", null).takeIf { !it.isNullOrEmpty() }
+                val msg = o.optString("message", "").takeIf { it.isNotEmpty() }
+                    ?: o.optString("error", "").takeIf { it.isNotEmpty() }
                 AuthResult(ok, t, user, msg)
             } catch (e: Exception) {
                 AuthResult(false, null, null, e.message ?: e.toString())

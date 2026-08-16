@@ -219,12 +219,12 @@ fun PlayerScreen(
             .onPreviewKeyEvent { event ->
                 handlePlayerKeyEvent(
                     event = event,
-                    playerState = playerState,
+                    _playerState = playerState,
                     sidePanelVisible = uiState.sidePanelVisible,
                     settingsVisible = uiState.settingsVisible,
                     engine = engine,
                     vm = vm,
-                    onExit = onExit,
+                    _onExit = onExit,
                     currentPlaylistProvider = {
                         val playlist = engine.getCurrentPlaylist()
                         val idx = engine.getCurrentIndex()
@@ -235,12 +235,12 @@ fun PlayerScreen(
             .onKeyEvent { event ->
                 handlePlayerKeyEvent(
                     event = event,
-                    playerState = playerState,
+                    _playerState = playerState,
                     sidePanelVisible = uiState.sidePanelVisible,
                     settingsVisible = uiState.settingsVisible,
                     engine = engine,
                     vm = vm,
-                    onExit = onExit,
+                    _onExit = onExit,
                     currentPlaylistProvider = {
                         val playlist = engine.getCurrentPlaylist()
                         val idx = engine.getCurrentIndex()
@@ -599,12 +599,12 @@ private fun ProxyBadge(modifier: Modifier = Modifier) {
  */
 private fun handlePlayerKeyEvent(
     event: androidx.compose.ui.input.key.KeyEvent,
-    playerState: PlayerState,
+    _playerState: PlayerState,
     sidePanelVisible: Boolean,
     settingsVisible: Boolean,
     engine: PlayerEngine,
     vm: PlayerViewModel,
-    onExit: () -> Unit,
+    _onExit: () -> Unit,
     currentPlaylistProvider: () -> PlaylistItem? = { null }
 ): Boolean {
     if (event.type != KeyEventType.KeyDown) return false

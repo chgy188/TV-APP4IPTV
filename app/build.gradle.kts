@@ -16,7 +16,6 @@ val keystoreProperties = Properties().apply {
 android {
     namespace = "com.example.composedtv"
     compileSdk = 34
-    buildToolsVersion = "34.0.0"
 
     defaultConfig {
         applicationId = "com.example.composedtv"
@@ -52,7 +51,7 @@ android {
             isEnable = true
             reset()
             include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-            isUniversalApk = true
+            isUniversalApk = false
         }
     }
 
@@ -80,6 +79,9 @@ android {
 
     kotlinOptions {
         jvmTarget = "11"
+        // Media3 的 UnstableApi 注解未声明为 requiresOptIn，
+        // 需通过编译器参数开启 opt-in，消除 @OptIn 被忽略的警告
+        freeCompilerArgs = listOf("-opt-in=androidx.media3.common.util.UnstableApi")
     }
 
     buildFeatures {

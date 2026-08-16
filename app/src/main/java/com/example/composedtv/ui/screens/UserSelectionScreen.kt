@@ -20,9 +20,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.PlayArrow
@@ -70,15 +68,16 @@ fun UserSelectionScreen(
     ) {
         // 屏幕较矮（手机横屏）时启用紧凑布局，尽量一屏显示
         val compact = maxHeight < 520.dp
+
+        // 顶部标题区
         Column(
             modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
+                .align(Alignment.TopStart)
                 .padding(
-                    horizontal = if (compact) 20.dp else 32.dp,
-                    vertical = if (compact) 16.dp else 32.dp
-                ),
-            verticalArrangement = Arrangement.spacedBy(if (compact) 10.dp else 20.dp)
+                    start = if (compact) 20.dp else 32.dp,
+                    end = if (compact) 20.dp else 32.dp,
+                    top = if (compact) 16.dp else 32.dp
+                )
         ) {
             Text(
                 text = "影直播",
@@ -86,41 +85,32 @@ fun UserSelectionScreen(
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.primary
             )
+            Spacer(modifier = Modifier.height(if (compact) 4.dp else 8.dp))
             Text(
                 text = "选择用户以开始观看",
                 fontSize = if (compact) 14.sp else 18.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+        }
 
-            if (!compact) Spacer(modifier = Modifier.height(8.dp))
-
-            if (storedUsers.isNotEmpty()) {
-                Text(
-                    text = "已登录用户",
-                    fontSize = if (compact) 14.sp else 16.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontWeight = FontWeight.Medium
+        // 中部：所有用户（已登录 + 游客 + 登录入口）统一横向滚动排
+        LazyRow(
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.Center)
+                .padding(horizontal = if (compact) 20.dp else 32.dp),
+            horizontalArrangement = Arrangement.spacedBy(if (compact) 12.dp else 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            contentPadding = PaddingValues(vertical = if (compact) 4.dp else 8.dp)
+        ) {
+            items(storedUsers) { user ->
+                UserCard(
+                    username = user.username,
+                    compact = compact,
+                    onClick = { onSelectUser(user.username) }
                 )
-                LazyRow(
-                    horizontalArrangement = Arrangement.spacedBy(if (compact) 12.dp else 16.dp),
-                    contentPadding = PaddingValues(vertical = if (compact) 4.dp else 8.dp)
-                ) {
-                    items(storedUsers) { user ->
-                        UserCard(
-                            username = user.username,
-                            compact = compact,
-                            onClick = { onSelectUser(user.username) }
-                        )
-                    }
-                }
             }
-
-            if (!compact) Spacer(modifier = Modifier.height(8.dp))
-
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(if (compact) 12.dp else 16.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+            item {
                 ActionCard(
                     icon = Icons.Default.PlayArrow,
                     title = "游客模式",
@@ -128,6 +118,8 @@ fun UserSelectionScreen(
                     compact = compact,
                     onClick = onSelectGuest
                 )
+            }
+            item {
                 ActionCard(
                     icon = Icons.Default.Star,
                     title = "登录 / 注册",
@@ -136,26 +128,36 @@ fun UserSelectionScreen(
                     onClick = onSelectLogin
                 )
             }
-
-            // 底部遥控器/键盘操作说明
-            Spacer(modifier = Modifier.height(if (compact) 8.dp else 16.dp))
-            RemoteHint(
-                compact = compact,
-                items = listOf(
-                    "←→↑↓" to "移动选择",
-                    "确定" to "进入",
-                    "返回" to "退出"
-                )
-            )
         }
+
+        // 底部遥控器/键盘操作说明，固定贴底
+        RemoteHint(
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.BottomCenter)
+                .padding(
+                    start = if (compact) 20.dp else 32.dp,
+                    end = if (compact) 20.dp else 32.dp,
+                    bottom = if (compact) 12.dp else 20.dp
+                ),
+            compact = compact,
+            items = listOf(
+                "←→↑↓" to "移动选择",
+                "确定" to "进入",
+                "返回" to "退出"
+            )
+        )
     }
 }
 
 @Composable
-private fun RemoteHint(items: List<Pair<String, String>>, compact: Boolean = false) {
+private fun RemoteHint(
+    items: List<Pair<String, String>>,
+    modifier: Modifier = Modifier,
+    compact: Boolean = false
+) {
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
+        modifier = modifier
             .background(
                 Color.Black.copy(alpha = 0.35f),
                 RoundedCornerShape(12.dp)

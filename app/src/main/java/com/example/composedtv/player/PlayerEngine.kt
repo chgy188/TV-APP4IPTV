@@ -147,8 +147,6 @@ class PlayerEngine(private val context: Context) {
     private var consecutiveErrors = 0
     private var flvRetryDone = false
 
-    /** 是否已渲染过第一帧（用于区分"首次缓冲"与"播放中卡顿"） */
-    private var hasRenderedFirstFrame = false
     /** 重载前保存的播放位置（毫秒），用于点播内容恢复进度 */
     private var pendingResumePositionMs: Long = 0
     /** 当前播放是否为直播流 */
@@ -201,14 +199,6 @@ class PlayerEngine(private val context: Context) {
         playCurrent()
     }
 
-    /** 播放单条（无列表上下切换） */
-    fun playSingle(item: PlaylistItem) {
-        playlist = listOf(item)
-        currentIndex = 0
-        consecutiveErrors = 0
-        playCurrent()
-    }
-
     private fun playCurrent() {
         if (playlist.isEmpty()) return
         val item = playlist[currentIndex.coerceIn(0, playlist.lastIndex)]
@@ -224,7 +214,6 @@ class PlayerEngine(private val context: Context) {
         flvRetryDone = false
         proxyRetryDone = false
         currentPlayingUrl = item.url
-        hasRenderedFirstFrame = false
         // 判断是否直播流：HLS (.m3u8) 和 FLV 视为直播，其余（如 .mp4/.mkv）视为点播
         isLiveStream = isFlvStream(item.url) || item.url.lowercase().let {
             it.contains(".m3u8") || it.contains(".m3u")
@@ -670,7 +659,7 @@ class PlayerEngine(private val context: Context) {
      * 播放期致命/卡死兜底：先原地重载当前频道；若已连续重载 PLAYBACK_RELOAD_MAX 次仍失败则跳下一台。
      * 重载成功后(onPlaybackWatcher STATE_READY)会清零 playbackReviveCount，因此只有"连续"卡死才累计跳台。
      */
-    private fun onPlaybackFatal(exo: ExoPlayer?, attempt: String, reason: String) {
+    private fun onPlaybackFatal(_exo: ExoPlayer?, _attempt: String, reason: String) {
         if (playlist.isEmpty()) return
         playbackReviveCount++
         if (playbackReviveCount > PLAYBACK_RELOAD_MAX) {
@@ -745,10 +734,6 @@ class PlayerEngine(private val context: Context) {
                         // no-op
                     }
                 }
-            }
-
-            override fun onRenderedFirstFrame() {
-                hasRenderedFirstFrame = true
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -950,12 +935,6 @@ class PlayerEngine(private val context: Context) {
             delay(3000)
             updateState(transientHint = null)
         }
-    }
-
-    /** 显示信息条（常驻，不自动隐藏） */
-    fun showInfo() {
-        infoHideJob?.cancel()
-        updateState(showInfo = true)
     }
 
     // ===== 生命周期 =====

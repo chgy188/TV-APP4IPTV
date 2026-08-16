@@ -33,6 +33,9 @@ build_release.bat
 build_err.txt
 _apkcheck/
 *.log
+build_out.txt
+clean_out.txt
+search_log.txt
 
 # 系统
 Thumbs.db

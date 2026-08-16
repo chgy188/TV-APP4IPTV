@@ -779,14 +779,6 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun selectStoredUser(username: String, onResult: (Boolean) -> Unit) {
-        val ok = ApiClient.switchToStoredUser(username)
-        if (ok) {
-            _uiState.value = _uiState.value.copy(storedUsers = ApiClient.getStoredUsers())
-        }
-        onResult(ok)
-    }
-
     fun enterAsGuest() {
         ApiClient.enterAsGuest()
     }

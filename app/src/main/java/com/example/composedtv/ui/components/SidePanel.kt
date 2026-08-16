@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -241,19 +242,11 @@ fun SidePanel(
                 }
 
                 // 第二列：类别列表（搜索/收藏固定置顶，普通分类滚动）
-                // 滚动定位：把全列表 selectedCategoryIndex 映射到普通分类列表内的索引
-                val normalCategories = remember(data.categories) {
-                    data.categories.mapIndexed { idx, c -> idx to c }
-                        .filter { !it.second.isSearch && !it.second.isFavorites }
-                }
+                // 滚动定位：分类列现在使用完整 data.categories（含搜索/收藏），
+                // 可直接用 selectedCategoryIndex 在 LazyColumn 内定位。
                 LaunchedEffect(isVisible, data.selectedCategoryIndex) {
-                    if (isVisible && normalCategories.isNotEmpty()) {
-                        val selected = data.selectedCategoryIndex
-                        // 全列表索引 → 普通分类列表内的索引
-                        val targetInNormal = normalCategories.indexOfFirst { it.first == selected }
-                        if (targetInNormal >= 0) {
-                            categoryListState.scrollCenteredTo(targetInNormal)
-                        }
+                    if (isVisible && data.categories.isNotEmpty()) {
+                        categoryListState.scrollCenteredTo(data.selectedCategoryIndex)
                     }
                 }
                 PanelColumn(
@@ -261,7 +254,7 @@ fun SidePanel(
                     icon = Icons.Default.Star,
                     modifier = Modifier.weight(0.75f)
                 ) {
-                    if (data.isLoadingCategories && normalCategories.isEmpty()) {
+                    if (data.isLoadingCategories && data.categories.isEmpty()) {
                         Box(
                             modifier = Modifier.fillMaxWidth().padding(top = 20.dp),
                             contentAlignment = Alignment.Center
@@ -273,56 +266,35 @@ fun SidePanel(
                             )
                         }
                     } else {
-                        // 分类列拆分：搜索/收藏固定置顶，普通分类在下方 LazyColumn 滚动
-                        Column {
-                            // 顶部固定区：搜索 + 收藏（不随列表滚动）
-                            // 注意：这里不是 LazyColumn，普通 clickable 的 Surface 不可聚焦，
-                            // 必须显式加 focusable 才能被遥控器选中。
-                            data.categories.forEachIndexed { index, category ->
-                                if (category.isSearch || category.isFavorites) {
-                                    PanelItem(
-                                        modifier = if (category.isSearch) {
-                                            Modifier.focusable().focusRequester(categoryFocusRequester)
-                                        } else {
-                                            Modifier.focusable()
-                                        },
-                                        text = category.name,
-                                        isSelected = index == data.selectedCategoryIndex,
-                                        icon = when {
-                                            category.isSearch -> Icons.Default.Search
-                                            category.isFavorites -> Icons.Default.Star
-                                            else -> null
-                                        },
-                                        iconTint = MaterialTheme.colorScheme.secondary,
-                                        onClick = {
-                                            bumpActivity()
-                                            onCategorySelected(index)
-                                        },
-                                        onFocused = { bumpActivity() }
-                                    )
-                                }
-                            }
-
-                            // 普通分类区：可滚动
-                            LazyColumn(
-                                state = categoryListState,
-                                verticalArrangement = Arrangement.spacedBy(4.dp),
-                                contentPadding = PaddingValues(vertical = 4.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                items(items = normalCategories) { (index, category) ->
-                                    PanelItem(
-                                        text = category.name,
-                                        isSelected = index == data.selectedCategoryIndex,
-                                        icon = null,
-                                        iconTint = MaterialTheme.colorScheme.secondary,
-                                        onClick = {
-                                            bumpActivity()
-                                            onCategorySelected(index)
-                                        },
-                                        onFocused = { bumpActivity() }
-                                    )
-                                }
+                        // 所有分类项（搜索/收藏 + 普通分类）同处一个 LazyColumn，
+                        // 保证焦点链连续：遥控器上下键可从普通分类首项移到上方收藏/搜索项。
+                        LazyColumn(
+                            state = categoryListState,
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                            contentPadding = PaddingValues(vertical = 4.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            itemsIndexed(items = data.categories) { index, category ->
+                                PanelItem(
+                                    focusRequester = if (category.isSearch) {
+                                        categoryFocusRequester
+                                    } else {
+                                        null
+                                    },
+                                    text = category.name,
+                                    isSelected = index == data.selectedCategoryIndex,
+                                    icon = when {
+                                        category.isSearch -> Icons.Default.Search
+                                        category.isFavorites -> Icons.Default.Star
+                                        else -> null
+                                    },
+                                    iconTint = MaterialTheme.colorScheme.secondary,
+                                    onClick = {
+                                        bumpActivity()
+                                        onCategorySelected(index)
+                                    },
+                                    onFocused = { bumpActivity() }
+                                )
                             }
                         }
                     }
@@ -456,6 +428,7 @@ private fun PanelItem(
     iconTint: Color = MaterialTheme.colorScheme.onSurface,
     countryText: String = "",
     langText: String = "",
+    focusRequester: FocusRequester? = null,
     onClick: () -> Unit,
     onFocused: () -> Unit = {}
 ) {
@@ -467,6 +440,9 @@ private fun PanelItem(
         modifier = modifier
             .fillMaxWidth()
             .scale(scale)
+            // 单一焦点节点：clickable 自带焦点能力；此处仅用 focusRequester 附加定位，
+            // 不再外加独立 focusable，避免 Surface 上出现嵌套双焦点节点导致焦点锁定。
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
             .onFocusChanged {
                 if (it.isFocused) onFocused()
                 focused = it.isFocused
