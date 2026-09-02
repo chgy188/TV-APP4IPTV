@@ -13,6 +13,11 @@ val keystoreProperties = Properties().apply {
     }
 }
 
+// 自动版本号：本地用固定版本；CI 打 tag 时通过 APP_VERSION_NAME 覆盖（如 v1.2.3）
+val appVersionName: String = System.getenv("APP_VERSION_NAME") ?: "1.0.0"
+// CI 开关：true 时产出 universal APK（合并所有 ABI 成一个包）
+val ciUniversal: Boolean = System.getenv("CI_UNIVERSAL") == "true"
+
 android {
     namespace = "com.example.composedtv"
     compileSdk = 34
@@ -22,8 +27,8 @@ android {
         minSdk = 21
         targetSdk = 34
         // 语义化版本：versionCode = 主版本*10000 + 次版本*100 + 补丁版本
-        // 每次发布时手动递增 versionName 末尾，versionCode 会自动对应
-        versionName = "1.0.0"
+        // 每次发布时手动递增 versionName 末尾（或 CI 通过 APP_VERSION_NAME 注入 tag 版本）
+        versionName = appVersionName
         versionCode = versionName!!.split(".")
             .let { parts ->
                 val major = parts.getOrNull(0)?.toIntOrNull() ?: 0
@@ -51,7 +56,8 @@ android {
             isEnable = true
             reset()
             include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-            isUniversalApk = false
+            // 本地默认只出各 ABI；CI 设 CI_UNIVERSAL=true 时额外产出 universal 单包
+            isUniversalApk = ciUniversal
         }
     }
 

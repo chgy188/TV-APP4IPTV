@@ -90,8 +90,40 @@ app/src/main/java/com/example/composedtv/
 ./gradlew installDebug
 ```
 
-- `build.gradle.kts` 启用 **ABI splits**（armeabi-v7a / arm64-v8a / x86 / x86_64）+ `universalApk`，便于 TV 盒子分发。
+- `build.gradle.kts` 本地默认启用 **ABI splits**（armeabi-v7a / arm64-v8a / x86 / x86_64），产出按架构分离的 APK。
+- 在 CI 中设环境变量 `CI_UNIVERSAL=true` 会额外产出 **universal 单包**（合并所有 ABI），方便直接分发。
 - Release 开启 `minify` + `shrinkResources` + proguard。
+
+## GitHub Actions 自动构建
+
+每次 `push` 到 `main`（或打 `v*` tag）会自动构建并上传 APK 产物；打 tag 时还会自动创建 GitHub Release 并附上 APK。向 `main` 开 PR 时仅构建 debug 用于校验。
+
+### 1. 配置仓库 Secrets（一次性）
+
+在仓库 `Settings → Secrets and variables → Actions` 添加：
+
+| Secret 名称 | 内容 |
+|-------------|------|
+| `KEYSTORE_BASE64` | `composedtv-release.jks` 的 base64 全文 |
+| `KEYSTORE_PASSWORD` | keystore 密码 |
+| `KEY_ALIAS` | `composedtv` |
+| `KEY_PASSWORD` | key 密码 |
+
+生成 `KEYSTORE_BASE64`（PowerShell）：
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("app\composedtv-release.jks")) | Out-File keystore.b64 -NoNewline
+# 然后把 keystore.b64 的全部内容粘进 KEYSTORE_BASE64
+```
+
+### 2. 自动版本号
+
+打 tag 时使用 tag 名作为版本，例如 `git tag v1.2.3 && git push origin v1.2.3` → 构建出的 APK `versionName=1.2.3`，并自动生成名为 `Release 1.2.3` 的 GitHub Release。非 tag 的 push 使用 `0.0.0-ci<时间戳>` 作为临时版本号，便于区分。
+
+### 3. 产物位置
+
+- Actions 页面 → 对应 run → **Artifacts** 区域下载 `apks-<版本号>`（含 release 各 ABI + universal，以及 PR 场景下的 debug）。
+- 打 tag 时可直接在仓库 **Releases** 页面下载签名 APK。
 
 ## ⚠️ 安全与 .gitignore
 
