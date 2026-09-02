@@ -44,7 +44,9 @@ android {
     signingConfigs {
         create("release") {
             if (keystoreProperties.containsKey("storeFile")) {
-                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                // 用 rootProject.file 以项目根目录为基准解析 storeFile，
+                // 保证 CI（keystore 解码到根目录 app/ 下）与本地路径一致
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
                 storePassword = keystoreProperties.getProperty("storePassword")
                 keyAlias = keystoreProperties.getProperty("keyAlias")
                 keyPassword = keystoreProperties.getProperty("keyPassword")
