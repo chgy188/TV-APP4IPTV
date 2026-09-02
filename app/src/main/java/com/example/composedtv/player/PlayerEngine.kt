@@ -19,6 +19,7 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.extractor.ExtractorsFactory
 import androidx.media3.extractor.flv.FlvExtractor
 import com.example.composedtv.data.remote.ApiClient
+import com.example.composedtv.debug.DebugDiagnostics
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -99,19 +100,38 @@ class PlayerEngine(private val context: Context) {
      *  之后创建的所有竞速候选（含代理副路）都会绑定该 Surface，实现真正的双路竞速且切换无黑屏。
      *  media3 1.2.1：ExoPlayer 无 getVideoSurface()，故直接 setVideoSurface（幂等）。 */
     fun setSharedSurface(surface: android.view.Surface?) {
+        // 诊断：统计注入调用次数与"幂等判断未拦住、真正执行 setVideoSurface"的次数。
+        // 后者在 API<23 上每次都会触发解码器 release + re-init（无 setOutputSurface），
+        // 是老设备"有声音但画面卡成图片轮播"的重点嫌疑。
+        DebugDiagnostics.onSurfaceInjectCall()
         if (sharedSurface === surface) return
         sharedSurface = surface
         if (surface != null) {
+            // API<23 无 setOutputSurface：每次 setVideoSurface 都会重建解码器。
+            // 用 lastSetSurface 做二次节流，避免 TextureView 每次 new Surface 对象
+            // （sharedSurface === surface 永远 false）导致的反复 setVideoSurface。
+            if (lastSetSurface === surface) return
+            lastSetSurface = surface
             _playerRef.value?.let { exo ->
+                DebugDiagnostics.onSurfaceInjectApplied()
                 exo.setVideoSurface(surface)
             }
             for (c in raceCandidates) {
                 c.exo?.let { exo ->
+                    DebugDiagnostics.onSurfaceInjectApplied()
                     exo.setVideoSurface(surface)
                 }
             }
+        } else {
+            // Surface 置空时清除节流缓存，下次非空可正常注入
+            lastSetSurface = null
         }
     }
+
+    /** setVideoSurface 节流：记录上一次真正执行的 Surface 对象，相同则跳过。
+     * 用于修复 TextureView 场景下 Surface(surfaceTexture) 每次 new 新对象、
+     * 幂等判断（===）失效、导致 API<23 反复重建解码器的问题。 */
+    private var lastSetSurface: android.view.Surface? = null
 
     /** 把设置抽屉里的值同步进 engine（PlaybackSettings 定义在 PlayerViewModel） */
     fun applyPlaybackSettings(s: com.example.composedtv.viewmodel.PlaybackSettings) {
@@ -119,6 +139,7 @@ class PlayerEngine(private val context: Context) {
         raceHedgeMs = s.hedgeMs
         // 老设备（如海信 Android 6）：复活代理会并行双解码，直接拖垮弱解码器，故强制关闭
         proxyReviveMax = if (isLegacyDevice()) 0 else s.reviveMax
+        DebugDiagnostics.setEnv(isLegacyDevice(), s.rendererMode.name)
         Log.d(TAG, "applyPlaybackSettings: stuck=${stuckTimeoutMs} hedge=${raceHedgeMs} revive=${proxyReviveMax} legacy=${isLegacyDevice()}")
     }
 
@@ -140,6 +161,13 @@ class PlayerEngine(private val context: Context) {
     val playerFlow: kotlinx.coroutines.flow.StateFlow<ExoPlayer?> = _playerRef
     val player: ExoPlayer? get() = _playerRef.value
 
+    /** 统一设置主 player 引用：同步给诊断中心，便于 HUD 读取 DecoderCounters */
+    private fun setPlayerRef(exo: ExoPlayer?) {
+        if (_playerRef.value === exo) return
+        _playerRef.value = exo
+        DebugDiagnostics.attachPlayer(exo)
+    }
+
     private var playlist: List<PlaylistItem> = emptyList()
     private var currentIndex = 0
     /** 当前正在播放的 URL（供 stuck 复活竞速复用） */
@@ -158,6 +186,16 @@ class PlayerEngine(private val context: Context) {
         var exo: ExoPlayer?,
         var failed: Boolean = false
     )
+    /** 竞速 watchdog 连续超时次数：达到 [RACE_TIMEOUT_MAX] 后不再原地重载，改为切台。
+     * 用于解决「死源一直 BUFFERING 但不报错」时永不切台的问题——
+     * 这类源不会触发 onPlayerError，因此 raceCandidateFailed / handlePlayFailure
+     * （唯一切台入口）永不执行，watchdog 只能无限原地重载同一频道。 */
+    private var raceTimeoutCount = 0
+
+    /** 竞速连续超时上限：第 1 次超时原地重载（给一次机会），达到上限则切下一台。
+     * 老设备 15s×2=30s、非老设备 8s×2=16s 后切台。 */
+    private val RACE_TIMEOUT_MAX = 2
+
     private var raceActive = false
     private var raceDecided = false
     private var raceCandidates = listOf<RaceCandidate>()
@@ -210,25 +248,38 @@ class PlayerEngine(private val context: Context) {
         wasReviving = false
         player?.stop()
         player?.release()
-        _playerRef.value = null
+        DebugDiagnostics.onPlayerReleased()
+        setPlayerRef(null)
         flvRetryDone = false
         proxyRetryDone = false
         currentPlayingUrl = item.url
+        DebugDiagnostics.setChannel(item.name, item.url, false)
         // 判断是否直播流：HLS (.m3u8) 和 FLV 视为直播，其余（如 .mp4/.mkv）视为点播
         isLiveStream = isFlvStream(item.url) || item.url.lowercase().let {
             it.contains(".m3u8") || it.contains(".m3u")
         }
-        updateState(
-            currentName = item.name,
-            currentIndex = currentIndex,
-            playlistSize = playlist.size,
-            isFavorite = item.isFavorite,
-            isLoading = true,
-            error = null,
-            showInfo = true,
-            usingProxy = false
-        )
-        scheduleInfoHide()
+        // 信息条：仅在「频道真正变化」时弹出。
+        // 原地重载（watchdog / 播放期兜底）会反复调用 playCurrent，若每次都
+        // showInfo=true + scheduleInfoHide()，频道名与底部提示就会周期性闪烁
+        // （非老设备 watchdog 8 秒一轮，表现为亮 5 秒灭 3 秒）。
+        // 同一频道重载时保持信息条当前状态：已隐藏则继续隐藏。
+        val channelChanged = _state.value.currentName != item.name
+        if (channelChanged) {
+            updateState(
+                currentName = item.name,
+                currentIndex = currentIndex,
+                playlistSize = playlist.size,
+                isFavorite = item.isFavorite,
+                isLoading = true,
+                error = null,
+                showInfo = true,
+                usingProxy = false
+            )
+            scheduleInfoHide()
+        } else {
+            // 重载同一频道：只更新加载态，不动信息条显隐
+            updateState(isLoading = true, error = null)
+        }
         playUrl(item.url, item.country)
     }
 
@@ -463,6 +514,14 @@ class PlayerEngine(private val context: Context) {
             )
         }
         p.setMediaItem(builder.build())
+        // 诊断：挂 AnalyticsListener 采集解码器名称/初始化耗时/视频格式/丢帧
+        p.addAnalyticsListener(DebugDiagnostics.newAnalyticsListener())
+        DebugDiagnostics.onPlayerCreated()
+        DebugDiagnostics.log(
+            "Engine",
+            "createCandidate attempt=${if (useProxy) "proxy" else "direct"} winner=$winner " +
+                "hls=$isHls flv=$isFlv legacy=$legacy url=$finalUrl"
+        )
         p.prepare()
         p.playWhenReady = true
         p.repeatMode = Player.REPEAT_MODE_OFF
@@ -475,12 +534,13 @@ class PlayerEngine(private val context: Context) {
         raceDecided = false
         raceCandidates = emptyList()
         updateState(isLoading = true)
+        DebugDiagnostics.onRaceStart()
         Log.d(TAG, "竞速开始: $attempts")
 
         val firstAttempt = attempts[0]
         val c0 = RaceCandidate(firstAttempt, null, false)
         c0.exo = createCandidatePlayer(url, firstAttempt == "proxy", winner = true)
-        _playerRef.value = c0.exo
+        setPlayerRef(c0.exo)
         raceCandidates = listOf(c0)
         attachCandidateListener(c0, url, myToken)
         startWatchdog()
@@ -535,6 +595,7 @@ class PlayerEngine(private val context: Context) {
                     return
                 }
                 Log.e(TAG, "${cand.attempt} onPlayerError: ${error.errorCodeName} url=$url", error)
+                DebugDiagnostics.onError("race/${cand.attempt}", error)
                 raceCandidateFailed(cand)
             }
         })
@@ -548,18 +609,26 @@ class PlayerEngine(private val context: Context) {
         raceHedgeJob = null
         stopWatchdog()
         consecutiveErrors = 0
+        // 竞速成功：清零 watchdog 连续超时计数，避免偶发超时累积后误切台
+        raceTimeoutCount = 0
 
         for (c in raceCandidates) {
             if (c !== winner) {
                 c.exo?.stop()
                 c.exo?.release()
+                DebugDiagnostics.onPlayerReleased()
             }
         }
 
         val winExo = winner.exo
         if (winExo != null) {
             winExo.volume = 1f
-            _playerRef.value = winExo
+            setPlayerRef(winExo)
+            DebugDiagnostics.setChannel(
+                playlist.getOrNull(currentIndex)?.name ?: "",
+                currentPlayingUrl,
+                winner.attempt == "proxy"
+            )
             winExo.playWhenReady = true
             // 点播内容：恢复到重载前的播放位置
             if (!isLiveStream && pendingResumePositionMs > 0) {
@@ -642,7 +711,12 @@ class PlayerEngine(private val context: Context) {
             delay(stuckTimeoutMs)
             val state = target.playbackState
             val pos = target.currentPosition
-            val stuck = (state == Player.STATE_BUFFERING) && (pos <= basePos + 500)
+            // 仅在确实还在缓冲且位置未推进时判 stuck。
+            // 注意：API<23 解码器重建/重载初期画面定格也会被观察到 BUFFERING，
+            // 故要求"曾经播放过(playWhenReady 且非 IDLE)"才判 stuck，避免把
+            // 重建/重载过程本身误判为 stuck 进而递归重载（图片轮播的放大器之一）。
+            val everStarted = target.playbackState != Player.STATE_IDLE
+            val stuck = everStarted && (state == Player.STATE_BUFFERING) && (pos <= basePos + 500)
             if (stuck) {
                 Log.w(TAG, "播放期 stuck(${stuckTimeoutMs}ms) 未恢复，触发兜底: $currentPlayingUrl")
                 onPlaybackFatal(exo, attempt, "stuck")
@@ -694,7 +768,7 @@ class PlayerEngine(private val context: Context) {
         // 共享 Surface 模式下代理候选已绑定 PlayerView 的 Surface，无需切换 _playerRef，
         // 避免 PlayerView 重建 Surface 导致老电视"有声音没画面"；仅当 Surface 尚未就绪时回退切换
         if (sharedSurface == null) {
-            _playerRef.value = proxyCand.exo
+            setPlayerRef(proxyCand.exo)
         }
         attachCandidateListener(proxyCand, url, myToken)
         Log.d(TAG, "reviveProxyCandidate: 直连继续播 + 代理并行竞速 (sharedSurface=${sharedSurface != null})")
@@ -755,6 +829,7 @@ class PlayerEngine(private val context: Context) {
                     return
                 }
                 Log.e(TAG, "播放期 onPlayerError: ${error.errorCodeName} url=$currentPlayingUrl", error)
+                DebugDiagnostics.onError("playback/$attempt", error)
                 onPlaybackFatal(exo, attempt, error.errorCodeName)
             }
         })
@@ -786,6 +861,7 @@ class PlayerEngine(private val context: Context) {
             }
         }
         Log.d(TAG, "reloadCurrentChannel(reason=$reason) idx=$currentIndex url=$currentPlayingUrl isLive=$isLiveStream")
+        DebugDiagnostics.onReload(reason)
         playCurrent()
     }
 
@@ -794,6 +870,7 @@ class PlayerEngine(private val context: Context) {
         cand.failed = true
         cand.exo?.stop()
         cand.exo?.release()
+        DebugDiagnostics.onPlayerReleased()
         cand.exo = null
         val alive = raceCandidates.filter { !it.failed }
         if (alive.isEmpty()) {
@@ -819,6 +896,7 @@ class PlayerEngine(private val context: Context) {
         for (c in raceCandidates) {
             c.exo?.stop()
             c.exo?.release()
+            DebugDiagnostics.onPlayerReleased()
         }
         raceCandidates = emptyList()
     }
@@ -839,7 +917,8 @@ class PlayerEngine(private val context: Context) {
             resetRace()
             player?.stop()
             player?.release()
-            _playerRef.value = null
+            DebugDiagnostics.onPlayerReleased()
+            setPlayerRef(null)
             playUrl(curUrl, country)
             return
         }
@@ -852,7 +931,8 @@ class PlayerEngine(private val context: Context) {
             resetRace()
             player?.stop()
             player?.release()
-            _playerRef.value = null
+            DebugDiagnostics.onPlayerReleased()
+            setPlayerRef(null)
             playUrl(curUrl, country, forceProxy = true)
             return
         }
@@ -869,9 +949,18 @@ class PlayerEngine(private val context: Context) {
         watchdogJob = scope.launch {
             delay(WATCHDOG_TIMEOUT_MS)
             if (raceActive && !raceDecided) {
-                Log.d(TAG, "Watchdog: race timeout, reload current channel: $currentPlayingUrl")
                 stopWatchdog()
-                reloadCurrentChannel(reason = "race-timeout")
+                raceTimeoutCount++
+                if (raceTimeoutCount >= RACE_TIMEOUT_MAX) {
+                    // 连续超时：该源八成已死（一直 BUFFERING 不报错），原地重载无意义，
+                    // 直接切下一台。否则会卡在同一频道无限重载、永远不换台。
+                    raceTimeoutCount = 0
+                    Log.w(TAG, "Watchdog 连续超时 ${RACE_TIMEOUT_MAX} 次，切下一台: $currentPlayingUrl")
+                    playNext()
+                } else {
+                    Log.d(TAG, "Watchdog: race timeout ($raceTimeoutCount/$RACE_TIMEOUT_MAX), reload: $currentPlayingUrl")
+                    reloadCurrentChannel(reason = "race-timeout")
+                }
             }
         }
     }
@@ -955,7 +1044,8 @@ class PlayerEngine(private val context: Context) {
         hintHideJob?.cancel()
         player?.stop()
         player?.release()
-        _playerRef.value = null
+        DebugDiagnostics.onPlayerReleased()
+        setPlayerRef(null)
         sharedSurface = null
         playlist = emptyList()
     }

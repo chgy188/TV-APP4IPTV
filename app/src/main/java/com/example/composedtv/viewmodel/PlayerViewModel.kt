@@ -6,6 +6,7 @@ import android.content.SharedPreferences
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.composedtv.BuildConfig
 import com.example.composedtv.data.remote.ApiChannel
 import com.example.composedtv.data.remote.ApiClient
 import com.example.composedtv.data.remote.ApiFavorite
@@ -14,12 +15,14 @@ import com.example.composedtv.data.remote.StoredUser
 import com.example.composedtv.player.PlaylistItem
 import com.example.composedtv.player.PlayerEngine
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** 侧边栏三排目录数据 */
 data class SidePanelData(
@@ -94,7 +97,9 @@ data class PlaybackSettings(
     /** 直连胜出后 stuck 时最多复活代理候选的次数 */
     val reviveMax: Int = 1,
     /** 视频渲染方式（AUTO / SURFACE / TEXTURE） */
-    val rendererMode: RendererMode = RendererMode.AUTO
+    val rendererMode: RendererMode = RendererMode.AUTO,
+    /** 画面诊断 HUD 开关（无 ADB 环境调试用；持久化保存，重启后保持上次选择） */
+    val diagHudEnabled: Boolean = false
 ) {
     companion object {
         private const val PREF_NAME = "playback_settings"
@@ -102,6 +107,7 @@ data class PlaybackSettings(
         private const val KEY_HEDGE = "race_hedge_ms"
         private const val KEY_REVIVE = "proxy_revive_max"
         private const val KEY_RENDERER = "renderer_mode"
+        private const val KEY_DIAG_HUD = "diag_hud_enabled"
 
         fun load(context: Context): PlaybackSettings {
             val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
@@ -109,7 +115,10 @@ data class PlaybackSettings(
                 stuckTimeoutMs = sp.getLong(KEY_STUCK, 8_000L),
                 hedgeMs = sp.getLong(KEY_HEDGE, 1_500L),
                 reviveMax = sp.getInt(KEY_REVIVE, 1),
-                rendererMode = RendererMode.fromValue(sp.getInt(KEY_RENDERER, RendererMode.AUTO.value))
+                rendererMode = RendererMode.fromValue(sp.getInt(KEY_RENDERER, RendererMode.AUTO.value)),
+                // 默认值随构建类型：debug 包默认开（便于调试），release 包默认关（对普通用户干净）。
+                // 一旦用户在设置里切换过，就以持久化的值为准。
+                diagHudEnabled = sp.getBoolean(KEY_DIAG_HUD, BuildConfig.DEBUG)
             )
         }
 
@@ -120,6 +129,7 @@ data class PlaybackSettings(
                 .putLong(KEY_HEDGE, s.hedgeMs)
                 .putInt(KEY_REVIVE, s.reviveMax)
                 .putInt(KEY_RENDERER, s.rendererMode.value)
+                .putBoolean(KEY_DIAG_HUD, s.diagHudEnabled)
                 .apply()
         }
     }
@@ -183,13 +193,34 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
     /** 正在等待定位到侧边栏的「当前播放频道」（显示侧边栏时临时持有，定位完成后清空） */
     private var pendingCurrentChannel: PlaylistItem? = null
 
-    /** 初始化：根据是否游客加载初始频道 */
+    /** 初始化：根据是否游客加载初始频道，并预热节目栏数据 */
     fun initialize(isGuest: Boolean) {
         _uiState.value = _uiState.value.copy(isGuest = isGuest, storedUsers = ApiClient.getStoredUsers())
         if (isGuest) {
             loadGuestStartChannel()
         } else {
             loadFirstFavoriteChannel()
+        }
+        // 节目栏数据预热：启动即拉（源→分类→频道），首次打开节目栏无需等待
+        preloadSidePanelAfterStart()
+    }
+
+    /**
+     * 启动时预加载节目栏数据。
+     *
+     * 时机：等初始频道起播完成后再拉，避免与起播争抢带宽——老设备（如极米 H1）
+     * 网络与 CPU 较弱，同时并发多个请求会拖慢起播。
+     * 效果：用户按确定键打开节目栏时数据已就绪，不再出现加载 spinner。
+     */
+    private fun preloadSidePanelAfterStart() {
+        viewModelScope.launch {
+            // 等待初始频道就绪（最多等 15 秒；超时也照常预加载，保证节目栏最终有数据）
+            runCatching {
+                withTimeoutOrNull(15_000L) {
+                    while (!_uiState.value.initialChannelLoaded) delay(200)
+                }
+            }
+            loadSidePanelSources()
         }
     }
 
@@ -309,8 +340,15 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
 
     // ===== 侧边栏数据加载 =====
 
-    /** 打开侧边栏时加载源列表 */
+    /** 节目栏源列表加载中标记：防止「启动预热」与「用户手动打开节目栏」重复触发并发加载 */
+    @Volatile
+    private var sourcesLoading = false
+
+    /** 打开侧边栏时加载源列表（启动预热也走这里） */
     fun loadSidePanelSources() {
+        // 已有加载在途则跳过，避免并发请求与状态互相覆盖
+        if (sourcesLoading) return
+        sourcesLoading = true
         viewModelScope.launch {
             try {
                 // 若已有源列表（通常来自当天缓存/内存），直接复用，不显示 spinner
@@ -359,6 +397,9 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                         isLoadingChannels = false
                     )
                 )
+            } finally {
+                // 无论成功/失败/提前 return，都复位加载标记，允许后续重新加载
+                sourcesLoading = false
             }
         }
     }
@@ -739,6 +780,12 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun updateRendererMode(mode: RendererMode) {
         val next = _uiState.value.playbackSettings.copy(rendererMode = mode)
+        commitSettings(next)
+    }
+
+    /** 画面诊断 HUD 开关（持久化，重启后保持上次选择） */
+    fun updateDiagHud(enabled: Boolean) {
+        val next = _uiState.value.playbackSettings.copy(diagHudEnabled = enabled)
         commitSettings(next)
     }
 

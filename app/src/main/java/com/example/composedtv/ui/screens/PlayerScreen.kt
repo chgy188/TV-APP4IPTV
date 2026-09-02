@@ -7,6 +7,7 @@ package com.example.composedtv.ui.screens
 
 import android.util.Log
 import android.view.KeyEvent
+import android.widget.Toast
 import android.view.LayoutInflater
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -73,6 +74,9 @@ import com.example.composedtv.viewmodel.RendererMode
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.Surface as TvSurface
 import com.example.composedtv.R
+import com.example.composedtv.debug.DebugDiagnostics
+import com.example.composedtv.debug.DebugHudHost
+import com.example.composedtv.debug.DebugLogServer
 import com.example.composedtv.player.PlayerEngine
 import com.example.composedtv.player.PlayerState
 import com.example.composedtv.player.PlaylistItem
@@ -99,9 +103,54 @@ fun PlayerScreen(
     val context = LocalContext.current
     val uiState by vm.uiState.collectAsState()
 
+    // 诊断中心初始化（无 ADB 环境下采集播放指标：解码器 / 丢帧 / Surface 注入等）
+    LaunchedEffect(Unit) { DebugDiagnostics.init(context) }
+
     // 创建 PlayerEngine（随 Composable 生命周期管理）
     val engine = remember { PlayerEngine(context) }
     val playerState by engine.stateFlow.collectAsState()
+
+    // ===== 诊断 HUD =====
+    // 遥控器数字键 0：开关 HUD；数字键 9：开关局域网 HTTP 导出服务（PC 浏览器直接看）
+    // 采样状态由 DebugHudHost 自己持有（作用域隔离），避免 HUD 刷新引发整个
+    // PlayerScreen 重组 → AndroidView.update → 重建 Surface → 重启解码器。
+    // 开关状态持久化在 PlaybackSettings.diagHudEnabled（SharedPreferences），
+    // 重启后保持上次选择；此处本地 state 仅用于即时响应，值由配置流同步。
+    var diagVisible by remember { mutableStateOf(uiState.playbackSettings.diagHudEnabled) }
+    var diagServerUrl by remember { mutableStateOf<String?>(null) }
+
+    // 持久化配置 → 本地 state（首次进入 / 其他入口修改设置时同步）
+    LaunchedEffect(uiState.playbackSettings.diagHudEnabled) {
+        diagVisible = uiState.playbackSettings.diagHudEnabled
+        DebugDiagnostics.enabled = diagVisible
+    }
+
+    // 诊断开关：遥控器数字键与设置抽屉共用同一套逻辑（切换后写入持久化配置）
+    val toggleDiag: () -> Unit = {
+        val next = !diagVisible
+        diagVisible = next
+        DebugDiagnostics.enabled = next
+        vm.updateDiagHud(next)
+        Toast.makeText(
+            context,
+            if (next) "诊断 HUD 开" else "诊断 HUD 关",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+    val toggleDiagServer: () -> Unit = {
+        val url = if (DebugLogServer.isRunning()) {
+            DebugLogServer.stop()
+            null
+        } else {
+            DebugLogServer.start()
+        }
+        diagServerUrl = url
+        Toast.makeText(
+            context,
+            url?.let { "诊断服务: $it" } ?: "诊断服务已停止",
+            Toast.LENGTH_LONG
+        ).show()
+    }
 
     // 收集 VM 发送的收藏信号 → 调用局部 engine 执行（不依赖 engine 引用传递）
     LaunchedEffect(Unit) {
@@ -186,6 +235,7 @@ fun PlayerScreen(
     // 生命周期：onResume / onPause / onDestroy
     DisposableEffect(engine) {
         onDispose {
+            DebugLogServer.stop()
             engine.release()
         }
     }
@@ -225,6 +275,8 @@ fun PlayerScreen(
                     engine = engine,
                     vm = vm,
                     _onExit = onExit,
+                    onToggleDiag = toggleDiag,
+                    onToggleDiagServer = toggleDiagServer,
                     currentPlaylistProvider = {
                         val playlist = engine.getCurrentPlaylist()
                         val idx = engine.getCurrentIndex()
@@ -241,6 +293,8 @@ fun PlayerScreen(
                     engine = engine,
                     vm = vm,
                     _onExit = onExit,
+                    onToggleDiag = toggleDiag,
+                    onToggleDiagServer = toggleDiagServer,
                     currentPlaylistProvider = {
                         val playlist = engine.getCurrentPlaylist()
                         val idx = engine.getCurrentIndex()
@@ -248,9 +302,15 @@ fun PlayerScreen(
                     }
                 )
             }
-            // 手势仅在侧边栏关闭时启用，避免与列表项点击 / 滚动冲突
-            .pointerInput(uiState.sidePanelVisible) {
-                if (uiState.sidePanelVisible) return@pointerInput
+            // 手势仅在侧边栏与设置抽屉「都关闭」时启用，避免与列表项点击 / 滚动冲突。
+            // 关键：设置抽屉也必须禁用。抽屉固定在右半屏，而本手势把「右半屏 tap」
+            // 解释为「弹出设置抽屉」——抽屉打开时若手势仍生效，点击抽屉内任意位置
+            // （分类/选项）都会被 onTap 判定为右半屏 tap，再 toggle 一次就把抽屉关掉，
+            // 表现为「点了分类、还没选右排选项就退出」。
+            // 注意：本手势用 awaitFirstDown(requireUnconsumed = false)，指针事件即使
+            // 已被抽屉内部消费，这里仍会收到，因此必须在抽屉打开时主动 return。
+            .pointerInput(uiState.sidePanelVisible, uiState.settingsVisible) {
+                if (uiState.sidePanelVisible || uiState.settingsVisible) return@pointerInput
                 detectTapAndVerticalDragGestures(
                     onTap = { isRightSide ->
                         if (isRightSide) {
@@ -328,14 +388,20 @@ fun PlayerScreen(
                         }
                     })
                     is TextureView -> {
-                        val injectSurface = { tv: TextureView ->
-                            val st = tv.surfaceTexture
-                            if (st != null) engine.setSharedSurface(Surface(st))
+                        // 关键修复（API<23 + TextureView）：
+                        // Surface(surfaceTexture) 每次都会 new 新对象，而 API<23 没有
+                        // setOutputSurface，每次 setVideoSurface 都会重建解码器。
+                        // 因此 TextureView 场景下：缓存同一个 Surface 对象，只注入一次，
+                        // 后续 update 重组不再重复 set（避免"图片轮播"式反复重建）。
+                        val cachedSurface = kotlin.lazy { Surface(videoView.surfaceTexture) }
+                        val injectSurface = {
+                            val st = videoView.surfaceTexture
+                            if (st != null) engine.setSharedSurface(cachedSurface.value)
                         }
                         videoView.addOnAttachStateChangeListener(object :
                             android.view.View.OnAttachStateChangeListener {
                             override fun onViewAttachedToWindow(v: android.view.View) {
-                                v.post { injectSurface(videoView) }
+                                v.post { injectSurface() }
                             }
 
                             override fun onViewDetachedFromWindow(v: android.view.View) {
@@ -343,7 +409,7 @@ fun PlayerScreen(
                             }
                         })
                         // 兜底：view 已 attach 时直接尝试一次
-                        videoView.post { injectSurface(videoView) }
+                        videoView.post { injectSurface() }
                     }
                     else -> {}
                 }
@@ -360,10 +426,11 @@ fun PlayerScreen(
                 view.isClickable = false
                 // 将 PlayerView 的视频 Surface 注入 engine，让竞速所有候选（含代理副路）共用同一 Surface：
                 // 副路可真正出画参与竞速、胜出切换不重建 Surface（修复老电视黑屏/丢帧）
+                // 注意：TextureView 场景已在 factory 注入并缓存 Surface 对象，此处不再重复 set，
+                // 否则每次重组 new 新 Surface + API<23 无 setOutputSurface → 解码器反复重建。
                 val videoView = view.getVideoSurfaceView()
                 val surface = when (videoView) {
                     is SurfaceView -> videoView.holder.surface.takeIf { it.isValid }
-                    is TextureView -> videoView.surfaceTexture?.let { Surface(it) }
                     else -> null
                 }
                 if (surface != null) {
@@ -494,8 +561,26 @@ fun PlayerScreen(
             onHedgeChange = { vm.updateHedge(it) },
             onReviveChange = { vm.updateReviveMax(it) },
             onRendererChange = { vm.updateRendererMode(it) },
-            onClose = { vm.hideSettingsDrawer() }
+            onClose = { vm.hideSettingsDrawer() },
+            diagEnabled = diagVisible,
+            diagServerUrl = diagServerUrl,
+            onToggleDiag = toggleDiag,
+            onToggleDiagServer = toggleDiagServer,
+            onResetDiag = { DebugDiagnostics.resetCounters() }
         )
+
+        // 诊断 HUD（绘制在最上层；遥控器数字键 0 开关）
+        // 设置抽屉 / 节目栏打开时自动隐藏：HUD 固定在右上角，与右侧 560dp 宽的
+        // 设置抽屉、左侧节目栏会重叠遮挡，此时显示 HUD 也无意义。
+        val hudVisible = diagVisible && !uiState.settingsVisible && !uiState.sidePanelVisible
+        if (hudVisible) {
+            DebugHudHost(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(12.dp)
+                    .width(380.dp)
+            )
+        }
 
         // 初始加载中
         if (uiState.isLoading && !uiState.initialChannelLoaded) {
@@ -605,6 +690,8 @@ private fun handlePlayerKeyEvent(
     engine: PlayerEngine,
     vm: PlayerViewModel,
     _onExit: () -> Unit,
+    onToggleDiag: () -> Unit = {},
+    onToggleDiagServer: () -> Unit = {},
     currentPlaylistProvider: () -> PlaylistItem? = { null }
 ): Boolean {
     if (event.type != KeyEventType.KeyDown) return false
@@ -668,6 +755,18 @@ private fun handlePlayerKeyEvent(
                 engine.manualReload()
                 true
             } else false
+        }
+
+        // 数字键 0：开关诊断 HUD（无 ADB 时在画面上直接看解码器/丢帧/Surface 指标）
+        KeyEvent.KEYCODE_0 -> {
+            onToggleDiag()
+            true
+        }
+
+        // 数字键 9：开关局域网诊断 HTTP 服务（PC 浏览器访问投影 IP 查看/导出日志）
+        KeyEvent.KEYCODE_9 -> {
+            onToggleDiagServer()
+            true
         }
 
         // 菜单键：唤出/收起右侧配置抽屉（与侧边栏互斥）
