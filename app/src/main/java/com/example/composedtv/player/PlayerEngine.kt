@@ -733,6 +733,7 @@ class PlayerEngine(private val context: Context) {
      * 播放期致命/卡死兜底：先原地重载当前频道；若已连续重载 PLAYBACK_RELOAD_MAX 次仍失败则跳下一台。
      * 重载成功后(onPlaybackWatcher STATE_READY)会清零 playbackReviveCount，因此只有"连续"卡死才累计跳台。
      */
+    @Suppress("UNUSED_PARAMETER")
     private fun onPlaybackFatal(_exo: ExoPlayer?, _attempt: String, reason: String) {
         if (playlist.isEmpty()) return
         playbackReviveCount++

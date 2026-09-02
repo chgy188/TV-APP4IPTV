@@ -76,7 +76,6 @@ fun SettingsDrawer(
     onHedgeChange: (Long) -> Unit,
     onReviveChange: (Int) -> Unit,
     onRendererChange: (RendererMode) -> Unit,
-    onClose: () -> Unit,
     // ===== 诊断（无 ADB 环境调试用） =====
     diagEnabled: Boolean = false,
     diagServerUrl: String? = null,

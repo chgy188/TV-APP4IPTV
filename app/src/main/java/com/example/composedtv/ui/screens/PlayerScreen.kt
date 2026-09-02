@@ -1,6 +1,5 @@
 @file:OptIn(
-    androidx.tv.material3.ExperimentalTvMaterial3Api::class,
-    androidx.media3.common.util.UnstableApi::class
+    androidx.tv.material3.ExperimentalTvMaterial3Api::class
 )
 
 package com.example.composedtv.ui.screens
@@ -561,7 +560,6 @@ fun PlayerScreen(
             onHedgeChange = { vm.updateHedge(it) },
             onReviveChange = { vm.updateReviveMax(it) },
             onRendererChange = { vm.updateRendererMode(it) },
-            onClose = { vm.hideSettingsDrawer() },
             diagEnabled = diagVisible,
             diagServerUrl = diagServerUrl,
             onToggleDiag = toggleDiag,
@@ -682,6 +680,7 @@ private fun ProxyBadge(modifier: Modifier = Modifier) {
 /**
  * 处理播放器遥控器按键
  */
+@Suppress("UNUSED_PARAMETER")
 private fun handlePlayerKeyEvent(
     event: androidx.compose.ui.input.key.KeyEvent,
     _playerState: PlayerState,
