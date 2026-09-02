@@ -71,8 +71,9 @@ jobs:
             echo "versionName=$VER" >> "$GITHUB_OUTPUT"
             echo "isRelease=true" >> "$GITHUB_OUTPUT"
           else
-            # 非 tag 构建用日期时间戳，避免覆盖正式版本号
-            VER="0.0.0-ci$(date +%Y%m%d%H%M)"
+            # 非 tag 构建用纯数字三段版本号（补丁段放时间戳），
+            # 保证 versionCode 为正数，避免 gradle 报 versionCode=0
+            VER="0.0.$(date +%Y%m%d%H%M)"
             echo "versionName=$VER" >> "$GITHUB_OUTPUT"
             echo "isRelease=false" >> "$GITHUB_OUTPUT"
           fi

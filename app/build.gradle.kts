@@ -34,7 +34,8 @@ android {
                 val major = parts.getOrNull(0)?.toIntOrNull() ?: 0
                 val minor = parts.getOrNull(1)?.toIntOrNull() ?: 0
                 val patch = parts.getOrNull(2)?.toIntOrNull() ?: 0
-                major * 10000 + minor * 100 + patch
+                // 兜底：确保 versionCode 为正整数，避免 CI 异常版本号导致构建失败
+                (major * 10000 + minor * 100 + patch).coerceAtLeast(1)
             }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
