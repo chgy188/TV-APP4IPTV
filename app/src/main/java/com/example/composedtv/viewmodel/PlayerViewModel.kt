@@ -66,7 +66,11 @@ data class ChannelEntry(
     /** 频道归属国（ISO 2 字母代码，来自 iptv-org） */
     val countryAttr: String = "",
     /** 频道语言（ISO 639-3 代码数组，来自 iptv-org） */
-    val langs: List<String> = emptyList()
+    val langs: List<String> = emptyList(),
+    /** 源站要求的自定义请求头：User-Agent（防盗链常用） */
+    val ua: String = "",
+    /** 源站要求的自定义请求头：Referer（服务端字段名 rf，防盗链常用） */
+    val rf: String = ""
 )
 
 /** 视频渲染方式。
@@ -236,7 +240,9 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                             name = guestChannel.name,
                             url = guestChannel.url,
                             sourceId = guestChannel.id,
-                            country = ""
+                            country = "",
+                            ua = guestChannel.ua,
+                            rf = guestChannel.rf
                         )
                     )
                     currentPlaylist = playlist
@@ -275,6 +281,8 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                             sourceId = fav.sourceId,
                             favId = fav.id,
                             isFavorite = true,
+                            ua = fav.ua,
+                            rf = fav.rf,
                             country = ""
                         )
                     }
@@ -519,7 +527,9 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                             sourceId = fav.sourceId,
                             favId = fav.id,
                             isFavorite = true,
-                            category = "收藏"
+                            category = "收藏",
+                            ua = fav.ua,
+                            rf = fav.rf
                         )
                     }
                 } else {
@@ -537,7 +547,9 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                                 isFavorite = false,
                                 category = ch.group,
                                 countryAttr = ch.countryAttr,
-                                langs = ch.langs
+                                langs = ch.langs,
+                                ua = ch.ua,
+                                rf = ch.rf
                             )
                         }
                 }
@@ -599,7 +611,9 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                 sourceId = ch.sourceId,
                 favId = ch.favId,
                 isFavorite = ch.isFavorite,
-                country = ch.countryAttr
+                country = ch.countryAttr,
+                ua = ch.ua,
+                rf = ch.rf
             )
         }
         currentPlaylist = playlist
@@ -660,7 +674,9 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                                 sourceId = source.id,
                                 favId = null,
                                 isFavorite = false,
-                                category = ch.group
+                                category = ch.group,
+                                ua = ch.ua,
+                                rf = ch.rf
                             )
                         }
                         .toList()

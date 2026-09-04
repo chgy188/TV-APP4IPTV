@@ -37,7 +37,11 @@ data class PlaylistItem(
     val sourceId: String? = null,
     val favId: String? = null,
     val isFavorite: Boolean = false,
-    val country: String = ""   // 频道国家/地区，用于"国内IP不走代理"判定
+    val country: String = "",  // 频道国家/地区，用于"国内IP不走代理"判定
+    /** 源站要求的自定义请求头：User-Agent（防盗链常用） */
+    val ua: String = "",
+    /** 源站要求的自定义请求头：Referer（服务端字段名 rf，防盗链常用） */
+    val rf: String = ""
 )
 
 /** 播放器 UI 状态 */
@@ -193,6 +197,8 @@ class PlayerEngine(private val context: Context) {
     private var currentIndex = 0
     /** 当前正在播放的 URL（供 stuck 复活竞速复用） */
     private var currentPlayingUrl: String = ""
+    /** 当前频道的自定义请求头（UA/Referer），仅在直连源站时携带 */
+    private var currentChannelHeaders: Map<String, String> = emptyMap()
     private var consecutiveErrors = 0
     private var flvRetryDone = false
 
@@ -249,6 +255,14 @@ class PlayerEngine(private val context: Context) {
         playCurrent()
     }
 
+    /** 从频道项提取 UA/Referer 作为请求头（防盗链用）。仅直连源站时携带，代理场景由代理端处理。 */
+    private fun buildChannelHeaders(item: PlaylistItem): Map<String, String> {
+        val headers = mutableMapOf<String, String>()
+        if (item.ua.isNotBlank()) headers["User-Agent"] = item.ua
+        if (item.rf.isNotBlank()) headers["Referer"] = item.rf
+        return headers
+    }
+
     private fun playCurrent() {
         if (playlist.isEmpty()) return
         val item = playlist[currentIndex.coerceIn(0, playlist.lastIndex)]
@@ -262,6 +276,8 @@ class PlayerEngine(private val context: Context) {
         flvRetryDone = false
         proxyRetryDone = false
         currentPlayingUrl = item.url
+        // 频道自定义请求头（UA/Referer，防盗链用），仅直连源站时携带
+        currentChannelHeaders = buildChannelHeaders(item)
         DebugDiagnostics.setChannel(item.name, item.url, false)
         // 判断是否直播流：HLS (.m3u8) 和 FLV 视为直播，其余（如 .mp4/.mkv）视为点播
         isLiveStream = isFlvStream(item.url) || item.url.lowercase().let {
@@ -514,6 +530,10 @@ class PlayerEngine(private val context: Context) {
         // 与原 setAllowCrossProtocolRedirects(true) 行为一致。
         val httpFactory = OkHttpDataSource.Factory(playHttpClient)
             .setUserAgent(BROWSER_UA)
+        if (!useProxy && currentChannelHeaders.isNotEmpty()) {
+            // 直连源站才携带频道自定义请求头；代理走自有 worker，无需转发 UA/Referer
+            httpFactory.setDefaultRequestProperties(currentChannelHeaders)
+        }
         val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
 
         val mediaSourceFactory = if (isFlv) {

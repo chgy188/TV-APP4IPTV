@@ -378,6 +378,8 @@ object ApiClient {
                 status = o.optString("s", ""),
                 checkedAt = o.optLong("t", 0L),
                 checkError = o.optString("e", ""),
+                ua = o.optString("ua", ""),
+                rf = o.optString("rf", ""),
                 lastStatus = parseStatus(o.opt("k")),
                 country = o.optString("c", ""),
                 countryAttr = o.optString("a", ""),
@@ -408,7 +410,8 @@ object ApiClient {
                     logo = "",
                     url = o.optString("url", ""),
                     status = "", checkedAt = 0, checkError = "",
-                    lastStatus = -1, country = o.optString("country", "")
+                    lastStatus = -1, country = o.optString("country", ""),
+                    ua = o.optString("ua", ""), rf = o.optString("rf", "")
                 )
             } else null
         } catch (e: Exception) { null }
@@ -519,7 +522,9 @@ object ApiClient {
                 name = name,
                 logo = logo,
                 status = o.optString("status", "").takeIf { it.isNotEmpty() }
-                    ?: ch.optString("status", "").takeIf { it.isNotEmpty() }
+                    ?: ch.optString("status", "").takeIf { it.isNotEmpty() },
+                ua = ch.optString("ua", "").takeIf { it.isNotEmpty() } ?: o.optString("ua", ""),
+                rf = ch.optString("rf", "").takeIf { it.isNotEmpty() } ?: o.optString("rf", "")
             ))
         }
         cachedFavorites = list

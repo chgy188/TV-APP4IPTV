@@ -28,7 +28,11 @@ data class ApiChannel(
     /** 频道归属国（ISO 2 字母代码，来自 iptv-org，前端显示用） */
     val countryAttr: String = "",
     /** 频道语言（ISO 639-3 代码数组，来自 iptv-org，前端显示用） */
-    val langs: List<String> = emptyList()
+    val langs: List<String> = emptyList(),
+    /** 源站要求的自定义请求头：User-Agent（防盗链常用） */
+    val ua: String = "",
+    /** 源站要求的自定义请求头：Referer（服务端字段名 rf，防盗链常用） */
+    val rf: String = ""
 )
 
 data class AuthResult(
@@ -52,7 +56,11 @@ data class ApiFavorite(
     val sourceId: String?,
     val name: String,
     val logo: String?,
-    val status: String?
+    val status: String?,
+    /** 源站要求的自定义请求头：User-Agent（防盗链常用） */
+    val ua: String = "",
+    /** 源站要求的自定义请求头：Referer（服务端字段名 rf，防盗链常用） */
+    val rf: String = ""
 )
 
 data class ApiSquareItem(
