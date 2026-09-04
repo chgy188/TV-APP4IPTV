@@ -15,8 +15,7 @@ val keystoreProperties = Properties().apply {
 
 // 自动版本号：本地用固定版本；CI 打 tag 时通过 APP_VERSION_NAME 覆盖（如 v1.2.3）
 val appVersionName: String = System.getenv("APP_VERSION_NAME") ?: "1.0.0"
-// CI 开关：true 时产出 universal APK（合并所有 ABI 成一个包）
-val ciUniversal: Boolean = System.getenv("CI_UNIVERSAL") == "true"
+// 注：已不按 ABI 分包，统一产出单一 APK（详见下方 splits 说明）
 
 android {
     namespace = "com.example.composedtv"
@@ -54,13 +53,14 @@ android {
         }
     }
 
+    // 统一产出单一 APK，不做 ABI 分包：
+    // 本项目不含 native .so（media3 / OkHttp / Compose 均为纯 Kotlin / Java，
+    // 解码由系统 MediaCodec 提供），按 ABI 拆分既不节省体积，
+    // 又会让 Release 出现多个 APK、导致用户装错包。
+    // 若将来引入 native 库（如 media3 的 FFmpeg 解码扩展），可重新启用下面的 abi split。
     splits {
         abi {
-            isEnable = true
-            reset()
-            include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-            // 本地默认只出各 ABI；CI 设 CI_UNIVERSAL=true 时额外产出 universal 单包
-            isUniversalApk = ciUniversal
+            isEnable = false
         }
     }
 

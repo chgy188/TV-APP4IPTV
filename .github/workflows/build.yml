@@ -79,11 +79,10 @@ jobs:
           fi
 
       # ---- 构建：main/tag → release(含 universal)；PR → 仅 debug ----
-      - name: Build Release APK (universal + per-ABI)
+      - name: Build Release APK
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         env:
           APP_VERSION_NAME: ${{ steps.version.outputs.versionName }}
-          CI_UNIVERSAL: "true"
         run: ./gradlew assembleRelease --no-daemon
 
       - name: Build Debug APK (PR)

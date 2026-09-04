@@ -178,7 +178,7 @@ object DebugLogServer {
             append(row("渲染帧 / 丢帧 / 丢到关键帧", "${s.renderedTotal} / ${s.droppedTotal} / ${s.droppedToKeyframe}", s.droppedToKeyframe > 0))
             append(row("Surface 注入(调用/实际执行)", "${s.surfaceInjectCalls} / ${s.surfaceInjectApplied}", s.surfaceInjectApplied > 3))
             append(row("Player 创建 / 释放", "${s.playerCreateCount} / ${s.playerReleaseCount}", s.playerCreateCount - s.playerReleaseCount > 1))
-            append(row("竞速启动 / 重载次数", "${s.raceStartCount} / ${s.reloadCount}", s.reloadCount > 2))
+            append(row("起播 / 重载次数", "${s.raceStartCount} / ${s.reloadCount}", s.reloadCount > 2))
             append(row("最近重载原因", s.lastReloadReason, false))
             append(row("错误数 / 最近错误", "${s.errorCount} / ${s.lastError}", s.errorCount > 0))
             append(row("日志行数 / 路径", "${s.logLines} / ${s.logPath}", false))

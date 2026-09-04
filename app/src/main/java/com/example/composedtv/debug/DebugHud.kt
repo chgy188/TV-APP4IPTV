@@ -63,7 +63,7 @@ fun DebugHud(s: DiagSnapshot, modifier: Modifier = Modifier) {
             .padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(1.dp)
     ) {
-        HudTitle("DIAG · API ${s.sdkInt} · ${s.abi} · legacy=${s.legacy} · ${s.rendererMode}")
+        HudTitle("DIAG · API ${s.sdkInt} · legacy=${s.legacy} · ${s.rendererMode}")
         HudLine("频道", s.channelName.ifEmpty { "-" }, s.usingProxy)
         HudLine("解码器", s.decoderName, softDecode)
         HudLine(
@@ -89,7 +89,7 @@ fun DebugHud(s: DiagSnapshot, modifier: Modifier = Modifier) {
             s.surfaceInjectApplied > 3
         )
         HudLine("Player", "创建${s.playerCreateCount} 释放${s.playerReleaseCount}", s.playerCreateCount - s.playerReleaseCount > 1)
-        HudLine("竞速/重载", "${s.raceStartCount} / ${s.reloadCount} (${s.lastReloadReason})", s.reloadCount > 2)
+        HudLine("起播/重载", "${s.raceStartCount} / ${s.reloadCount} (${s.lastReloadReason})", s.reloadCount > 2)
         HudLine("错误", "${s.errorCount} · ${s.lastError}", s.errorCount > 0)
         if (s.serverRunning) {
             HudLine("HTTP", s.serverUrl, false)

@@ -90,8 +90,8 @@ app/src/main/java/com/example/composedtv/
 ./gradlew installDebug
 ```
 
-- `build.gradle.kts` 本地默认启用 **ABI splits**（armeabi-v7a / arm64-v8a / x86 / x86_64），产出按架构分离的 APK。
-- 在 CI 中设环境变量 `CI_UNIVERSAL=true` 会额外产出 **universal 单包**（合并所有 ABI），方便直接分发。
+- 不做 ABI 分包，统一产出**单一 APK**：本项目不含 native `.so`（media3 / OkHttp / Compose 均为纯 Kotlin / Java，解码由系统 MediaCodec 提供），按架构拆分既不省体积，又会让 Release 出现多个包导致用户装错。
+  若将来引入 native 库（如 FFmpeg 解码扩展），可在 `app/build.gradle.kts` 重新启用 `splits.abi`。
 - Release 开启 `minify` + `shrinkResources` + proguard。
 
 ## GitHub Actions 自动构建
@@ -122,7 +122,7 @@ app/src/main/java/com/example/composedtv/
 
 ### 3. 产物位置
 
-- Actions 页面 → 对应 run → **Artifacts** 区域下载 `apks-<版本号>`（含 release 各 ABI + universal，以及 PR 场景下的 debug）。
+- Actions 页面 → 对应 run → **Artifacts** 区域下载 `apks-<版本号>`（含签名后的 release 单包，以及 PR 场景下的 debug）。
 - 打 tag 时可直接在仓库 **Releases** 页面下载签名 APK。
 
 ## ⚠️ 安全与 .gitignore
