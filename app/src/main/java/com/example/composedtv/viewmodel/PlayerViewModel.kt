@@ -92,10 +92,9 @@ enum class RendererMode(val value: Int) {
 data class PlaybackSettings(
     /** 直连胜出后持续缓冲判定 stuck 的时长（毫秒） */
     val stuckTimeoutMs: Long = 8_000L,
-    /** 副路径（代理）延迟启动毫秒数 */
-    val hedgeMs: Long = 1_500L,
-    /** 直连胜出后 stuck 时最多复活代理候选的次数 */
-    val reviveMax: Int = 1,
+    /** 代理候选的起播超时（毫秒）：代理路径多一跳、握手更慢，需比直连更长容忍。
+     *  超过该时长仍未 READY 则切换下一个候选；网络差 / 代理慢时可调大，避免被误判为不可播 */
+    val proxyTimeoutMs: Long = 10_000L,
     /** 视频渲染方式（AUTO / SURFACE / TEXTURE） */
     val rendererMode: RendererMode = RendererMode.AUTO,
     /** 画面诊断 HUD 开关（无 ADB 环境调试用；持久化保存，重启后保持上次选择） */
@@ -104,8 +103,7 @@ data class PlaybackSettings(
     companion object {
         private const val PREF_NAME = "playback_settings"
         private const val KEY_STUCK = "stuck_timeout_ms"
-        private const val KEY_HEDGE = "race_hedge_ms"
-        private const val KEY_REVIVE = "proxy_revive_max"
+        private const val KEY_PROXY_TIMEOUT = "proxy_timeout_ms"
         private const val KEY_RENDERER = "renderer_mode"
         private const val KEY_DIAG_HUD = "diag_hud_enabled"
 
@@ -113,8 +111,7 @@ data class PlaybackSettings(
             val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             return PlaybackSettings(
                 stuckTimeoutMs = sp.getLong(KEY_STUCK, 8_000L),
-                hedgeMs = sp.getLong(KEY_HEDGE, 1_500L),
-                reviveMax = sp.getInt(KEY_REVIVE, 1),
+                proxyTimeoutMs = sp.getLong(KEY_PROXY_TIMEOUT, 10_000L),
                 rendererMode = RendererMode.fromValue(sp.getInt(KEY_RENDERER, RendererMode.AUTO.value)),
                 // 默认值随构建类型：debug 包默认开（便于调试），release 包默认关（对普通用户干净）。
                 // 一旦用户在设置里切换过，就以持久化的值为准。
@@ -126,8 +123,7 @@ data class PlaybackSettings(
             val sp: SharedPreferences = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             sp.edit()
                 .putLong(KEY_STUCK, s.stuckTimeoutMs)
-                .putLong(KEY_HEDGE, s.hedgeMs)
-                .putInt(KEY_REVIVE, s.reviveMax)
+                .putLong(KEY_PROXY_TIMEOUT, s.proxyTimeoutMs)
                 .putInt(KEY_RENDERER, s.rendererMode.value)
                 .putBoolean(KEY_DIAG_HUD, s.diagHudEnabled)
                 .apply()
@@ -138,8 +134,11 @@ data class PlaybackSettings(
 /** 设置抽屉可选值集合（供 UI 渲染单选列表） */
 object PlaybackSettingOptions {
     val stuckOptions = listOf(5_000L to "5秒", 8_000L to "8秒(默认)", 12_000L to "12秒")
-    val hedgeOptions = listOf(1_000L to "1秒", 1_500L to "1.5秒(默认)", 2_500L to "2.5秒")
-    val reviveOptions = listOf(0 to "0次(关闭)", 1 to "1次(默认)", 2 to "2次")
+    val proxyTimeoutOptions = listOf(
+        7_000L to "7秒(网络好)",
+        10_000L to "10秒(默认)",
+        15_000L to "15秒(网络差)"
+    )
     val rendererOptions = listOf(
         RendererMode.AUTO to "自动(默认)",
         RendererMode.SURFACE to "SurfaceView(性能优)",
@@ -768,13 +767,8 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
         commitSettings(next)
     }
 
-    fun updateHedge(ms: Long) {
-        val next = _uiState.value.playbackSettings.copy(hedgeMs = ms)
-        commitSettings(next)
-    }
-
-    fun updateReviveMax(n: Int) {
-        val next = _uiState.value.playbackSettings.copy(reviveMax = n)
+    fun updateProxyTimeout(ms: Long) {
+        val next = _uiState.value.playbackSettings.copy(proxyTimeoutMs = ms)
         commitSettings(next)
     }
 

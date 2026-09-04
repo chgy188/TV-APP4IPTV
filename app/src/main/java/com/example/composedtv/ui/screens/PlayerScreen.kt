@@ -442,16 +442,38 @@ fun PlayerScreen(
                 .focusable(enabled = !uiState.settingsVisible)
         )
 
-        // 加载中 spinner
+        // 加载中 spinner + 当前加载模式 / 超时（简洁展示）
         if (playerState.isLoading) {
             Box(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
             ) {
-                CircularProgressIndicator(
-                    color = MaterialTheme.colorScheme.primary,
-                    strokeWidth = 3.dp
-                )
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    CircularProgressIndicator(
+                        color = MaterialTheme.colorScheme.primary,
+                        strokeWidth = 3.dp
+                    )
+                    Text(
+                        text = when (playerState.loadMode) {
+                            "proxy" -> "代理加载中…"
+                            else -> "直连加载中…"
+                        },
+                        color = Color.White,
+                        fontSize = 15.sp
+                    )
+                    if (playerState.loadRemainMs > 0) {
+                        // 向上取整，避免最后一秒显示 0
+                        val remainSec = (playerState.loadRemainMs + 999) / 1000
+                        Text(
+                            text = "${remainSec}s 后自动切换",
+                            color = Color.Gray,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
             }
         }
 
@@ -557,8 +579,7 @@ fun PlayerScreen(
             visible = uiState.settingsVisible,
             settings = uiState.playbackSettings,
             onStuckTimeoutChange = { vm.updateStuckTimeout(it) },
-            onHedgeChange = { vm.updateHedge(it) },
-            onReviveChange = { vm.updateReviveMax(it) },
+            onProxyTimeoutChange = { vm.updateProxyTimeout(it) },
             onRendererChange = { vm.updateRendererMode(it) },
             diagEnabled = diagVisible,
             diagServerUrl = diagServerUrl,

@@ -136,6 +136,8 @@ dependencies {
     implementation("androidx.media3:media3-ui:1.2.1")
     implementation("androidx.media3:media3-common:1.2.1")
     implementation("androidx.media3:media3-extractor:1.2.1")
+    // OkHttp 数据源（连接复用、HTTP/2），版本需与 media3 主版本严格一致
+    implementation("androidx.media3:media3-datasource-okhttp:1.2.1")
 
     // OkHttp
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

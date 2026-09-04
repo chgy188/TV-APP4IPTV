@@ -11,7 +11,7 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -26,6 +26,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import okhttp3.ConnectionPool
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
 
 /** 播放列表项 */
 data class PlaylistItem(
@@ -50,7 +53,13 @@ data class PlayerState(
     /** 操作结果提示（如"已收藏"/"请先登录"等），显示在信息条上，3 秒后自动清空 */
     val transientHint: String? = null,
     /** 当前播放是否经由 HLS 代理（用于 UI 显示代理标识） */
-    val usingProxy: Boolean = false
+    val usingProxy: Boolean = false,
+    /** 当前正在尝试的加载模式（"direct"/"proxy"），仅加载中有效；胜出或失败时置空，供 UI 简洁展示 */
+    val loadMode: String? = null,
+    /** 起播超时（毫秒）：超过该时长仍未 READY 则自动切换下一个候选；0 表示不展示 */
+    val loadTimeoutMs: Long = 0L,
+    /** 当前尝试的剩余超时（毫秒），每秒刷新，供 UI 倒计时显示；0 表示不展示 */
+    val loadRemainMs: Long = 0L
 )
 
 /**
@@ -59,10 +68,13 @@ data class PlayerState(
  * 从 tv4iptv PlayerActivity 移植，适配 Compose 生命周期。
  * 通过 [stateFlow] 暴露 UI 状态，通过 [player] 暴露 ExoPlayer 实例供 PlayerView 绑定。
  *
- * 播放优化（可配置，见 PlayerViewModel.PlaybackSettings）：
- * - stuckTimeoutMs：直连胜出后持续缓冲判定卡顿的时长
- * - raceHedgeMs：副路径（代理）延迟启动毫秒数
- * - proxyReviveMax：直连胜出后卡顿复活代理的次数
+ * 播放策略（串行尝试，见 [startRace]）：
+ * 按 planPlay 给出的顺序逐个尝试（直连 → 代理），同一时刻只存在 1 个 ExoPlayer，
+ * 避免并行多路解码导致小内存设备 OOM；失败或超时（START_ATTEMPT_TIMEOUT_MS）
+ * 即切换下一个尝试，全部用尽才走失败处理（切台）。
+ *
+ * 可配置（见 PlayerViewModel.PlaybackSettings）：
+ * - stuckTimeoutMs：持续缓冲超过该时长且播放位置不前进 → 判定卡顿并原地重载
  *
  * 国内频道（country 为 CN/SK/澳门等）：完全不走代理，仅直连。
  */
@@ -72,29 +84,40 @@ class PlayerEngine(private val context: Context) {
         private const val TAG = "PlayerEngine"
         /** 老设备（Android 6.0.1 及以下，如海信老电视）适配阈值：降级为单路顺序播放，避免双路解码卡顿 */
         private const val LEGACY_SDK_MAX = 23
-        /** 竞速 watchdog：老设备起播/解码更慢，放宽超时避免误 reload */
-        private val WATCHDOG_TIMEOUT_MS: Long
-            get() = if (android.os.Build.VERSION.SDK_INT <= LEGACY_SDK_MAX) 15_000L else 8_000L
         private val BROWSER_UA =
             "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) " +
             "Chrome/120.0.0.0 Mobile Safari/537.36"
+
+        /**
+         * 播放专用 OkHttpClient：与 ApiClient 的 client 隔离（后者挂了 logging-interceptor，
+         * 播放是海量小分片请求，日志拦截器会带来严重性能与内存开销）。
+         * 进程内单例共享以复用连接池：HLS 每几秒请求一个分片，连接复用可显著减少 TCP/TLS 重连开销。
+         */
+        private val playHttpClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .connectionPool(ConnectionPool(8, 30, TimeUnit.SECONDS))
+                .retryOnConnectionFailure(true)
+                .build()
+        }
+
+        /** 记忆"上次成功播放模式"的 SP 文件与 key 前缀 */
+        private const val PREF_PLAY_MODE = "play_mode_cache"
+        private const val KEY_LAST_MODE = "last_mode_"
+        /** 记忆条目上限，超出则整体清空，避免长期运行无界增长 */
+        private const val MAX_PLAY_MODE_ENTRIES = 500
         // ===== 可被设置抽屉注入的播放参数（下方 var 为运行时值，此处为默认值） =====
-        private const val DEFAULT_STUCK_TIMEOUT_MS = 8_000L   // 直连胜出后持续缓冲判定 stuck 的时长
-        private const val DEFAULT_RACE_HEDGE_MS = 800L         // 副路径（代理）延迟启动
-        private const val DEFAULT_PROXY_REVIVE_MAX = 1        // 直连胜出后 stuck 时最多复活代理的次数
-        private const val REVIVE_COOLDOWN_MS = 3_000L         // 两次复活最小间隔，防疯抢
+        private const val DEFAULT_STUCK_TIMEOUT_MS = 8_000L   // 持续缓冲判定 stuck 的时长
+        private const val DEFAULT_PROXY_TIMEOUT_MS = 10_000L  // 代理候选起播超时（可由设置抽屉注入）
 
         // 判定为"国内"的渠道：完全不走代理（CN=中国, SK=韩国, MO/MACAU/澳门）
         private val DOMESTIC_COUNTRIES = setOf("CN", "SK", "MO", "MACAU", "澳门")
     }
 
     // ===== 可注入播放参数（由设置抽屉经 ViewModel 注入） =====
-    /** 持续缓冲超过该时长且播放位置不前进 → 判定 stuck */
+    /** 持续缓冲超过该时长且播放位置不前进 → 判定 stuck（触发原地重载） */
     var stuckTimeoutMs = DEFAULT_STUCK_TIMEOUT_MS
-    /** 副路径（代理）延迟启动毫秒数 */
-    var raceHedgeMs = DEFAULT_RACE_HEDGE_MS
-    /** 直连胜出后 stuck 时最多复活代理候选的次数 */
-    var proxyReviveMax = DEFAULT_PROXY_REVIVE_MAX
 
     /** 由 PlayerScreen 注入共享 Surface（PlayerView 就绪后其视频渲染 Surface 非空）。
      *  之后创建的所有竞速候选（含代理副路）都会绑定该 Surface，实现真正的双路竞速且切换无黑屏。
@@ -136,11 +159,9 @@ class PlayerEngine(private val context: Context) {
     /** 把设置抽屉里的值同步进 engine（PlaybackSettings 定义在 PlayerViewModel） */
     fun applyPlaybackSettings(s: com.example.composedtv.viewmodel.PlaybackSettings) {
         stuckTimeoutMs = s.stuckTimeoutMs
-        raceHedgeMs = s.hedgeMs
-        // 老设备（如海信 Android 6）：复活代理会并行双解码，直接拖垮弱解码器，故强制关闭
-        proxyReviveMax = if (isLegacyDevice()) 0 else s.reviveMax
+        proxyTimeoutMs = s.proxyTimeoutMs
         DebugDiagnostics.setEnv(isLegacyDevice(), s.rendererMode.name)
-        Log.d(TAG, "applyPlaybackSettings: stuck=${stuckTimeoutMs} hedge=${raceHedgeMs} revive=${proxyReviveMax} legacy=${isLegacyDevice()}")
+        Log.d(TAG, "applyPlaybackSettings: stuck=${stuckTimeoutMs} proxy=${proxyTimeoutMs} legacy=${isLegacyDevice()}")
     }
 
     /** 是否老设备：Android 6.0.1 (API 23) 及以下。老设备解码/渲染能力弱，需要降级策略 */
@@ -186,36 +207,27 @@ class PlayerEngine(private val context: Context) {
         var exo: ExoPlayer?,
         var failed: Boolean = false
     )
-    /** 竞速 watchdog 连续超时次数：达到 [RACE_TIMEOUT_MAX] 后不再原地重载，改为切台。
-     * 用于解决「死源一直 BUFFERING 但不报错」时永不切台的问题——
-     * 这类源不会触发 onPlayerError，因此 raceCandidateFailed / handlePlayFailure
-     * （唯一切台入口）永不执行，watchdog 只能无限原地重载同一频道。 */
-    private var raceTimeoutCount = 0
-
-    /** 竞速连续超时上限：第 1 次超时原地重载（给一次机会），达到上限则切下一台。
-     * 老设备 15s×2=30s、非老设备 8s×2=16s 后切台。 */
-    private val RACE_TIMEOUT_MAX = 2
-
     private var raceActive = false
     private var raceDecided = false
     private var raceCandidates = listOf<RaceCandidate>()
-    private var raceHedgeJob: Job? = null
     private var racePlayToken = 0
-    private var watchdogJob: Job? = null
 
-    // 闸门竞速：直连胜出后的 stuck 监测 + 代理复活
-    /** 直连胜出后 stuck 时允许复活代理候选的剩余次数（上限见 proxyReviveMax） */
-    private var proxyReviveBudget = 0
-    /** 是否正处于"复活代理"竞速阶段（用于终局判定：双路皆败直接跳台） */
-    private var wasReviving = false
-    /** stuck 监测协程 */
-    private var stuckMonitorJob: Job? = null
-    /** 上一次报告的播放位置，用于判断"是否在前进" */
-    private var lastReportedPositionMs = 0L
-    /** 上次复活时间戳，用于冷却间隔 */
-    private var lastReviveAt = 0L
+    // ===== 串行起播状态（同时刻只存在 1 个 ExoPlayer） =====
+    /** 当前起播的尝试序列（如 [direct, proxy]），按序串行尝试 */
+    private var currentAttempts = listOf<String>()
+    /** 当前正在尝试 [currentAttempts] 的下标（-1 表示尚未开始） */
+    private var currentAttemptIndex = -1
+    /** 单个尝试的起播超时协程：超时未 READY 即切下一个尝试 */
+    private var attemptTimeoutJob: Job? = null
+    /** 单个尝试的起播超时：超时即切换下一个（连接类错误会立即切换，不走这里）。
+     *  取 3.5s：既能覆盖正常起播，又不会让"慢但不报错"的源拖太久。 */
+    private val START_ATTEMPT_TIMEOUT_MS = 3_500L
+    /** 代理候选专属起播超时：代理路径多一跳、握手更慢，给更长容忍，避免被误判为不可播。
+     *  可由设置抽屉注入（applyPlaybackSettings），默认 [DEFAULT_PROXY_TIMEOUT_MS] */
+    var proxyTimeoutMs = DEFAULT_PROXY_TIMEOUT_MS
+
     /** 由 PlayerScreen 注入的共享视频 Surface（PlayerView 的 videoSurface）。
-     *  所有竞速候选共用一个 Surface：副路可真正出画参与竞速，胜出切换时不重建 Surface（修复老电视"有声音没画面"） */
+     *  串行切换尝试时复用同一 Surface，避免 Surface 重建导致老电视"有声音没画面" */
     private var sharedSurface: android.view.Surface? = null
     /** 老设备专用：本频道直连失败后是否已顺序重试过代理（最多 1 次，避免双解码） */
     private var proxyRetryDone = false
@@ -240,12 +252,9 @@ class PlayerEngine(private val context: Context) {
     private fun playCurrent() {
         if (playlist.isEmpty()) return
         val item = playlist[currentIndex.coerceIn(0, playlist.lastIndex)]
-        // 进入新一轮竞速：清除重载荷载锁，允许后续（若仍卡死）再次兜底重载
+        // 进入新一轮起播：清除重载荷载锁，允许后续（若仍卡死）再次兜底重载
         isReloading = false
         resetRace()
-        stopStuckMonitor()
-        proxyReviveBudget = 0
-        wasReviving = false
         player?.stop()
         player?.release()
         DebugDiagnostics.onPlayerReleased()
@@ -286,7 +295,6 @@ class PlayerEngine(private val context: Context) {
     fun playNext() {
         if (playlist.isEmpty()) return
         currentIndex = (currentIndex + 1) % playlist.size
-        wasReviving = false
         showInfoTransient()
         playCurrent()
     }
@@ -420,13 +428,58 @@ class PlayerEngine(private val context: Context) {
         return listOf("direct", "proxy")
     }
 
+    /**
+     * 记忆上次成功模式：把上次胜出的模式排到尝试列表最前，
+     * 使"必须走代理的源"无需每次先失败一次直连（省一次等待）。
+     *
+     * 串行兜底仍在（记忆模式失败会继续试其余候选），
+     * 因此最坏情况退化为固定顺序 [direct, proxy]，不会比现状更差。
+     */
+    private fun reorderByLastMode(url: String, attempts: List<String>): List<String> {
+        if (attempts.size <= 1) return attempts
+        val last = loadLastMode(url) ?: return attempts
+        if (last !in attempts) return attempts
+        val reordered = listOf(last) + attempts.filter { it != last }
+        if (reordered != attempts) Log.d(TAG, "记忆模式生效: $url -> $reordered")
+        return reordered
+    }
+
+    /** url → 短 key（MD5），避免超长 url 直接作为 SP key */
+    private fun modeKey(url: String): String = try {
+        java.security.MessageDigest.getInstance("MD5")
+            .digest(url.toByteArray())
+            .joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    } catch (e: Exception) {
+        url.hashCode().toString()
+    }
+
+    private fun loadLastMode(url: String): String? = try {
+        context.getSharedPreferences(PREF_PLAY_MODE, Context.MODE_PRIVATE)
+            .getString(KEY_LAST_MODE + modeKey(url), null)
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun saveLastMode(url: String, mode: String) {
+        try {
+            val sp = context.getSharedPreferences(PREF_PLAY_MODE, Context.MODE_PRIVATE)
+            // 条目超限：整体清空后重新累积
+            if (sp.all.size >= MAX_PLAY_MODE_ENTRIES) {
+                sp.edit().clear().apply()
+            }
+            sp.edit().putString(KEY_LAST_MODE + modeKey(url), mode).apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "保存上次成功模式失败: ${e.message}")
+        }
+    }
+
     private fun playUrl(url: String, country: String = "", forceProxy: Boolean = false) {
         if (url.isBlank()) {
             handlePlayFailure()
             return
         }
         currentPlayingUrl = url
-        val attempts = if (forceProxy) listOf("proxy") else planPlay(url, country)
+        val attempts = if (forceProxy) listOf("proxy") else reorderByLastMode(url, planPlay(url, country))
         Log.d(TAG, "planPlay($url) -> $attempts country=$country forceProxy=$forceProxy")
         startRace(url, attempts)
     }
@@ -454,11 +507,13 @@ class PlayerEngine(private val context: Context) {
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
 
-        val httpFactory = DefaultHttpDataSource.Factory()
+        // 网络栈：OkHttp（连接复用、HTTP/2、可定制 DNS/超时），替代 HttpURLConnection 版 DefaultHttpDataSource。
+        // 注意：传入 client 后超时由 client 控制（connectTimeout / readTimeout），
+        // OkHttpDataSource 自带的 setConnectTimeoutMs / setReadTimeoutMs 会被忽略，故不要在此设置。
+        // 跨协议重定向（http→https）由 OkHttp 的 followSslRedirects 控制（默认 true），
+        // 与原 setAllowCrossProtocolRedirects(true) 行为一致。
+        val httpFactory = OkHttpDataSource.Factory(playHttpClient)
             .setUserAgent(BROWSER_UA)
-            .setConnectTimeoutMs(15_000)
-            .setReadTimeoutMs(30_000)
-            .setAllowCrossProtocolRedirects(true)
         val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
 
         val mediaSourceFactory = if (isFlv) {
@@ -528,37 +583,90 @@ class PlayerEngine(private val context: Context) {
         return p
     }
 
+    /**
+     * 串行起播：按 [attempts] 顺序逐个尝试（直连 → 代理），同一时刻只存在 1 个 ExoPlayer。
+     *
+     * 相比旧的"并行竞速"（直连与代理同时拉流、先 READY 者胜）：
+     * - 内存恒定单路：不再有 2~3 套解码器与大缓冲并存，根治小内存 TV 设备 OOM 闪退；
+     * - 弱网更稳：不再把本已紧张的带宽翻倍（旧方案在弱网下是负反馈）；
+     * - 逻辑线性：失败/超时即切下一个，无需 raceCandidates 多路状态机。
+     *
+     * 起播延迟由 [START_ATTEMPT_TIMEOUT_MS] 控制：单个尝试超时即切换，
+     * 而连接类错误（onPlayerError）会立即切换，几乎不增加等待。
+     */
     private fun startRace(url: String, attempts: List<String>) {
-        val myToken = ++racePlayToken
         raceActive = true
         raceDecided = false
         raceCandidates = emptyList()
+        currentAttempts = attempts
+        currentAttemptIndex = -1
         updateState(isLoading = true)
         DebugDiagnostics.onRaceStart()
-        Log.d(TAG, "竞速开始: $attempts")
+        Log.d(TAG, "串行起播: $attempts")
+        tryNextAttempt(url)
+    }
 
-        val firstAttempt = attempts[0]
-        val c0 = RaceCandidate(firstAttempt, null, false)
-        c0.exo = createCandidatePlayer(url, firstAttempt == "proxy", winner = true)
-        setPlayerRef(c0.exo)
-        raceCandidates = listOf(c0)
-        attachCandidateListener(c0, url, myToken)
-        startWatchdog()
-
-        if (attempts.size > 1) {
-            raceHedgeJob?.cancel()
-            raceHedgeJob = scope.launch {
-                delay(raceHedgeMs)
-                if (raceDecided || myToken != racePlayToken) return@launch
-                val c0State = c0.exo?.playbackState ?: Player.STATE_IDLE
-                if (c0State == Player.STATE_READY) return@launch
-                Log.d(TAG, "直连较慢，启动代理竞速…")
-                val c1 = RaceCandidate(attempts[1], null, false)
-                c1.exo = createCandidatePlayer(url, attempts[1] == "proxy", winner = false)
-                raceCandidates = raceCandidates + c1
-                attachCandidateListener(c1, url, myToken)
-            }
+    /** 尝试 [currentAttempts] 中的下一个；全部用尽则走 [handlePlayFailure]（切台） */
+    private fun tryNextAttempt(url: String) {
+        val nextIndex = currentAttemptIndex + 1
+        if (nextIndex >= currentAttempts.size) {
+            Log.w(TAG, "串行起播：所有尝试均失败，走失败处理 url=$url")
+            raceActive = false
+            raceDecided = true
+            stopAttemptTimeout()
+            updateState(loadMode = null, loadTimeoutMs = 0, loadRemainMs = 0)
+            handlePlayFailure()
+            return
         }
+        // 递增 token：使上一个尝试的 listener 立即失效，避免已释放 player 的回调串扰
+        val myToken = ++racePlayToken
+        currentAttemptIndex = nextIndex
+        val attempt = currentAttempts[nextIndex]
+        Log.d(TAG, "串行尝试[$nextIndex/${currentAttempts.size}]: $attempt")
+        // 简洁展示：UI 加载区显示当前正在尝试的模式（直连/代理）与超时阈值
+        val loadTimeout = if (attempt == "proxy") proxyTimeoutMs else START_ATTEMPT_TIMEOUT_MS
+        updateState(loadMode = attempt, loadTimeoutMs = loadTimeout, loadRemainMs = loadTimeout)
+
+        // 先释放上一个尝试的 player，确保同一时刻只有 1 个 ExoPlayer（内存恒定单路）
+        for (c in raceCandidates) {
+            c.exo?.stop()
+            c.exo?.release()
+            DebugDiagnostics.onPlayerReleased()
+        }
+
+        val cand = RaceCandidate(attempt, null, false)
+        cand.exo = createCandidatePlayer(url, attempt == "proxy", winner = true)
+        setPlayerRef(cand.exo)
+        raceCandidates = listOf(cand)
+        attachCandidateListener(cand, url, myToken)
+        startAttemptTimeout(url, myToken)
+    }
+
+    /** 单个尝试的起播超时：超过阈值仍未 READY → 切换下一个尝试；代理候选用更长超时 */
+    private fun startAttemptTimeout(url: String, token: Int) {
+        val attempt = currentAttempts.getOrNull(currentAttemptIndex) ?: return
+        val timeout = if (attempt == "proxy") proxyTimeoutMs else START_ATTEMPT_TIMEOUT_MS
+        attemptTimeoutJob?.cancel()
+        attemptTimeoutJob = scope.launch {
+            // 每秒刷新剩余时间供 UI 倒计时；倒计时归零即切换下一个候选。
+            // 最后一步按真实剩余时间 delay，保证总时长精确等于 timeout（不被整秒步进拉长）
+            var remainMs = timeout
+            while (remainMs > 0) {
+                if (token != racePlayToken || raceDecided) return@launch
+                updateState(loadRemainMs = remainMs)
+                val step = minOf(1_000L, remainMs)
+                delay(step)
+                remainMs -= step
+            }
+            if (token != racePlayToken || raceDecided) return@launch
+            Log.w(TAG, "串行尝试超时(${timeout}ms)未起播，切换下一个: $attempt")
+            tryNextAttempt(url)
+        }
+    }
+
+    private fun stopAttemptTimeout() {
+        attemptTimeoutJob?.cancel()
+        attemptTimeoutJob = null
     }
 
     private fun attachCandidateListener(cand: RaceCandidate, url: String, token: Int) {
@@ -567,7 +675,10 @@ class PlayerEngine(private val context: Context) {
             override fun onPlaybackStateChanged(state: Int) {
                 if (token != racePlayToken || raceDecided) return
                 when (state) {
-                    Player.STATE_READY -> onRaceWin(cand, token)
+                    Player.STATE_READY -> {
+                        stopAttemptTimeout()
+                        onRaceWin(cand, token)
+                    }
                     Player.STATE_BUFFERING -> {
                         if (cand.attempt == raceCandidates.firstOrNull()?.attempt) {
                             updateState(isLoading = true)
@@ -596,7 +707,9 @@ class PlayerEngine(private val context: Context) {
                 }
                 Log.e(TAG, "${cand.attempt} onPlayerError: ${error.errorCodeName} url=$url", error)
                 DebugDiagnostics.onError("race/${cand.attempt}", error)
-                raceCandidateFailed(cand)
+                // 串行：当前尝试失败 → 立即切换下一个（连接类错误无需等待超时）
+                stopAttemptTimeout()
+                tryNextAttempt(url)
             }
         })
     }
@@ -605,13 +718,10 @@ class PlayerEngine(private val context: Context) {
         if (raceDecided || token != racePlayToken) return
         raceDecided = true
         raceActive = false
-        raceHedgeJob?.cancel()
-        raceHedgeJob = null
-        stopWatchdog()
+        stopAttemptTimeout()
         consecutiveErrors = 0
-        // 竞速成功：清零 watchdog 连续超时计数，避免偶发超时累积后误切台
-        raceTimeoutCount = 0
 
+        // 串行下同时刻只存在 1 个 player；此处释放仅作兜底
         for (c in raceCandidates) {
             if (c !== winner) {
                 c.exo?.stop()
@@ -639,57 +749,19 @@ class PlayerEngine(private val context: Context) {
             attachPlaybackWatcher(winExo, winner.attempt)
         }
         raceCandidates = emptyList()
-        updateState(isLoading = false, isPlaying = true, error = null, usingProxy = winner.attempt == "proxy")
-        Log.d(TAG, "竞速胜出: ${winner.attempt}")
+        updateState(isLoading = false, isPlaying = true, error = null, usingProxy = winner.attempt == "proxy", loadMode = null, loadTimeoutMs = 0, loadRemainMs = 0)
+        Log.d(TAG, "起播成功: ${winner.attempt}")
+        // 记忆本次成功模式：下次起播直接优先该模式，省去先试错一次
+        saveLastMode(currentPlayingUrl, winner.attempt)
 
-        // 闸门竞速：直连胜出后才需要监测 stuck 并允许复活代理；代理胜出则不再反向复活直连
-        if (winner.attempt == "direct") {
-            proxyReviveBudget = proxyReviveMax
-            wasReviving = false
-            startStuckMonitor(winExo)
-        } else {
-            proxyReviveBudget = 0
-            stopStuckMonitor()
-        }
+        // 串行模式：不再并行复活代理（那会引入第二路解码，正是小内存设备 OOM 的主因）。
+        // 播放期卡顿统一由 attachPlaybackWatcher → startPlaybackStuckMonitor 兜底：
+        // 原地重载当前频道 → 仍失败则切下一台。
     }
 
-    /**
-     * 直连胜出后的 stuck 监测：持续缓冲超过 [stuckTimeoutMs] 且播放位置不前进 → 判定 stuck。
-     * stuck 且仍有复活额度 → 复活代理候选重新竞速（仅 1 次，避免重载循环）。
-     * 注意：正常直播波动（缓冲一下又恢复）会在 STATE_READY 时重置计时，不会误触发。
-     */
-    private fun startStuckMonitor(exo: ExoPlayer?) {
-        stopStuckMonitor()
-        val target = exo ?: return
-        lastReportedPositionMs = target.currentPosition
-        stuckMonitorJob = scope.launch {
-            delay(stuckTimeoutMs)
-            if (raceDecided && proxyReviveBudget <= 0 && !wasReviving) {
-                // 已是稳定播放且无复活需求，无需处理
-            }
-            val state = target.playbackState
-            val pos = target.currentPosition
-            val stuck = (state == Player.STATE_BUFFERING) && (pos <= lastReportedPositionMs + 500)
-            if (stuck && proxyReviveBudget > 0 && !raceDecided) {
-                val now = System.currentTimeMillis()
-                if (now - lastReviveAt >= REVIVE_COOLDOWN_MS) {
-                    Log.w(TAG, "直连胜出后 stuck(${stuckTimeoutMs}ms)，复活代理候选 (budget=$proxyReviveBudget)")
-                    proxyReviveBudget--
-                    lastReviveAt = now
-                    reviveProxyCandidate(target)
-                }
-            }
-        }
-    }
-
-    private fun stopStuckMonitor() {
-        stuckMonitorJob?.cancel()
-        stuckMonitorJob = null
-    }
-
-    // ===== 播放期兜底监测（代理胜出 / 直连胜出后均生效） =====
-    // 竞速期只监测直连胜出场景；代理胜出后没有任何兜底，会出现永久 spinner / 黑屏。
-    // 这里统一给"已稳定播放"的 winner 增加缓冲超时监测：超时仍未恢复则重载当前频道，
+    // ===== 播放期兜底监测（直连 / 代理胜出后均生效） =====
+    // 串行模式下不再有"复活代理"（会引入第二路并行解码）。统一给已稳定播放的
+    // player 增加缓冲超时监测：超时仍未恢复则重载当前频道，
     // 连续重载 PLAYBACK_RELOAD_MAX 次仍卡则跳下一台（与"双路皆败跳台"语义一致）。
 
     /** 播放期连续原地重载次数；重载后若成功恢复(STATE_READY)则清零。 */
@@ -749,31 +821,7 @@ class PlayerEngine(private val context: Context) {
         reloadCurrentChannel(reason = "playback-$reason")
     }
 
-    /**
-     * 复活代理候选重新竞速：保留当前直连（仍在播）作为候选之一，并行再拉一路代理。
-     * 代理先出画 → onRaceWin 切过去；代理也败 → raceCandidateFailed 处理（双路皆败直接跳台）。
-     */
-    private fun reviveProxyCandidate(currentWinnerExo: ExoPlayer) {
-        val url = currentPlayingUrl
-        val myToken = ++racePlayToken
-        raceDecided = false
-        raceActive = true
-        wasReviving = true
-        stopWatchdog()
-        // 现任直连作为候选，保持其播放
-        val directCand = RaceCandidate("direct", currentWinnerExo, false)
-        val proxyCand = RaceCandidate("proxy", null, false)
-        raceCandidates = listOf(directCand, proxyCand)
-        attachCandidateListener(directCand, url, myToken)
-        proxyCand.exo = createCandidatePlayer(url, true, winner = false)
-        // 共享 Surface 模式下代理候选已绑定 PlayerView 的 Surface，无需切换 _playerRef，
-        // 避免 PlayerView 重建 Surface 导致老电视"有声音没画面"；仅当 Surface 尚未就绪时回退切换
-        if (sharedSurface == null) {
-            setPlayerRef(proxyCand.exo)
-        }
-        attachCandidateListener(proxyCand, url, myToken)
-        Log.d(TAG, "reviveProxyCandidate: 直连继续播 + 代理并行竞速 (sharedSurface=${sharedSurface != null})")
-    }
+
 
     /**
      * 胜出后的播放期监听器（仅观察状态，不自动重载）：
@@ -850,9 +898,9 @@ class PlayerEngine(private val context: Context) {
             return
         }
         isReloading = true
-        // 立即终止旧的播放期与竞速层监测，避免旧 player 在其延迟/超时窗口内再次触发 reload
+        // 立即终止旧的播放期与起播层监测，避免旧 player 在其延迟/超时窗口内再次触发 reload
         stopPlaybackStuckMonitor()
-        stopWatchdog()
+        stopAttemptTimeout()
         // 点播内容：保存当前播放位置以便重载后恢复
         if (!isLiveStream) {
             val pos = player?.currentPosition ?: 0
@@ -866,44 +914,22 @@ class PlayerEngine(private val context: Context) {
         playCurrent()
     }
 
-    private fun raceCandidateFailed(cand: RaceCandidate) {
-        if (raceDecided || cand.failed) return
-        cand.failed = true
-        cand.exo?.stop()
-        cand.exo?.release()
-        DebugDiagnostics.onPlayerReleased()
-        cand.exo = null
-        val alive = raceCandidates.filter { !it.failed }
-        if (alive.isEmpty()) {
-            raceActive = false
-            raceDecided = true
-            stopStuckMonitor()
-            // 闸门竞速终局：直连胜出后复活代理，代理也败（双路皆败）→ 直接跳台，不报错不循环
-            if (wasReviving) {
-                Log.w(TAG, "复活竞速双路皆败，直接跳台（不报错）")
-                wasReviving = false
-                playNext()
-                return
-            }
-            handlePlayFailure()
-        }
-    }
-
     private fun resetRace() {
         raceActive = false
         raceDecided = false
-        raceHedgeJob?.cancel()
-        raceHedgeJob = null
+        stopAttemptTimeout()
         for (c in raceCandidates) {
             c.exo?.stop()
             c.exo?.release()
             DebugDiagnostics.onPlayerReleased()
         }
         raceCandidates = emptyList()
+        currentAttempts = emptyList()
+        currentAttemptIndex = -1
     }
 
     private fun handlePlayFailure() {
-        stopWatchdog()
+        stopAttemptTimeout()
         if (playlist.isEmpty()) {
             updateState(error = "无法播放", isLoading = false)
             return
@@ -945,31 +971,6 @@ class PlayerEngine(private val context: Context) {
         playNext()
     }
 
-    private fun startWatchdog() {
-        watchdogJob?.cancel()
-        watchdogJob = scope.launch {
-            delay(WATCHDOG_TIMEOUT_MS)
-            if (raceActive && !raceDecided) {
-                stopWatchdog()
-                raceTimeoutCount++
-                if (raceTimeoutCount >= RACE_TIMEOUT_MAX) {
-                    // 连续超时：该源八成已死（一直 BUFFERING 不报错），原地重载无意义，
-                    // 直接切下一台。否则会卡在同一频道无限重载、永远不换台。
-                    raceTimeoutCount = 0
-                    Log.w(TAG, "Watchdog 连续超时 ${RACE_TIMEOUT_MAX} 次，切下一台: $currentPlayingUrl")
-                    playNext()
-                } else {
-                    Log.d(TAG, "Watchdog: race timeout ($raceTimeoutCount/$RACE_TIMEOUT_MAX), reload: $currentPlayingUrl")
-                    reloadCurrentChannel(reason = "race-timeout")
-                }
-            }
-        }
-    }
-
-    private fun stopWatchdog() {
-        watchdogJob?.cancel()
-        watchdogJob = null
-    }
 
     // ===== UI 状态 =====
     private fun updateState(
@@ -982,7 +983,10 @@ class PlayerEngine(private val context: Context) {
         error: String? = _state.value.error,
         showInfo: Boolean = _state.value.showInfo,
         transientHint: String? = _state.value.transientHint,
-        usingProxy: Boolean = _state.value.usingProxy
+        usingProxy: Boolean = _state.value.usingProxy,
+        loadMode: String? = _state.value.loadMode,
+        loadTimeoutMs: Long = _state.value.loadTimeoutMs,
+        loadRemainMs: Long = _state.value.loadRemainMs
     ) {
         _state.value = PlayerState(
             currentIndex = currentIndex,
@@ -994,7 +998,10 @@ class PlayerEngine(private val context: Context) {
             error = error,
             showInfo = showInfo,
             transientHint = transientHint,
-            usingProxy = usingProxy
+            usingProxy = usingProxy,
+            loadMode = loadMode,
+            loadTimeoutMs = loadTimeoutMs,
+            loadRemainMs = loadRemainMs
         )
     }
 
@@ -1038,9 +1045,8 @@ class PlayerEngine(private val context: Context) {
     }
 
     fun release() {
-        stopWatchdog()
+        stopAttemptTimeout()
         resetRace()
-        stopStuckMonitor()
         infoHideJob?.cancel()
         hintHideJob?.cancel()
         player?.stop()

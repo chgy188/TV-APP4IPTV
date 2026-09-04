@@ -73,8 +73,7 @@ fun SettingsDrawer(
     visible: Boolean,
     settings: PlaybackSettings,
     onStuckTimeoutChange: (Long) -> Unit,
-    onHedgeChange: (Long) -> Unit,
-    onReviveChange: (Int) -> Unit,
+    onProxyTimeoutChange: (Long) -> Unit,
     onRendererChange: (RendererMode) -> Unit,
     // ===== 诊断（无 ADB 环境调试用） =====
     diagEnabled: Boolean = false,
@@ -85,7 +84,7 @@ fun SettingsDrawer(
 ) {
     // 分组定义：随设置值与诊断状态变化重建（回调本身稳定，不列入 key 避免无谓重建）
     val groups = remember(
-        settings.stuckTimeoutMs, settings.hedgeMs, settings.reviveMax, settings.rendererMode,
+        settings.stuckTimeoutMs, settings.proxyTimeoutMs, settings.rendererMode,
         diagEnabled, diagServerUrl
     ) {
         listOf(
@@ -98,20 +97,12 @@ fun SettingsDrawer(
                     .indexOfFirst { it.first == settings.stuckTimeoutMs }.coerceAtLeast(0)
             ),
             SettingGroupDef(
-                title = "代理延迟",
-                options = PlaybackSettingOptions.hedgeOptions.map { (v, label) ->
-                    label to { onHedgeChange(v) }
+                title = "代理起播超时",
+                options = PlaybackSettingOptions.proxyTimeoutOptions.map { (v, label) ->
+                    label to { onProxyTimeoutChange(v) }
                 },
-                selectedIndex = PlaybackSettingOptions.hedgeOptions
-                    .indexOfFirst { it.first == settings.hedgeMs }.coerceAtLeast(0)
-            ),
-            SettingGroupDef(
-                title = "复活次数",
-                options = PlaybackSettingOptions.reviveOptions.map { (v, label) ->
-                    label to { onReviveChange(v) }
-                },
-                selectedIndex = PlaybackSettingOptions.reviveOptions
-                    .indexOfFirst { it.first == settings.reviveMax }.coerceAtLeast(0)
+                selectedIndex = PlaybackSettingOptions.proxyTimeoutOptions
+                    .indexOfFirst { it.first == settings.proxyTimeoutMs }.coerceAtLeast(0)
             ),
             SettingGroupDef(
                 title = "渲染方式",

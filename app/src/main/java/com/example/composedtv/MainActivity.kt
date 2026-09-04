@@ -80,6 +80,9 @@ class MainActivity : ComponentActivity() {
                 if (!uiState.sidePanelVisible) {
                     when (event.keyCode) {
                         KeyEvent.KEYCODE_DPAD_LEFT -> {
+                            // 设置抽屉打开时：左右键需在「左排分类 ↔ 右排选项」间导航，
+                            // 不能拦截，否则既无法移动焦点，右键还会被误判为重载。
+                            if (uiState.settingsVisible) return super.dispatchKeyEvent(event)
                             if (event.action == KeyEvent.ACTION_DOWN) {
                                 Log.d("MainActivity", "左键 → 发送收藏信号")
                                 vm.sendToggleFavorite()
@@ -87,6 +90,8 @@ class MainActivity : ComponentActivity() {
                             return true // 拦截 DOWN + UP，防止系统焦点导航抢键
                         }
                         KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                            // 同上：设置抽屉打开时不拦截，交由 Compose 焦点导航处理
+                            if (uiState.settingsVisible) return super.dispatchKeyEvent(event)
                             if (event.action == KeyEvent.ACTION_DOWN) {
                                 Log.d("MainActivity", "右键 → 发送重载信号")
                                 vm.sendManualReload()
