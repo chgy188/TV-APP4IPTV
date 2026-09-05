@@ -88,9 +88,8 @@ android {
 
     kotlinOptions {
         jvmTarget = "11"
-        // Media3 的 UnstableApi 注解未声明为 requiresOptIn，
-        // 需通过编译器参数开启 opt-in，消除 @OptIn 被忽略的警告
-        freeCompilerArgs = listOf("-opt-in=androidx.media3.common.util.UnstableApi")
+        // 注：media3 1.2.1 的 UnstableApi 未声明为 requiresOptIn（不是 opt-in 标记），
+        // 因此既不需要 @OptIn 也不需要 -opt-in 编译器参数，加上反而会触发「不是 opt-in 标记」警告。
     }
 
     buildFeatures {

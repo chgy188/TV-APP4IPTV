@@ -91,10 +91,7 @@ fun DebugHud(s: DiagSnapshot, modifier: Modifier = Modifier) {
         HudLine("Player", "创建${s.playerCreateCount} 释放${s.playerReleaseCount}", s.playerCreateCount - s.playerReleaseCount > 1)
         HudLine("起播/重载", "${s.raceStartCount} / ${s.reloadCount} (${s.lastReloadReason})", s.reloadCount > 2)
         HudLine("错误", "${s.errorCount} · ${s.lastError}", s.errorCount > 0)
-        if (s.serverRunning) {
-            HudLine("HTTP", s.serverUrl, false)
-        }
-        HudLine("提示", "MENU→诊断分组 / 数字键0·9", false)
+        HudLine("提示", "MENU→诊断分组 / 数字键0", false)
     }
 }
 

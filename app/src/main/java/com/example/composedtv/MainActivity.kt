@@ -43,6 +43,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // 捕获 Activity 引用，供下方 Compose 树（经 AppContent 间接渲染）回调退出 APP
+        val self = this
+
         // 双击返回退出（仅在播放器界面生效）
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -60,7 +63,8 @@ class MainActivity : ComponentActivity() {
             ComposedTVTheme {
                 AppContent(
                     viewModel = vm,
-                    onScreenChanged = { currentScreenRef = it }
+                    onScreenChanged = { currentScreenRef = it },
+                    onExitApp = { self.finishAffinity() }
                 )
             }
         }
@@ -128,7 +132,8 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun AppContent(
     viewModel: PlayerViewModel,
-    onScreenChanged: (Screen) -> Unit
+    onScreenChanged: (Screen) -> Unit,
+    onExitApp: () -> Unit
 ) {
     var screen by remember { mutableStateOf<Screen>(Screen.UserSelection) }
     val vm = viewModel
@@ -179,7 +184,8 @@ private fun AppContent(
                 onExit = {
                     // 返回用户选择界面
                     screen = Screen.UserSelection
-                }
+                },
+                onExitApp = onExitApp
             )
         }
     }

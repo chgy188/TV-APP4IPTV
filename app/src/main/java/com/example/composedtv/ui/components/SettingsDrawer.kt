@@ -49,6 +49,7 @@ import androidx.compose.ui.unit.sp
 import com.example.composedtv.viewmodel.PlaybackSettings
 import com.example.composedtv.viewmodel.PlaybackSettingOptions
 import com.example.composedtv.viewmodel.RendererMode
+import com.example.composedtv.viewmodel.StartChannelMode
 
 /** 一个设置分组：左排一项 → 右排一组选项 */
 private data class SettingGroupDef(
@@ -63,31 +64,52 @@ private data class SettingGroupDef(
  * 右侧配置抽屉：由遥控器 MENU 键唤出，调整播放参数。
  *
  * 两排模式（现代 TV 设置布局）：
- * - 左排：设置分组（卡顿判定 / 代理延迟 / 复活次数 / 渲染方式 / 诊断）
+ * - 左排：设置分组（首播频道 / 直连起播超时 / 卡顿判定 / 代理起播超时 / 渲染方式 / 诊断）
  * - 右排：当前分组的选项
- * 相比原先单列纵向堆叠，可聚焦项从 19 个降到「左排 5 + 右排 3」，
+ * 相比原先单列纵向堆叠，可聚焦项从 19 个降到「左排 6 + 右排 3」，
  * 上下键次数大幅减少；←→ 键在两排间切换。
+ *
+ * @param isGuest 游客模式：不显示「首播频道」分组（游客固定续播上次退出的频道）
  */
 @Composable
 fun SettingsDrawer(
     visible: Boolean,
     settings: PlaybackSettings,
+    onDirectTimeoutChange: (Long) -> Unit,
     onStuckTimeoutChange: (Long) -> Unit,
     onProxyTimeoutChange: (Long) -> Unit,
     onRendererChange: (RendererMode) -> Unit,
+    // ===== 首播频道（仅登录用户） =====
+    isGuest: Boolean = false,
+    onStartChannelModeChange: (StartChannelMode) -> Unit = {},
     // ===== 诊断（无 ADB 环境调试用） =====
     diagEnabled: Boolean = false,
-    diagServerUrl: String? = null,
     onToggleDiag: () -> Unit = {},
-    onToggleDiagServer: () -> Unit = {},
     onResetDiag: () -> Unit = {}
 ) {
     // 分组定义：随设置值与诊断状态变化重建（回调本身稳定，不列入 key 避免无谓重建）
     val groups = remember(
-        settings.stuckTimeoutMs, settings.proxyTimeoutMs, settings.rendererMode,
-        diagEnabled, diagServerUrl
+        settings.directTimeoutMs, settings.stuckTimeoutMs, settings.proxyTimeoutMs,
+        settings.rendererMode, settings.startChannelMode, isGuest, diagEnabled
     ) {
-        listOf(
+        listOfNotNull(
+            // 游客没有收藏，首播固定为「上次退出频道」，无需该分组
+            if (isGuest) null else SettingGroupDef(
+                title = "首播频道",
+                options = PlaybackSettingOptions.startChannelOptions.map { (mode, label) ->
+                    label to { onStartChannelModeChange(mode) }
+                },
+                selectedIndex = PlaybackSettingOptions.startChannelOptions
+                    .indexOfFirst { it.first == settings.startChannelMode }.coerceAtLeast(0)
+            ),
+            SettingGroupDef(
+                title = "直连起播超时",
+                options = PlaybackSettingOptions.directTimeoutOptions.map { (v, label) ->
+                    label to { onDirectTimeoutChange(v) }
+                },
+                selectedIndex = PlaybackSettingOptions.directTimeoutOptions
+                    .indexOfFirst { it.first == settings.directTimeoutMs }.coerceAtLeast(0)
+            ),
             SettingGroupDef(
                 title = "卡顿判定",
                 options = PlaybackSettingOptions.stuckOptions.map { (v, label) ->
@@ -116,8 +138,6 @@ fun SettingsDrawer(
                 title = "诊断",
                 options = listOf(
                     (if (diagEnabled) "画面 HUD：开（点此关闭）" else "画面 HUD：关（点此开启）") to onToggleDiag,
-                    (if (diagServerUrl != null) "局域网服务：$diagServerUrl（点此停止）"
-                    else "局域网服务：关（点此开启）") to onToggleDiagServer,
                     "复位诊断计数器" to onResetDiag
                 ),
                 // 动作组：用「是否开启」作为选中态，仅作视觉提示

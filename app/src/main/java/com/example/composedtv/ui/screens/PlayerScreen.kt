@@ -75,7 +75,6 @@ import androidx.tv.material3.Surface as TvSurface
 import com.example.composedtv.R
 import com.example.composedtv.debug.DebugDiagnostics
 import com.example.composedtv.debug.DebugHudHost
-import com.example.composedtv.debug.DebugLogServer
 import com.example.composedtv.player.PlayerEngine
 import com.example.composedtv.player.PlayerState
 import com.example.composedtv.player.PlaylistItem
@@ -97,7 +96,8 @@ import com.example.composedtv.viewmodel.PlayerViewModel
 fun PlayerScreen(
     vm: PlayerViewModel,
     isGuest: Boolean,
-    onExit: () -> Unit
+    onExit: () -> Unit,
+    onExitApp: () -> Unit
 ) {
     val context = LocalContext.current
     val uiState by vm.uiState.collectAsState()
@@ -110,13 +110,12 @@ fun PlayerScreen(
     val playerState by engine.stateFlow.collectAsState()
 
     // ===== 诊断 HUD =====
-    // 遥控器数字键 0：开关 HUD；数字键 9：开关局域网 HTTP 导出服务（PC 浏览器直接看）
+    // 遥控器数字键 0：开关 HUD（无 ADB 时在画面上直接看解码器/丢帧/Surface 指标）
     // 采样状态由 DebugHudHost 自己持有（作用域隔离），避免 HUD 刷新引发整个
     // PlayerScreen 重组 → AndroidView.update → 重建 Surface → 重启解码器。
     // 开关状态持久化在 PlaybackSettings.diagHudEnabled（SharedPreferences），
     // 重启后保持上次选择；此处本地 state 仅用于即时响应，值由配置流同步。
     var diagVisible by remember { mutableStateOf(uiState.playbackSettings.diagHudEnabled) }
-    var diagServerUrl by remember { mutableStateOf<String?>(null) }
 
     // 持久化配置 → 本地 state（首次进入 / 其他入口修改设置时同步）
     LaunchedEffect(uiState.playbackSettings.diagHudEnabled) {
@@ -136,21 +135,6 @@ fun PlayerScreen(
             Toast.LENGTH_SHORT
         ).show()
     }
-    val toggleDiagServer: () -> Unit = {
-        val url = if (DebugLogServer.isRunning()) {
-            DebugLogServer.stop()
-            null
-        } else {
-            DebugLogServer.start()
-        }
-        diagServerUrl = url
-        Toast.makeText(
-            context,
-            url?.let { "诊断服务: $it" } ?: "诊断服务已停止",
-            Toast.LENGTH_LONG
-        ).show()
-    }
-
     // 收集 VM 发送的收藏信号 → 调用局部 engine 执行（不依赖 engine 引用传递）
     LaunchedEffect(Unit) {
         vm.toggleFavoriteSignal.collect {
@@ -165,6 +149,11 @@ fun PlayerScreen(
             Log.d("PlayerScreen", "收到重载信号，执行 manualReload")
             engine.manualReload()
         }
+    }
+
+    // 收藏变更（添加 / 取消）→ 通知 VM 刷新侧边栏「收藏」分类列表，做到即时生效
+    LaunchedEffect(Unit) {
+        engine.favoritesChanged.collect { vm.onFavoritesChanged() }
     }
 
     // 播放参数设置变化（或初始加载）→ 同步给 engine（MENU 设置抽屉调整即时生效）
@@ -205,7 +194,9 @@ fun PlayerScreen(
         if (uiState.initialChannelLoaded) {
             val playlist = vm.getInitialPlaylist()
             if (playlist.isNotEmpty()) {
-                engine.setPlaylist(playlist, 0)
+                // 起始索引：续播上次退出频道时不为 0
+                val startIdx = uiState.initialPlayIndex.coerceIn(0, playlist.lastIndex)
+                engine.setPlaylist(playlist, startIdx)
             }
         }
     }
@@ -234,7 +225,6 @@ fun PlayerScreen(
     // 生命周期：onResume / onPause / onDestroy
     DisposableEffect(engine) {
         onDispose {
-            DebugLogServer.stop()
             engine.release()
         }
     }
@@ -274,8 +264,8 @@ fun PlayerScreen(
                     engine = engine,
                     vm = vm,
                     _onExit = onExit,
+                    onExitApp = onExitApp,
                     onToggleDiag = toggleDiag,
-                    onToggleDiagServer = toggleDiagServer,
                     currentPlaylistProvider = {
                         val playlist = engine.getCurrentPlaylist()
                         val idx = engine.getCurrentIndex()
@@ -292,8 +282,8 @@ fun PlayerScreen(
                     engine = engine,
                     vm = vm,
                     _onExit = onExit,
+                    onExitApp = onExitApp,
                     onToggleDiag = toggleDiag,
-                    onToggleDiagServer = toggleDiagServer,
                     currentPlaylistProvider = {
                         val playlist = engine.getCurrentPlaylist()
                         val idx = engine.getCurrentIndex()
@@ -457,9 +447,12 @@ fun PlayerScreen(
                         strokeWidth = 3.dp
                     )
                     Text(
-                        text = when (playerState.loadMode) {
-                            "proxy" -> "代理加载中…"
-                            else -> "直连加载中…"
+                        text = when {
+                            playerState.loadMode == "proxy" -> "代理加载中…"
+                            playerState.loadMode == "direct" -> "直连加载中…"
+                            // 起播完成后 loadMode 置空，按实际代理状态区分播放期重新缓冲
+                            playerState.usingProxy -> "代理缓冲中…"
+                            else -> "直连缓冲中…"
                         },
                         color = Color.White,
                         fontSize = 15.sp
@@ -544,7 +537,7 @@ fun PlayerScreen(
             )
         }
 
-        // 侧边栏面板
+        // 侧边栏面板（退出搜索由返回键 BackHandler 统一处理 → vm.exitSearchMode）
         SidePanel(
             data = uiState.sidePanel,
             isVisible = uiState.sidePanelVisible,
@@ -570,21 +563,21 @@ fun PlayerScreen(
                 vm.hideSidePanel()
             },
             onAutoHide = { vm.hideSidePanel() },
-            onSearchQueryChange = { q -> vm.updateSearchQuery(q) },
-            onExitSearch = { vm.exitSearchMode() }
+            onSearchQueryChange = { q -> vm.updateSearchQuery(q) }
         )
 
         // 右侧配置抽屉（MENU 键唤出）：调整播放参数
         SettingsDrawer(
             visible = uiState.settingsVisible,
             settings = uiState.playbackSettings,
+            onDirectTimeoutChange = { vm.updateDirectTimeout(it) },
             onStuckTimeoutChange = { vm.updateStuckTimeout(it) },
             onProxyTimeoutChange = { vm.updateProxyTimeout(it) },
             onRendererChange = { vm.updateRendererMode(it) },
+            isGuest = isGuest,
+            onStartChannelModeChange = { vm.updateStartChannelMode(it) },
             diagEnabled = diagVisible,
-            diagServerUrl = diagServerUrl,
             onToggleDiag = toggleDiag,
-            onToggleDiagServer = toggleDiagServer,
             onResetDiag = { DebugDiagnostics.resetCounters() }
         )
 
@@ -710,8 +703,8 @@ private fun handlePlayerKeyEvent(
     engine: PlayerEngine,
     vm: PlayerViewModel,
     _onExit: () -> Unit,
+    onExitApp: () -> Unit,
     onToggleDiag: () -> Unit = {},
-    onToggleDiagServer: () -> Unit = {},
     currentPlaylistProvider: () -> PlaylistItem? = { null }
 ): Boolean {
     if (event.type != KeyEventType.KeyDown) return false
@@ -783,19 +776,13 @@ private fun handlePlayerKeyEvent(
             true
         }
 
-        // 数字键 9：开关局域网诊断 HTTP 服务（PC 浏览器访问投影 IP 查看/导出日志）
-        KeyEvent.KEYCODE_9 -> {
-            onToggleDiagServer()
-            true
-        }
-
         // 菜单键：唤出/收起右侧配置抽屉（与侧边栏互斥）
         KeyEvent.KEYCODE_MENU -> {
             vm.toggleSettingsDrawer()
             true
         }
 
-        // 返回键：先关面板，再退出（退出逻辑由 Activity 处理双击）
+        // 返回键：先关面板；主播放界面（无面板）首次返回→停播，停播状态再返回→完全退出 APP
         KeyEvent.KEYCODE_BACK -> {
             if (settingsVisible) {
                 vm.hideSettingsDrawer()
@@ -803,8 +790,14 @@ private fun handlePlayerKeyEvent(
             } else if (sidePanelVisible) {
                 vm.hideSidePanel()
                 true
+            } else if (_playerState.isPlaying) {
+                // 正在播放：立即停播（释放解码器/资源，停留在当前界面）
+                engine.stopPlayback()
+                true
             } else {
-                false // 交给 Activity 处理双击退出
+                // 已停播（或非播放态）：完全退出 APP
+                onExitApp()
+                true
             }
         }
 

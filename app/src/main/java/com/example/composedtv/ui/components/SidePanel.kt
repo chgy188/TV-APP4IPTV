@@ -87,8 +87,7 @@ fun SidePanel(
     onCategorySelected: (Int) -> Unit,
     onChannelSelected: (ChannelEntry) -> Unit,
     onAutoHide: () -> Unit = {},
-    onSearchQueryChange: (String) -> Unit = {},
-    onExitSearch: () -> Unit = {}
+    onSearchQueryChange: (String) -> Unit = {}
 ) {
     val channelFocusRequester = remember { FocusRequester() }
     // 分类列（第二列）焦点入口：其顶部固定区包含「收藏 / 搜索」，
@@ -150,14 +149,49 @@ fun SidePanel(
         }
     }
 
-    // 面板打开时将焦点移到频道列表
-    LaunchedEffect(isVisible) {
-        if (isVisible) {
-            delay(100)
-            // 焦点先落在分类列（收藏 / 搜索所在列），确保遥控可选中它们；
-            // 频道列表的滚动定位由下方 LaunchedEffect 负责（仅滚动，不抢焦点）
-            runCatching { categoryFocusRequester.requestFocus() }
+    // 面板打开后的焦点归属：优先落在「当前播放的频道」项上（见下方频道列 effect）。
+    // 本 effect 只做兜底：频道列表迟迟未就绪（加载中 / 源为空）时，先把焦点交给分类列
+    // （收藏 / 搜索所在列），保证面板一定持有焦点、遥控器可用；
+    // 频道列就绪后，其 effect 会再把焦点抢到当前播放的频道上。
+    var channelFocusDone by remember(isVisible) { mutableStateOf(false) }
+    LaunchedEffect(isVisible, data.channels) {
+        if (!isVisible) return@LaunchedEffect
+        // 频道列已就绪 → 交给下方频道 effect 聚焦，此处不抢
+        if (data.channels.isNotEmpty()) return@LaunchedEffect
+        delay(1_000)
+        if (!channelFocusDone) runCatching { categoryFocusRequester.requestFocus() }
+    }
+
+    // 频道列：把「当前播放的频道」滚动到可视区中间
+    LaunchedEffect(isVisible, data.channels, data.selectedChannelIndex) {
+        if (isVisible && !data.isSearchMode && data.channels.isNotEmpty()) {
+            channelListState.scrollCenteredTo(
+                data.selectedChannelIndex.coerceIn(0, data.channels.lastIndex)
+            )
         }
+    }
+
+    // 面板打开时把焦点放到「当前播放的频道」项上（每次打开只做一次，避免后续操作被抢焦点）。
+    // 等待逻辑：换源 / 换分类时频道列表会连续刷新两次（先默认分类，再定位到当前频道所在分类），
+    // 本 effect 以 data.channels / selectedChannelIndex 为 key，列表一变就重启，
+    // 因此自然等到「最后一次刷新 + 稳定 200ms」后才聚焦，不会落在临时的旧列表上。
+    LaunchedEffect(isVisible, data.channels, data.selectedChannelIndex) {
+        if (!isVisible || data.isSearchMode || channelFocusDone) return@LaunchedEffect
+        // 频道列表尚未就绪 → 等数据（effect 会因 key 变化重启）
+        if (data.channels.isEmpty()) return@LaunchedEffect
+        // 稳定期：期间列表若再次变化，本 effect 会重启并重新计时，
+        // 因此只会聚焦到「最后一次刷新」后的列表，不会落在临时旧列表上
+        delay(200)
+        channelFocusDone = true
+        val idx = data.selectedChannelIndex.coerceIn(0, data.channels.lastIndex)
+        channelListState.scrollCenteredTo(idx)
+        // 目标项可能尚未布局完成（滚动/首帧），重试几次再放弃
+        repeat(6) {
+            delay(120)
+            if (runCatching { channelFocusRequester.requestFocus() }.isSuccess) return@LaunchedEffect
+        }
+        // 聚焦失败兜底：交回分类列，保证遥控仍可用
+        runCatching { categoryFocusRequester.requestFocus() }
     }
 
     AnimatedVisibility(
@@ -317,22 +351,9 @@ fun SidePanel(
                         onChannelSelected = { ch ->
                             bumpActivity()
                             onChannelSelected(ch)
-                        },
-                        onExitSearch = {
-                            bumpActivity()
-                            onExitSearch()
                         }
                     )
                 } else {
-                    LaunchedEffect(isVisible, data.channels, data.selectedChannelIndex) {
-                        if (isVisible && data.channels.isNotEmpty()) {
-                            val idx = data.selectedChannelIndex.coerceIn(0, data.channels.lastIndex)
-                            // 先滚动到居中；延迟一小段再聚焦（等滚动完成）
-                            channelListState.scrollCenteredTo(idx)
-                            delay(120)
-                            runCatching { channelFocusRequester.requestFocus() }
-                        }
-                    }
                     PanelColumn(
                         title = "频道",
                         icon = Icons.Default.PlayArrow,
@@ -353,12 +374,16 @@ fun SidePanel(
                             LazyColumn(
                                 state = channelListState,
                                 verticalArrangement = Arrangement.spacedBy(4.dp),
-                                contentPadding = PaddingValues(vertical = 4.dp),
-                                modifier = Modifier.focusRequester(channelFocusRequester)
+                                contentPadding = PaddingValues(vertical = 4.dp)
                             ) {
-                                items(data.channels) { channel ->
-                                    val index = data.channels.indexOf(channel)
+                                itemsIndexed(data.channels) { index, channel ->
                                     PanelItem(
+                                        // 焦点入口挂在当前播放的频道项上：面板打开即聚焦到它
+                                        focusRequester = if (index == data.selectedChannelIndex) {
+                                            channelFocusRequester
+                                        } else {
+                                            null
+                                        },
                                         text = channel.name,
                                         isSelected = index == data.selectedChannelIndex,
                                         icon = if (channel.isFavorite) Icons.Default.Star else null,
@@ -579,7 +604,7 @@ private suspend fun androidx.compose.foundation.lazy.LazyListState.requestScroll
  *
  * - 搜索框聚焦后自动弹软键盘；D-pad 下键可从搜索框移动到结果列表
  * - 空查询时显示提示文本，不显示结果
- * - 选中频道即触发 [onChannelSelected]；返回键由外层处理（触发 onExitSearch）
+ * - 选中频道即触发 [onChannelSelected]；退出搜索由外层（返回键 / 选中其他分类）处理
  */
 @Composable
 private fun SearchColumn(
@@ -590,8 +615,7 @@ private fun SearchColumn(
     listState: androidx.compose.foundation.lazy.LazyListState,
     focusRequester: FocusRequester,
     onQueryChange: (String) -> Unit,
-    onChannelSelected: (ChannelEntry) -> Unit,
-    onExitSearch: () -> Unit
+    onChannelSelected: (ChannelEntry) -> Unit
 ) {
     val searchFieldFocus = remember { FocusRequester() }
 

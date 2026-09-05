@@ -1,5 +1,3 @@
-@file:OptIn(androidx.media3.common.util.UnstableApi::class)
-
 package com.example.composedtv.player
 
 import android.content.Context
@@ -21,6 +19,7 @@ import androidx.media3.extractor.flv.FlvExtractor
 import com.example.composedtv.data.remote.ApiClient
 import com.example.composedtv.debug.DebugDiagnostics
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -74,7 +73,7 @@ data class PlayerState(
  *
  * 播放策略（串行尝试，见 [startRace]）：
  * 按 planPlay 给出的顺序逐个尝试（直连 → 代理），同一时刻只存在 1 个 ExoPlayer，
- * 避免并行多路解码导致小内存设备 OOM；失败或超时（START_ATTEMPT_TIMEOUT_MS）
+ * 避免并行多路解码导致小内存设备 OOM；失败或超时（直连 [directTimeoutMs] / 代理 [proxyTimeoutMs]）
  * 即切换下一个尝试，全部用尽才走失败处理（切台）。
  *
  * 可配置（见 PlayerViewModel.PlaybackSettings）：
@@ -113,6 +112,7 @@ class PlayerEngine(private val context: Context) {
         private const val MAX_PLAY_MODE_ENTRIES = 500
         // ===== 可被设置抽屉注入的播放参数（下方 var 为运行时值，此处为默认值） =====
         private const val DEFAULT_STUCK_TIMEOUT_MS = 8_000L   // 持续缓冲判定 stuck 的时长
+        private const val DEFAULT_DIRECT_TIMEOUT_MS = 6_000L  // 直连候选起播超时（可由设置抽屉注入）
         private const val DEFAULT_PROXY_TIMEOUT_MS = 10_000L  // 代理候选起播超时（可由设置抽屉注入）
 
         // 判定为"国内"的渠道：完全不走代理（CN=中国, SK=韩国, MO/MACAU/澳门）
@@ -163,9 +163,10 @@ class PlayerEngine(private val context: Context) {
     /** 把设置抽屉里的值同步进 engine（PlaybackSettings 定义在 PlayerViewModel） */
     fun applyPlaybackSettings(s: com.example.composedtv.viewmodel.PlaybackSettings) {
         stuckTimeoutMs = s.stuckTimeoutMs
+        directTimeoutMs = s.directTimeoutMs
         proxyTimeoutMs = s.proxyTimeoutMs
         DebugDiagnostics.setEnv(isLegacyDevice(), s.rendererMode.name)
-        Log.d(TAG, "applyPlaybackSettings: stuck=${stuckTimeoutMs} proxy=${proxyTimeoutMs} legacy=${isLegacyDevice()}")
+        Log.d(TAG, "applyPlaybackSettings: stuck=${stuckTimeoutMs} direct=${directTimeoutMs} proxy=${proxyTimeoutMs} legacy=${isLegacyDevice()}")
     }
 
     /** 是否老设备：Android 6.0.1 (API 23) 及以下。老设备解码/渲染能力弱，需要降级策略 */
@@ -181,6 +182,12 @@ class PlayerEngine(private val context: Context) {
     private val _state = kotlinx.coroutines.flow.MutableStateFlow(PlayerState())
     val stateFlow: kotlinx.coroutines.flow.StateFlow<PlayerState> = _state
 
+    /** 收藏变更信号（添加 / 取消成功）：由 PlayerScreen 收集后通知 ViewModel 刷新侧边栏收藏列表 */
+    private val _favoritesChanged = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(
+        replay = 0, extraBufferCapacity = 1
+    )
+    val favoritesChanged: kotlinx.coroutines.flow.Flow<Unit> = _favoritesChanged
+
     /** 当前绑定的主 player（供 PlayerView 使用） */
     private val _playerRef = kotlinx.coroutines.flow.MutableStateFlow<ExoPlayer?>(null)
     val playerFlow: kotlinx.coroutines.flow.StateFlow<ExoPlayer?> = _playerRef
@@ -191,6 +198,24 @@ class PlayerEngine(private val context: Context) {
         if (_playerRef.value === exo) return
         _playerRef.value = exo
         DebugDiagnostics.attachPlayer(exo)
+    }
+
+    /** 安全释放单个 ExoPlayer：吞掉异常，避免销毁/异常态下 release 抛错中断后续逻辑 */
+    private fun safeRelease(exo: ExoPlayer?) {
+        if (exo == null) return
+        try {
+            DebugDiagnostics.onPlayerReleased()
+            exo.stop()
+            exo.release()
+        } catch (t: Throwable) {
+            Log.w(TAG, "safeRelease 异常: ${t.message}")
+        }
+    }
+
+    /** 释放当前主播放器（仅存于 _playerRef、未进入 raceCandidates 的胜出 player），杜绝切台泄漏 */
+    private fun releaseCurrentPlayer() {
+        safeRelease(_playerRef.value)
+        setPlayerRef(null)
     }
 
     private var playlist: List<PlaylistItem> = emptyList()
@@ -225,9 +250,11 @@ class PlayerEngine(private val context: Context) {
     private var currentAttemptIndex = -1
     /** 单个尝试的起播超时协程：超时未 READY 即切下一个尝试 */
     private var attemptTimeoutJob: Job? = null
-    /** 单个尝试的起播超时：超时即切换下一个（连接类错误会立即切换，不走这里）。
-     *  取 3.5s：既能覆盖正常起播，又不会让"慢但不报错"的源拖太久。 */
-    private val START_ATTEMPT_TIMEOUT_MS = 3_500L
+    /** 直连候选的起播超时：超时即切换下一个（连接类错误会立即切换，不走这里）。
+     *  默认 6s：既能覆盖正常起播，又不会让"慢但不报错"的源拖太久；
+     *  网络差 / 源响应慢时可在设置抽屉调到 10s，避免被误判为不可播。
+     *  可由设置抽屉注入（applyPlaybackSettings），默认 [DEFAULT_DIRECT_TIMEOUT_MS] */
+    var directTimeoutMs = DEFAULT_DIRECT_TIMEOUT_MS
     /** 代理候选专属起播超时：代理路径多一跳、握手更慢，给更长容忍，避免被误判为不可播。
      *  可由设置抽屉注入（applyPlaybackSettings），默认 [DEFAULT_PROXY_TIMEOUT_MS] */
     var proxyTimeoutMs = DEFAULT_PROXY_TIMEOUT_MS
@@ -263,15 +290,13 @@ class PlayerEngine(private val context: Context) {
         return headers
     }
 
-    private fun playCurrent() {
+    private fun playCurrent(ignoreLastMode: Boolean = false) {
         if (playlist.isEmpty()) return
         val item = playlist[currentIndex.coerceIn(0, playlist.lastIndex)]
         // 进入新一轮起播：清除重载荷载锁，允许后续（若仍卡死）再次兜底重载
         isReloading = false
         resetRace()
-        player?.stop()
-        player?.release()
-        DebugDiagnostics.onPlayerReleased()
+        safeRelease(player)
         setPlayerRef(null)
         flvRetryDone = false
         proxyRetryDone = false
@@ -305,7 +330,7 @@ class PlayerEngine(private val context: Context) {
             // 重载同一频道：只更新加载态，不动信息条显隐
             updateState(isLoading = true, error = null)
         }
-        playUrl(item.url, item.country)
+        playUrl(item.url, item.country, ignoreLastMode = ignoreLastMode)
     }
 
     fun playNext() {
@@ -376,7 +401,7 @@ class PlayerEngine(private val context: Context) {
         }
         Log.d(TAG, "手动重载当前频道: $currentPlayingUrl")
         showHint("正在重载：${playlist[currentIndex].name}")
-        reloadCurrentChannel(reason = "manual")
+        reloadCurrentChannel(reason = "manual", ignoreLastMode = true)
     }
 
     fun toggleFavorite() {
@@ -401,12 +426,16 @@ class PlayerEngine(private val context: Context) {
                         this[currentIndex] = item.copy(isFavorite = false, favId = null)
                     }
                     showHint("已取消收藏：${item.name}")
+                    // 通知 UI 层刷新收藏列表（侧边栏「收藏」分类），即时移除该频道
+                    _favoritesChanged.tryEmit(Unit)
                 } else {
                     // 添加收藏：后端用 url 去重，返回 url 作为标识
                     ApiClient.addFavorite(item.url, item.name, null, item.sourceId ?: "")
                     playlist = playlist.toMutableList().apply {
                         this[currentIndex] = item.copy(isFavorite = true, favId = item.url)
                     }
+                    // 通知 UI 层刷新收藏列表（侧边栏「收藏」分类），即时加入该频道
+                    _favoritesChanged.tryEmit(Unit)
                     showHint("已收藏：${item.name}")
                 }
                 updateState(isFavorite = playlist[currentIndex].isFavorite, showInfo = true)
@@ -489,14 +518,23 @@ class PlayerEngine(private val context: Context) {
         }
     }
 
-    private fun playUrl(url: String, country: String = "", forceProxy: Boolean = false) {
+    private fun playUrl(
+        url: String,
+        country: String = "",
+        forceProxy: Boolean = false,
+        ignoreLastMode: Boolean = false
+    ) {
         if (url.isBlank()) {
             handlePlayFailure()
             return
         }
         currentPlayingUrl = url
-        val attempts = if (forceProxy) listOf("proxy") else reorderByLastMode(url, planPlay(url, country))
-        Log.d(TAG, "planPlay($url) -> $attempts country=$country forceProxy=$forceProxy")
+        // 手动重载时忽略"记忆上次成功模式"，强制按 planPlay 原序（直连→代理）完整串行，
+        // 避免上次代理胜出后重载直接跳到代理、漏掉直连这一遍。
+        val attempts = if (forceProxy) listOf("proxy")
+        else if (ignoreLastMode) planPlay(url, country)
+        else reorderByLastMode(url, planPlay(url, country))
+        Log.d(TAG, "planPlay($url) -> $attempts country=$country forceProxy=$forceProxy ignoreLastMode=$ignoreLastMode")
         startRace(url, attempts)
     }
 
@@ -514,10 +552,12 @@ class PlayerEngine(private val context: Context) {
         // - initialBuffer 1s：起播快（仅需 1s 数据即开始播放）
         // - rebuffer 2.5s：卡顿后需更多缓冲才恢复，减少二次卡顿
         // 老设备内存/解码弱：缓冲减半，降低内存占用与起播压力
+        // 缓冲策略（兼顾流畅与内存）：峰值内存 ≈ bitrate × maxBuffer。
+        // 非老设备 maxBuffer 由 60s 降到 40s、老设备保持 30s，避免高码率 HLS 在小内存电视上撑爆内存 OOM。
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 if (legacy) 10_000 else 20_000,
-                if (legacy) 30_000 else 60_000,
+                if (legacy) 30_000 else 40_000,
                 1_000, 2_500
             )
             .setPrioritizeTimeOverSizeThresholds(true)
@@ -546,7 +586,9 @@ class PlayerEngine(private val context: Context) {
         }
 
         val renderersFactory = DefaultRenderersFactory(context)
-            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+            // PREFER：优先硬件 MediaCodec 解码（省内存/CPU），仅当硬件不支持时才回退到扩展(ffmpeg)软解。
+            // 原 ON 会强制优先软解，在电视盒子上极易因解码帧缓冲堆积触发 OOM。
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
             .setEnableDecoderFallback(true)
             .setEnableAudioFloatOutput(false)
 
@@ -562,7 +604,7 @@ class PlayerEngine(private val context: Context) {
         p.trackSelectionParameters = p.trackSelectionParameters
             .buildUpon()
             .setMaxVideoSize(if (legacy) 1280 else 1920, if (legacy) 720 else 1080)
-            .setMaxVideoBitrate(if (legacy) 4_000_000 else 10_000_000)
+            .setMaxVideoBitrate(if (legacy) 4_000_000 else 8_000_000)
             .setMinVideoBitrate(0)
             .setForceLowestBitrate(false)
             .setForceHighestSupportedBitrate(false)
@@ -611,12 +653,16 @@ class PlayerEngine(private val context: Context) {
      * - 弱网更稳：不再把本已紧张的带宽翻倍（旧方案在弱网下是负反馈）；
      * - 逻辑线性：失败/超时即切下一个，无需 raceCandidates 多路状态机。
      *
-     * 起播延迟由 [START_ATTEMPT_TIMEOUT_MS] 控制：单个尝试超时即切换，
+     * 起播延迟由 [directTimeoutMs]（直连）/ [proxyTimeoutMs]（代理）控制：单个尝试超时即切换，
      * 而连接类错误（onPlayerError）会立即切换，几乎不增加等待。
      */
     private fun startRace(url: String, attempts: List<String>) {
         raceActive = true
         raceDecided = false
+        // 防御性释放：任何残留的候选或上一频道 player（仅存 _playerRef）都先释放，
+        // 杜绝切台/重载时旧 ExoPlayer + 缓冲未回收导致的内存泄漏
+        for (c in raceCandidates) safeRelease(c.exo)
+        releaseCurrentPlayer()
         raceCandidates = emptyList()
         currentAttempts = attempts
         currentAttemptIndex = -1
@@ -644,15 +690,11 @@ class PlayerEngine(private val context: Context) {
         val attempt = currentAttempts[nextIndex]
         Log.d(TAG, "串行尝试[$nextIndex/${currentAttempts.size}]: $attempt")
         // 简洁展示：UI 加载区显示当前正在尝试的模式（直连/代理）与超时阈值
-        val loadTimeout = if (attempt == "proxy") proxyTimeoutMs else START_ATTEMPT_TIMEOUT_MS
+        val loadTimeout = if (attempt == "proxy") proxyTimeoutMs else directTimeoutMs
         updateState(loadMode = attempt, loadTimeoutMs = loadTimeout, loadRemainMs = loadTimeout)
 
         // 先释放上一个尝试的 player，确保同一时刻只有 1 个 ExoPlayer（内存恒定单路）
-        for (c in raceCandidates) {
-            c.exo?.stop()
-            c.exo?.release()
-            DebugDiagnostics.onPlayerReleased()
-        }
+        for (c in raceCandidates) safeRelease(c.exo)
 
         val cand = RaceCandidate(attempt, null, false)
         cand.exo = createCandidatePlayer(url, attempt == "proxy", winner = true)
@@ -665,7 +707,7 @@ class PlayerEngine(private val context: Context) {
     /** 单个尝试的起播超时：超过阈值仍未 READY → 切换下一个尝试；代理候选用更长超时 */
     private fun startAttemptTimeout(url: String, token: Int) {
         val attempt = currentAttempts.getOrNull(currentAttemptIndex) ?: return
-        val timeout = if (attempt == "proxy") proxyTimeoutMs else START_ATTEMPT_TIMEOUT_MS
+        val timeout = if (attempt == "proxy") proxyTimeoutMs else directTimeoutMs
         attemptTimeoutJob?.cancel()
         attemptTimeoutJob = scope.launch {
             // 每秒刷新剩余时间供 UI 倒计时；倒计时归零即切换下一个候选。
@@ -743,11 +785,7 @@ class PlayerEngine(private val context: Context) {
 
         // 串行下同时刻只存在 1 个 player；此处释放仅作兜底
         for (c in raceCandidates) {
-            if (c !== winner) {
-                c.exo?.stop()
-                c.exo?.release()
-                DebugDiagnostics.onPlayerReleased()
-            }
+            if (c !== winner) safeRelease(c.exo)
         }
 
         val winExo = winner.exo
@@ -909,7 +947,7 @@ class PlayerEngine(private val context: Context) {
      * 对于点播内容（非直播），保存当前播放位置，重载后 seekTo 恢复进度。
      * 与 handlePlayFailure 不同：不增加 consecutiveErrors、不跳下一台。
      */
-    private fun reloadCurrentChannel(reason: String) {
+    private fun reloadCurrentChannel(reason: String, ignoreLastMode: Boolean = false) {
         if (playlist.isEmpty()) return
         // 重载荷载锁：若已在 reload 流程中（竞速 watchdog / 播放期兜底可能同时触发），直接忽略，
         // 避免同一频道被并发多次 reload（表现为反复重新加载、台名反复闪烁）
@@ -931,19 +969,17 @@ class PlayerEngine(private val context: Context) {
         }
         Log.d(TAG, "reloadCurrentChannel(reason=$reason) idx=$currentIndex url=$currentPlayingUrl isLive=$isLiveStream")
         DebugDiagnostics.onReload(reason)
-        playCurrent()
+        playCurrent(ignoreLastMode = ignoreLastMode)
     }
 
     private fun resetRace() {
         raceActive = false
         raceDecided = false
         stopAttemptTimeout()
-        for (c in raceCandidates) {
-            c.exo?.stop()
-            c.exo?.release()
-            DebugDiagnostics.onPlayerReleased()
-        }
+        for (c in raceCandidates) safeRelease(c.exo)
         raceCandidates = emptyList()
+        // 兜底释放可能仅存于 _playerRef 的上一频道 player（胜出但未进入 raceCandidates）
+        releaseCurrentPlayer()
         currentAttempts = emptyList()
         currentAttemptIndex = -1
     }
@@ -962,9 +998,7 @@ class PlayerEngine(private val context: Context) {
             Log.d(TAG, "FLV 首次失败，原地重试: $curUrl")
             updateState(isLoading = true)
             resetRace()
-            player?.stop()
-            player?.release()
-            DebugDiagnostics.onPlayerReleased()
+            safeRelease(player)
             setPlayerRef(null)
             playUrl(curUrl, country)
             return
@@ -976,9 +1010,7 @@ class PlayerEngine(private val context: Context) {
             Log.d(TAG, "老设备直连失败，顺序重试代理: $curUrl")
             updateState(isLoading = true)
             resetRace()
-            player?.stop()
-            player?.release()
-            DebugDiagnostics.onPlayerReleased()
+            safeRelease(player)
             setPlayerRef(null)
             playUrl(curUrl, country, forceProxy = true)
             return
@@ -1064,16 +1096,34 @@ class PlayerEngine(private val context: Context) {
         player?.playWhenReady = false
     }
 
+    /** 停播：停止当前播放并释放解码器/渲染资源，保留播放列表，停留在当前界面（不退出 APP）。 */
+    fun stopPlayback() {
+        stopAttemptTimeout()
+        resetRace()
+        stopPlaybackStuckMonitor()
+        safeRelease(player)
+        setPlayerRef(null)
+        sharedSurface = null
+        updateState(
+            isLoading = false,
+            isPlaying = false,
+            error = null,
+            usingProxy = false,
+            loadMode = null
+        )
+        showHint("已停止播放")
+    }
+
     fun release() {
         stopAttemptTimeout()
         resetRace()
         infoHideJob?.cancel()
         hintHideJob?.cancel()
-        player?.stop()
-        player?.release()
-        DebugDiagnostics.onPlayerReleased()
+        safeRelease(player)
         setPlayerRef(null)
         sharedSurface = null
         playlist = emptyList()
+        // 彻底取消内部协程作用域，避免离开播放界面后仍有挂起任务持有资源
+        scope.cancel()
     }
 }

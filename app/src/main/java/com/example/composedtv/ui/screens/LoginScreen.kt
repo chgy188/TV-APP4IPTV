@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -83,6 +84,10 @@ fun LoginScreen(
     var errorMsg by remember { mutableStateOf<String?>(null) }
     // 密码框聚焦请求器：选中上次用户名后自动聚焦到密码框
     val passwordFocusRequester = remember { androidx.compose.ui.focus.FocusRequester() }
+    // 已记住用户名时默认收起用户名输入框（仅输密码即可），腾出垂直空间，
+    // 避免 TV 端弹出系统键盘时遮挡底部登录按钮；需切换账号时用"使用其他账号"展开。
+    var editingUser by remember(lastLoginUsername) { mutableStateOf(lastLoginUsername.isNullOrEmpty()) }
+    val userFocusRequester = remember { androidx.compose.ui.focus.FocusRequester() }
 
     BoxWithConstraints(
         modifier = Modifier
@@ -99,6 +104,7 @@ fun LoginScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
+                .imePadding()
                 .padding(
                     horizontal = if (compact) 20.dp else 24.dp,
                     vertical = if (compact) 16.dp else 32.dp
@@ -130,15 +136,54 @@ fun LoginScreen(
                 }
             }
 
-            InputField(
-                value = username,
-                onValueChange = { username = it },
-                label = "用户名",
-                icon = Icons.Default.Person,
-                isPassword = false,
-                compact = compact,
-                onEnter = { passwordFocusRequester.requestFocus() }
-            )
+            val showUserField = isRegister || editingUser || lastLoginUsername.isNullOrEmpty()
+            if (showUserField) {
+                InputField(
+                    value = username,
+                    onValueChange = { username = it },
+                    label = "用户名",
+                    icon = Icons.Default.Person,
+                    isPassword = false,
+                    compact = compact,
+                    modifier = Modifier.focusRequester(userFocusRequester),
+                    onEnter = { passwordFocusRequester.requestFocus() }
+                )
+            } else {
+                // 已记住账号：仅以只读感展示用户名 + "使用其他账号"入口，节省垂直空间
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            editingUser = true
+                            username = ""
+                        }
+                        .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
+                        .padding(horizontal = 12.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(Icons.Default.Person, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        text = lastLoginUsername ?: "",
+                        fontSize = 16.sp,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        text = "使用其他账号",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+
+            // 展开用户名输入框（切换账号）后自动聚焦，便于直接键入
+            androidx.compose.runtime.LaunchedEffect(editingUser) {
+                if (editingUser && lastLoginUsername != null) {
+                    kotlinx.coroutines.delay(120)
+                    runCatching { userFocusRequester.requestFocus() }
+                }
+            }
 
             InputField(
                 value = password,

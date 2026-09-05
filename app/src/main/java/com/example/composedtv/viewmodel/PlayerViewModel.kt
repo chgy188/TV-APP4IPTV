@@ -43,7 +43,9 @@ data class SidePanelData(
     /** 分类列表是否正在加载（显示 spinner） */
     val isLoadingCategories: Boolean = false,
     /** 频道列表是否正在加载（显示 spinner） */
-    val isLoadingChannels: Boolean = false
+    val isLoadingChannels: Boolean = false,
+    /** 收藏数据已变更（添加/取消）→ 缓存的「收藏」频道列表已过期，需重新拉取 */
+    val favoritesDirty: Boolean = false
 )
 
 /** 分类条目：收藏/搜索是特殊的虚拟分类 */
@@ -92,31 +94,57 @@ enum class RendererMode(val value: Int) {
     }
 }
 
+/**
+ * 首播频道模式（仅登录用户可在设置抽屉切换；游客固定为「上次退出频道」）。
+ * - FAVORITE_FIRST：收藏列表第一个（登录用户默认，保持原有行为）
+ * - LAST_PLAYED：上次退出时正在播放的频道
+ */
+enum class StartChannelMode(val value: Int) {
+    FAVORITE_FIRST(0),
+    LAST_PLAYED(1);
+
+    companion object {
+        fun fromValue(v: Int) = entries.firstOrNull { it.value == v } ?: FAVORITE_FIRST
+    }
+}
+
 /** 播放参数设置（由 MENU 设置抽屉调整，持久化保存） */
 data class PlaybackSettings(
     /** 直连胜出后持续缓冲判定 stuck 的时长（毫秒） */
     val stuckTimeoutMs: Long = 8_000L,
+    /** 直连候选的起播超时（毫秒）：超过该时长仍未 READY 则切换下一个候选。
+     *  默认 6s：既能覆盖正常起播，又不会让"慢但不报错"的源拖太久；
+     *  网络差 / 源响应慢时可调到 10s，避免被误判为不可播 */
+    val directTimeoutMs: Long = 6_000L,
     /** 代理候选的起播超时（毫秒）：代理路径多一跳、握手更慢，需比直连更长容忍。
      *  超过该时长仍未 READY 则切换下一个候选；网络差 / 代理慢时可调大，避免被误判为不可播 */
     val proxyTimeoutMs: Long = 10_000L,
     /** 视频渲染方式（AUTO / SURFACE / TEXTURE） */
     val rendererMode: RendererMode = RendererMode.AUTO,
+    /** 首播频道模式（登录用户可调；游客忽略该设置，始终续播上次退出时的频道） */
+    val startChannelMode: StartChannelMode = StartChannelMode.FAVORITE_FIRST,
     /** 画面诊断 HUD 开关（无 ADB 环境调试用；持久化保存，重启后保持上次选择） */
     val diagHudEnabled: Boolean = false
 ) {
     companion object {
         private const val PREF_NAME = "playback_settings"
         private const val KEY_STUCK = "stuck_timeout_ms"
+        private const val KEY_DIRECT_TIMEOUT = "direct_timeout_ms"
         private const val KEY_PROXY_TIMEOUT = "proxy_timeout_ms"
         private const val KEY_RENDERER = "renderer_mode"
+        private const val KEY_START_CHANNEL = "start_channel_mode"
         private const val KEY_DIAG_HUD = "diag_hud_enabled"
 
         fun load(context: Context): PlaybackSettings {
             val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             return PlaybackSettings(
                 stuckTimeoutMs = sp.getLong(KEY_STUCK, 8_000L),
+                directTimeoutMs = sp.getLong(KEY_DIRECT_TIMEOUT, 6_000L),
                 proxyTimeoutMs = sp.getLong(KEY_PROXY_TIMEOUT, 10_000L),
                 rendererMode = RendererMode.fromValue(sp.getInt(KEY_RENDERER, RendererMode.AUTO.value)),
+                startChannelMode = StartChannelMode.fromValue(
+                    sp.getInt(KEY_START_CHANNEL, StartChannelMode.FAVORITE_FIRST.value)
+                ),
                 // 默认值随构建类型：debug 包默认开（便于调试），release 包默认关（对普通用户干净）。
                 // 一旦用户在设置里切换过，就以持久化的值为准。
                 diagHudEnabled = sp.getBoolean(KEY_DIAG_HUD, BuildConfig.DEBUG)
@@ -127,9 +155,106 @@ data class PlaybackSettings(
             val sp: SharedPreferences = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             sp.edit()
                 .putLong(KEY_STUCK, s.stuckTimeoutMs)
+                .putLong(KEY_DIRECT_TIMEOUT, s.directTimeoutMs)
                 .putLong(KEY_PROXY_TIMEOUT, s.proxyTimeoutMs)
                 .putInt(KEY_RENDERER, s.rendererMode.value)
+                .putInt(KEY_START_CHANNEL, s.startChannelMode.value)
                 .putBoolean(KEY_DIAG_HUD, s.diagHudEnabled)
+                .apply()
+        }
+    }
+}
+
+/**
+ * 上次退出时正在播放的频道（首播续播用）。
+ *
+ * 除了频道本身，还记录其「播放列表来源」与索引，启动时据此重建同一份列表，
+ * 使续播后 ↑↓ 切台依然可用（而不是只剩孤零零一个频道）。
+ */
+data class LastPlayedChannel(
+    val name: String,
+    val url: String,
+    val sourceId: String? = null,
+    val favId: String? = null,
+    val isFavorite: Boolean = false,
+    val country: String = "",
+    val ua: String = "",
+    val rf: String = "",
+    /** 播放列表来源类型：[ORIGIN_FAVORITES] / [ORIGIN_CATEGORY] / [ORIGIN_SINGLE] */
+    val originKind: String = ORIGIN_SINGLE,
+    /** 来源为分类时的源 id */
+    val originSourceId: String? = null,
+    /** 来源为分类时的分类名 */
+    val originCategory: String? = null,
+    /** 在来源列表中的索引 */
+    val originIndex: Int = 0
+) {
+    fun toPlaylistItem() = PlaylistItem(
+        name = name,
+        url = url,
+        sourceId = sourceId,
+        favId = favId,
+        isFavorite = isFavorite,
+        country = country,
+        ua = ua,
+        rf = rf
+    )
+
+    companion object {
+        /** 播放列表来自收藏 */
+        const val ORIGIN_FAVORITES = "favorites"
+        /** 播放列表来自某个源的某个分类 */
+        const val ORIGIN_CATEGORY = "category"
+        /** 播放列表只有一个频道（游客默认频道 / 搜索结果等），重建时退化为单条 */
+        const val ORIGIN_SINGLE = "single"
+
+        private const val PREF_NAME = "last_played_channel"
+        private const val K_NAME = "name"
+        private const val K_URL = "url"
+        private const val K_SOURCE_ID = "source_id"
+        private const val K_FAV_ID = "fav_id"
+        private const val K_IS_FAV = "is_fav"
+        private const val K_COUNTRY = "country"
+        private const val K_UA = "ua"
+        private const val K_RF = "rf"
+        private const val K_ORIGIN_KIND = "origin_kind"
+        private const val K_ORIGIN_SOURCE = "origin_source_id"
+        private const val K_ORIGIN_CAT = "origin_category"
+        private const val K_ORIGIN_IDX = "origin_index"
+
+        fun load(context: Context): LastPlayedChannel? {
+            val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+            val url = sp.getString(K_URL, null)?.takeIf { it.isNotBlank() } ?: return null
+            return LastPlayedChannel(
+                name = sp.getString(K_NAME, null) ?: "",
+                url = url,
+                sourceId = sp.getString(K_SOURCE_ID, null),
+                favId = sp.getString(K_FAV_ID, null),
+                isFavorite = sp.getBoolean(K_IS_FAV, false),
+                country = sp.getString(K_COUNTRY, null) ?: "",
+                ua = sp.getString(K_UA, null) ?: "",
+                rf = sp.getString(K_RF, null) ?: "",
+                originKind = sp.getString(K_ORIGIN_KIND, null) ?: ORIGIN_SINGLE,
+                originSourceId = sp.getString(K_ORIGIN_SOURCE, null),
+                originCategory = sp.getString(K_ORIGIN_CAT, null),
+                originIndex = sp.getInt(K_ORIGIN_IDX, 0)
+            )
+        }
+
+        fun save(context: Context, c: LastPlayedChannel) {
+            context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit()
+                .putString(K_NAME, c.name)
+                .putString(K_URL, c.url)
+                .putString(K_SOURCE_ID, c.sourceId)
+                .putString(K_FAV_ID, c.favId)
+                .putBoolean(K_IS_FAV, c.isFavorite)
+                .putString(K_COUNTRY, c.country)
+                .putString(K_UA, c.ua)
+                .putString(K_RF, c.rf)
+                .putString(K_ORIGIN_KIND, c.originKind)
+                .putString(K_ORIGIN_SOURCE, c.originSourceId)
+                .putString(K_ORIGIN_CAT, c.originCategory)
+                .putInt(K_ORIGIN_IDX, c.originIndex)
                 .apply()
         }
     }
@@ -138,6 +263,10 @@ data class PlaybackSettings(
 /** 设置抽屉可选值集合（供 UI 渲染单选列表） */
 object PlaybackSettingOptions {
     val stuckOptions = listOf(5_000L to "5秒", 8_000L to "8秒(默认)", 12_000L to "12秒")
+    val directTimeoutOptions = listOf(
+        6_000L to "6秒(默认)",
+        10_000L to "10秒(网络差/源慢)"
+    )
     val proxyTimeoutOptions = listOf(
         7_000L to "7秒(网络好)",
         10_000L to "10秒(默认)",
@@ -148,6 +277,10 @@ object PlaybackSettingOptions {
         RendererMode.SURFACE to "SurfaceView(性能优)",
         RendererMode.TEXTURE to "TextureView(兼容)"
     )
+    val startChannelOptions = listOf(
+        StartChannelMode.FAVORITE_FIRST to "收藏第一个(默认)",
+        StartChannelMode.LAST_PLAYED to "上次退出频道"
+    )
 }
 
 /** UI 状态 */
@@ -157,6 +290,8 @@ data class PlayerUiState(
     val sidePanelVisible: Boolean = false,
     val sidePanel: SidePanelData = SidePanelData(),
     val initialChannelLoaded: Boolean = false,
+    /** 初始播放列表中的起始索引（续播上次退出频道时不为 0） */
+    val initialPlayIndex: Int = 0,
     val errorMessage: String? = null,
     val storedUsers: List<StoredUser> = emptyList(),
     /** 上次成功登录的用户名（用于登录界面预填，null 表示无记录） */
@@ -187,8 +322,18 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
         )
     }
 
+    /** 播放列表来源：用于把「上次退出时的频道」连同它的列表一起还原（续播后 ↑↓ 仍可切台） */
+    private data class PlaylistOrigin(
+        val kind: String = LastPlayedChannel.ORIGIN_SINGLE,
+        val sourceId: String? = null,
+        val category: String? = null
+    )
+
     /** 播放列表管理器（由 PlayerScreen 持有 PlayerEngine，VM 负责数据供给） */
     private var currentPlaylist: List<PlaylistItem> = emptyList()
+
+    /** 当前播放列表的来源（随 currentPlaylist 一起更新） */
+    private var currentPlaylistOrigin = PlaylistOrigin()
 
     /** 当前播放频道的索引（由 PlayerScreen 同步更新，用于 Activity 层兜底切侧边栏） */
     private var currentPlayIndex: Int = 0
@@ -200,7 +345,10 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
     fun initialize(isGuest: Boolean) {
         _uiState.value = _uiState.value.copy(isGuest = isGuest, storedUsers = ApiClient.getStoredUsers())
         if (isGuest) {
+            // 游客：固定续播上次退出时的频道；首次使用（无记录）才用默认起始频道
             loadGuestStartChannel()
+        } else if (_uiState.value.playbackSettings.startChannelMode == StartChannelMode.LAST_PLAYED) {
+            loadLastPlayedChannel()
         } else {
             loadFirstFavoriteChannel()
         }
@@ -229,10 +377,38 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
 
     // ===== 初始播放 =====
 
+    /**
+     * 游客首播：优先续播上次退出时的频道；首次使用（无记录）走后端默认起始频道。
+     *
+     * 注意「没有收藏 → 退化为游客起始频道」的登录分支也会走到这里（loadFirstFavoriteChannel），
+     * 那种情况下若存在续播记录，同样优先续播，体验更连贯。
+     */
     private fun loadGuestStartChannel() {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isLoading = true, errorMessage = null)
             try {
+                val last = LastPlayedChannel.load(app)
+                if (last != null) {
+                    val (playlist, idx) = buildResumePlaylist(last)
+                    if (playlist.isNotEmpty()) {
+                        currentPlaylist = playlist
+                        currentPlaylistOrigin = PlaylistOrigin(
+                            kind = last.originKind,
+                            sourceId = last.originSourceId,
+                            category = last.originCategory
+                        )
+                        currentPlayIndex = idx
+                        Log.d(TAG, "续播上次退出频道: ${last.name} idx=$idx size=${playlist.size}")
+                        _uiState.value = _uiState.value.copy(
+                            isLoading = false,
+                            initialChannelLoaded = true,
+                            initialPlayIndex = idx,
+                            errorMessage = null
+                        )
+                        return@launch
+                    }
+                }
+                // 无续播记录（首次使用）→ 后端默认起始频道
                 val guestChannel = ApiClient.getGuestStart()
                 if (guestChannel != null) {
                     val playlist = listOf(
@@ -246,9 +422,11 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                         )
                     )
                     currentPlaylist = playlist
+                    currentPlaylistOrigin = PlaylistOrigin(LastPlayedChannel.ORIGIN_SINGLE, null, null)
                     _uiState.value = _uiState.value.copy(
                         isLoading = false,
                         initialChannelLoaded = true,
+                        initialPlayIndex = 0,
                         errorMessage = null
                     )
                 } else {
@@ -264,6 +442,111 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                     errorMessage = "连接失败：${e.message}"
                 )
             }
+        }
+    }
+
+    /**
+     * 登录用户选择「上次退出频道」时的首播：有记录则续播，
+     * 没有记录（首次 / 数据被清）则退回「收藏第一个」。
+     */
+    private fun loadLastPlayedChannel() {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(isLoading = true, errorMessage = null)
+            val last = runCatching { LastPlayedChannel.load(app) }.getOrNull()
+            if (last == null) {
+                Log.d(TAG, "无续播记录，退回收藏第一个")
+                loadFirstFavoriteChannel()
+                return@launch
+            }
+            try {
+                val (playlist, idx) = buildResumePlaylist(last)
+                if (playlist.isEmpty()) {
+                    loadFirstFavoriteChannel()
+                    return@launch
+                }
+                currentPlaylist = playlist
+                currentPlaylistOrigin = PlaylistOrigin(
+                    kind = last.originKind,
+                    sourceId = last.originSourceId,
+                    category = last.originCategory
+                )
+                currentPlayIndex = idx
+                Log.d(TAG, "续播上次退出频道: ${last.name} idx=$idx size=${playlist.size}")
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    initialChannelLoaded = true,
+                    initialPlayIndex = idx,
+                    errorMessage = null
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "loadLastPlayedChannel failed", e)
+                loadFirstFavoriteChannel()
+            }
+        }
+    }
+
+    /**
+     * 按记录的来源重建续播用的播放列表，返回「列表 + 起始索引」。
+     *
+     * 重建失败（源/分类已不存在、网络异常）或列表里找不到该频道时，
+     * 退化为只含该频道的单条列表，保证「至少把上次的频道播出来」。
+     */
+    private suspend fun buildResumePlaylist(last: LastPlayedChannel): Pair<List<PlaylistItem>, Int> {
+        val rebuilt: List<PlaylistItem>? = when (last.originKind) {
+            LastPlayedChannel.ORIGIN_FAVORITES -> runCatching {
+                if (!ApiClient.isLoggedIn) {
+                    emptyList<PlaylistItem>()
+                } else {
+                    ApiClient.getFavorites().map { fav ->
+                        PlaylistItem(
+                            name = fav.name,
+                            url = fav.url,
+                            sourceId = fav.sourceId,
+                            favId = fav.id,
+                            isFavorite = true,
+                            ua = fav.ua,
+                            rf = fav.rf,
+                            country = ""
+                        )
+                    }
+                }
+            }.getOrNull()
+
+            LastPlayedChannel.ORIGIN_CATEGORY -> runCatching {
+                val sid = last.originSourceId
+                val cat = last.originCategory
+                if (sid == null || cat == null) {
+                    emptyList<PlaylistItem>()
+                } else {
+                    ApiClient.getChannels(sid)
+                        .filter { (it.group.ifEmpty { "未分类" }) == cat }
+                        .map { ch ->
+                            PlaylistItem(
+                                name = ch.name,
+                                url = ch.url,
+                                sourceId = sid,
+                                favId = null,
+                                isFavorite = false,
+                                country = ch.countryAttr,
+                                ua = ch.ua,
+                                rf = ch.rf
+                            )
+                        }
+                }
+            }.getOrNull()
+
+            else -> null
+        }
+
+        if (rebuilt.isNullOrEmpty()) {
+            return listOf(last.toPlaylistItem()) to 0
+        }
+        val idx = rebuilt.indexOfFirst { it.url == last.url }
+        return if (idx >= 0) {
+            rebuilt to idx
+        } else {
+            // 列表已变（频道被移除等）：把上次的频道放在首位，其余保留，保证切台仍可用
+            (listOf(last.toPlaylistItem()) + rebuilt) to 0
         }
     }
 
@@ -287,13 +570,15 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                         )
                     }
                     currentPlaylist = playlist
+                    currentPlaylistOrigin = PlaylistOrigin(LastPlayedChannel.ORIGIN_FAVORITES)
                     _uiState.value = _uiState.value.copy(
                         isLoading = false,
                         initialChannelLoaded = true,
+                        initialPlayIndex = 0,
                         errorMessage = null
                     )
                 } else {
-                    // 没有收藏 → 退化为游客起始频道
+                    // 没有收藏 → 退化为游客起始频道（其中有续播记录则优先续播）
                     Log.w(TAG, "No favorites, falling back to guest start")
                     loadGuestStartChannel()
                 }
@@ -310,9 +595,38 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
     /** 供 PlayerScreen 获取初始播放列表 */
     fun getInitialPlaylist(): List<PlaylistItem> = currentPlaylist
 
-    /** 供 PlayerScreen 同步当前播放索引（用于 Activity 层兜底的确定键弹出侧边栏） */
+    /**
+     * 供 PlayerScreen 同步当前播放索引（用于 Activity 层兜底的确定键弹出侧边栏）。
+     * 同步的同时把「当前播放频道 + 其列表来源」写入持久化，作为下次启动的续播依据。
+     */
     fun syncCurrentPlayIndex(index: Int) {
         currentPlayIndex = index
+        persistLastPlayed(index)
+    }
+
+    /** 记录上次播放的频道（切台 / 起播即写，退出时无需额外处理） */
+    private fun persistLastPlayed(index: Int) {
+        val item = currentPlaylist.getOrNull(index) ?: return
+        if (item.url.isBlank()) return
+        runCatching {
+            LastPlayedChannel.save(
+                app,
+                LastPlayedChannel(
+                    name = item.name,
+                    url = item.url,
+                    sourceId = item.sourceId,
+                    favId = item.favId,
+                    isFavorite = item.isFavorite,
+                    country = item.country,
+                    ua = item.ua,
+                    rf = item.rf,
+                    originKind = currentPlaylistOrigin.kind,
+                    originSourceId = currentPlaylistOrigin.sourceId,
+                    originCategory = currentPlaylistOrigin.category,
+                    originIndex = index
+                )
+            )
+        }.onFailure { Log.w(TAG, "保存续播记录失败: ${it.message}") }
     }
 
     /** Activity 层兜底调用：切换侧边栏（无需传参，内部通过 currentPlaylist + currentPlayIndex 定位） */
@@ -494,8 +808,58 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 加载指定分类的频道列表 */
-    fun loadChannelsForCategory(sourceIndex: Int, categoryIndex: Int) {
+    /**
+     * 在当前源内定位「正在播放的频道」，使面板打开时高亮 / 聚焦到它。
+     *
+     * 必要性：启动预热时还没有「当前播放频道」信息，分类与频道是按默认分类加载的；
+     * 用户按确定键打开面板时，播放中的频道往往不在已展示的分类里。
+     * 此时不能走 [loadCategoriesForSource]——它的缓存命中分支会直接返回、不会切换分类，
+     * 导致焦点与高亮停在无关频道上。这里按频道所属分组直接切到对应分类并强制刷新其列表。
+     */
+    private fun locateCurrentChannelInSource(sourceIndex: Int) {
+        val pending = pendingCurrentChannel
+        if (pending == null) {
+            loadCategoriesForSource(sourceIndex, force = true)
+            return
+        }
+        viewModelScope.launch {
+            try {
+                val state = _uiState.value
+                val source = state.sidePanel.sources.getOrNull(sourceIndex) ?: return@launch
+                val catIdx = if (pending.isFavorite || pending.favId != null) {
+                    // 播放中的是收藏频道 → 切到「收藏」分类
+                    state.sidePanel.categories.indexOfFirst { it.isFavorites }.takeIf { it >= 0 }
+                } else {
+                    // 用缓存的频道表（内存 / 每日磁盘缓存，通常为命中）反查频道所属分组
+                    val all = ApiClient.getChannels(source.id)
+                    val matched = all.firstOrNull { it.url == pending.url }
+                        ?: all.firstOrNull { it.name == pending.name }
+                    val group = matched?.group?.ifEmpty { "未分类" }
+                    group?.let { g ->
+                        state.sidePanel.categories
+                            .indexOfFirst { !it.isSearch && !it.isFavorites && it.name == g }
+                            .takeIf { it >= 0 }
+                    }
+                }
+                if (catIdx != null) {
+                    Log.d(TAG, "定位当前播放频道所在分类：cat=$catIdx url=${pending.url}")
+                    loadChannelsForCategory(sourceIndex, catIdx, force = true)
+                } else {
+                    // 分类表里找不到（源已变更 / 数据未就绪）→ 重新拉分类再走定位流程
+                    loadCategoriesForSource(sourceIndex, force = true)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "locateCurrentChannelInSource failed", e)
+                loadCategoriesForSource(sourceIndex, force = true)
+            }
+        }
+    }
+
+    /**
+     * 加载指定分类的频道列表
+     * @param force 为 true 时忽略缓存、强制重新加载（定位当前播放频道时使用）
+     */
+    fun loadChannelsForCategory(sourceIndex: Int, categoryIndex: Int, force: Boolean = false) {
         val state = _uiState.value
         val source = state.sidePanel.sources.getOrNull(sourceIndex) ?: return
         val category = state.sidePanel.categories.getOrNull(categoryIndex) ?: return
@@ -504,7 +868,10 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
             return
         }
         // 同一源同一分类且频道已加载（缓存命中）→ 直接复用，不显示 spinner
-        if (state.sidePanel.selectedSourceIndex == sourceIndex &&
+        // 例外：收藏分类在数据已变更（favoritesDirty）时必须重新拉取，
+        // 否则取消收藏后列表里仍显示该频道，要下次冷启动才消失
+        if (!force && !(category.isFavorites && state.sidePanel.favoritesDirty) &&
+            state.sidePanel.selectedSourceIndex == sourceIndex &&
             state.sidePanel.selectedCategoryIndex == categoryIndex &&
             state.sidePanel.channels.isNotEmpty()
         ) {
@@ -573,7 +940,9 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                         isSearchMode = false,
                         searchQuery = "",
                         searchResults = emptyList(),
-                        isLoadingChannels = false
+                        isLoadingChannels = false,
+                        // 收藏分类刚拉到最新数据 → 清除脏标记；其他分类保持不变
+                        favoritesDirty = state.sidePanel.favoritesDirty && !category.isFavorites
                     )
                 )
             } catch (e: Exception) {
@@ -584,10 +953,33 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                         isSearchMode = false,
                         searchQuery = "",
                         searchResults = emptyList(),
-                        isLoadingChannels = false
+                        isLoadingChannels = false,
+                        favoritesDirty = state.sidePanel.favoritesDirty && !category.isFavorites
                     )
                 )
             }
+        }
+    }
+
+    /**
+     * 收藏发生变更（添加 / 取消）后调用：让侧边栏「收藏」分类即时反映最新数据。
+     *
+     * - 当前正停留在收藏分类 → 立即重新拉取并替换列表，画面上马上少掉/多出该频道；
+     * - 停留在其他分类（或面板关闭）→ 只打脏标记，下次切到收藏分类时强制重新加载，
+     *   不会打断用户正在浏览的列表。
+     */
+    fun onFavoritesChanged() {
+        val state = _uiState.value
+        if (!ApiClient.isLoggedIn) return
+        _uiState.value = _uiState.value.copy(
+            sidePanel = state.sidePanel.copy(favoritesDirty = true)
+        )
+        // 分类表已加载且当前展示的就是收藏分类 → 立刻重载（loadChannelsForCategory 会清脏标记）
+        val favCatIdx = state.sidePanel.categories.indexOfFirst { it.isFavorites }
+        if (favCatIdx >= 0 && state.sidePanel.selectedCategoryIndex == favCatIdx &&
+            !state.sidePanel.isSearchMode
+        ) {
+            loadChannelsForCategory(state.sidePanel.selectedSourceIndex, favCatIdx, force = true)
         }
     }
 
@@ -617,6 +1009,21 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
             )
         }
         currentPlaylist = playlist
+        // 记录列表来源：续播时据此重建同一份列表（搜索结果无法复原，退化为单条）
+        currentPlaylistOrigin = if (state.sidePanel.isSearchMode) {
+            PlaylistOrigin(LastPlayedChannel.ORIGIN_SINGLE)
+        } else {
+            val cat = state.sidePanel.categories.getOrNull(state.sidePanel.selectedCategoryIndex)
+            when {
+                cat == null -> PlaylistOrigin(LastPlayedChannel.ORIGIN_SINGLE)
+                cat.isFavorites -> PlaylistOrigin(LastPlayedChannel.ORIGIN_FAVORITES)
+                else -> PlaylistOrigin(
+                    kind = LastPlayedChannel.ORIGIN_CATEGORY,
+                    sourceId = state.sidePanel.sources.getOrNull(state.sidePanel.selectedSourceIndex)?.id,
+                    category = cat.name
+                )
+            }
+        }
 
         _uiState.value = _uiState.value.copy(
             sidePanel = state.sidePanel.copy(selectedChannelIndex = safeIdx)
@@ -726,8 +1133,8 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                     _uiState.value = _uiState.value.copy(
                         sidePanel = state.sidePanel.copy(selectedSourceIndex = prefSrcIdx)
                     )
-                    loadCategoriesForSource(prefSrcIdx)
-                } else if (state.sidePanel.categories.isEmpty() ||
+                }
+                if (state.sidePanel.categories.isEmpty() ||
                     state.sidePanel.loadedSourceId != sources.getOrNull(prefSrcIdx)?.id
                 ) {
                     // 分类为空，或当前分类不属于正在播放的源（换源后未刷新）→ 重新加载
@@ -744,8 +1151,8 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                         )
                         pendingCurrentChannel = null
                     } else {
-                        // 需要在当前源重选分类
-                        loadCategoriesForSource(prefSrcIdx)
+                        // 需要在当前源重选分类 → 定位到当前播放频道所在的分类
+                        locateCurrentChannelInSource(prefSrcIdx)
                     }
                 }
             }
@@ -783,6 +1190,11 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
         commitSettings(next)
     }
 
+    fun updateDirectTimeout(ms: Long) {
+        val next = _uiState.value.playbackSettings.copy(directTimeoutMs = ms)
+        commitSettings(next)
+    }
+
     fun updateProxyTimeout(ms: Long) {
         val next = _uiState.value.playbackSettings.copy(proxyTimeoutMs = ms)
         commitSettings(next)
@@ -790,6 +1202,12 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun updateRendererMode(mode: RendererMode) {
         val next = _uiState.value.playbackSettings.copy(rendererMode = mode)
+        commitSettings(next)
+    }
+
+    /** 首播频道模式（仅登录用户可调；下次启动生效） */
+    fun updateStartChannelMode(mode: StartChannelMode) {
+        val next = _uiState.value.playbackSettings.copy(startChannelMode = mode)
         commitSettings(next)
     }
 

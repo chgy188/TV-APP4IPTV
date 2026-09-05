@@ -1,5 +1,3 @@
-@file:OptIn(androidx.media3.common.util.UnstableApi::class)
-
 package com.example.composedtv.debug
 
 import android.content.Context
@@ -10,18 +8,15 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.DecoderCounters
+import androidx.media3.exoplayer.DecoderReuseEvaluation
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import com.example.composedtv.BuildConfig
 import org.json.JSONObject
-import java.io.File
-import java.io.FileWriter
-import java.net.NetworkInterface
 import java.text.SimpleDateFormat
 import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -43,8 +38,6 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 data class DiagSnapshot(
     val enabled: Boolean = true,
-    val serverRunning: Boolean = false,
-    val serverUrl: String = "",
 
     // ===== 设备 =====
     val device: String = "",
@@ -97,15 +90,13 @@ data class DiagSnapshot(
     val lastError: String = "-",
 
     // ===== 日志 =====
-    val logLines: Int = 0,
-    val logPath: String = "-"
+    val logLines: Int = 0
 )
 
 object DebugDiagnostics {
 
     private const val TAG = "Diag"
     private const val MAX_LOG_LINES = 3000
-    private const val LOG_FILE_NAME = "iptv-debug.log"
 
     /** HUD / HTTP 服务总开关。release 默认关，可用遥控器数字键 0 打开 */
     @Volatile
@@ -246,12 +237,15 @@ object DebugDiagnostics {
             log(TAG, "decoder-init name=$decoderName cost=${initializationDurationMs}ms")
         }
 
+        // 用三参数版本：两参数版本在 media3 1.2.1 已废弃
         override fun onVideoInputFormatChanged(
             eventTime: AnalyticsListener.EventTime,
-            format: Format
+            format: Format,
+            decoderReuseEvaluation: DecoderReuseEvaluation?
         ) {
             log(TAG, "video-format ${format.sampleMimeType} ${format.width}x${format.height}" +
-                    " fps=${format.frameRate} bps=${format.bitrate} codecs=${format.codecs}")
+                    " fps=${format.frameRate} bps=${format.bitrate} codecs=${format.codecs}" +
+                    " reuse=${decoderReuseEvaluation?.result ?: "-"}")
         }
 
         override fun onVideoSizeChanged(
@@ -261,11 +255,15 @@ object DebugDiagnostics {
             log(TAG, "video-size ${videoSize.width}x${videoSize.height}")
         }
 
-        fun onDroppedFrames(
+        // 原名 onDroppedFrames 是 ExoPlayer 2 的写法，media3 已改名 onDroppedVideoFrames，
+        // 且多出 elapsedMs 参数；此前没有 override 也不会报错，导致丢帧事件一直没被采集
+        override fun onDroppedVideoFrames(
             eventTime: AnalyticsListener.EventTime,
-            droppedFrames: Int
+            droppedFrames: Int,
+            elapsedMs: Long
         ) {
-            log(TAG, "dropped-frames count=$droppedFrames")
+            log(TAG, "dropped-frames count=$droppedFrames elapsed=${elapsedMs}ms" +
+                    " pos=${eventTime.currentPlaybackPositionMs}ms")
         }
 
         override fun onPlayerError(
@@ -329,8 +327,6 @@ object DebugDiagnostics {
         val fmt = p?.videoFormat
         return DiagSnapshot(
             enabled = enabled,
-            serverRunning = DebugLogServer.isRunning(),
-            serverUrl = DebugLogServer.url().orEmpty(),
             device = "${Build.MANUFACTURER} ${Build.MODEL}",
             sdkInt = Build.VERSION.SDK_INT,
             abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "?",
@@ -369,14 +365,12 @@ object DebugDiagnostics {
             lastReloadReason = lastReloadReason,
             errorCount = cError.get(),
             lastError = lastError,
-            logLines = logSize(),
-            logPath = logPath() ?: "-"
+            logLines = logSize()
         )
     }
 
     fun toJson(s: DiagSnapshot = snapshot()): String = JSONObject().apply {
         put("enabled", s.enabled)
-        put("serverUrl", s.serverUrl)
         put("device", s.device)
         put("sdkInt", s.sdkInt)
         put("abi", s.abi)
@@ -413,7 +407,6 @@ object DebugDiagnostics {
         put("lastReloadReason", s.lastReloadReason)
         put("errorCount", s.errorCount)
         put("lastError", s.lastError)
-        put("logPath", s.logPath)
     }.toString(2)
 
     private fun stateName(state: Int): String = when (state) {
@@ -424,36 +417,14 @@ object DebugDiagnostics {
         else -> "?$state"
     }
 
-    // ===== 日志 =====
+    // ===== 日志（内存环形缓冲，供诊断面板展示） =====
 
     private val logLock = Any()
     private val logLines = ArrayDeque<String>(512)
-    private val writer = Executors.newSingleThreadExecutor()
-
-    @Volatile
-    private var fileSink: File? = null
 
     private val tsFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
     private fun stamp(): String = tsFormat.format(Date())
-
-    /** 文件日志落盘（HTTP 服务启动时自动开启） */
-    fun startFileLogging() {
-        val dir = appContext?.getExternalFilesDir(null)
-        if (dir == null) {
-            Log.w(TAG, "startFileLogging: 无法获取外部目录")
-            return
-        }
-        if (!dir.exists()) dir.mkdirs()
-        fileSink = File(dir, LOG_FILE_NAME)
-        log(TAG, "file logging -> ${fileSink?.absolutePath}")
-    }
-
-    fun stopFileLogging() {
-        fileSink = null
-    }
-
-    fun logPath(): String? = fileSink?.absolutePath
 
     fun log(tag: String, msg: String) {
         val line = "${stamp()} [$tag] $msg"
@@ -461,14 +432,6 @@ object DebugDiagnostics {
         synchronized(logLock) {
             if (logLines.size >= MAX_LOG_LINES) logLines.removeFirst()
             logLines.addLast(line)
-        }
-        val f = fileSink
-        if (f != null) {
-            writer.execute {
-                runCatching {
-                    FileWriter(f, true).use { it.appendLine(line) }
-                }.onFailure { Log.w(TAG, "写日志文件失败: ${it.message}") }
-            }
         }
     }
 
@@ -479,10 +442,6 @@ object DebugDiagnostics {
 
     fun clearLog() {
         synchronized(logLock) { logLines.clear() }
-        val f = fileSink
-        if (f != null) {
-            writer.execute { runCatching { FileWriter(f, false).use { it.write("") } } }
-        }
     }
 
     /** 复位所有计数器（切换频道前后对比用） */
@@ -503,11 +462,4 @@ object DebugDiagnostics {
         log(TAG, "counters reset")
     }
 
-    /** 本机 IPv4（HTTP 服务地址展示用，不需要额外权限） */
-    fun localIpAddress(): String? = runCatching {
-        NetworkInterface.getNetworkInterfaces()?.toList()
-            ?.flatMap { it.inetAddresses.toList() }
-            ?.firstOrNull { !it.isLoopbackAddress && it.address.size == 4 }
-            ?.hostAddress
-    }.getOrNull()
 }
