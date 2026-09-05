@@ -3,6 +3,7 @@ package com.example.composedtv
 import android.os.Bundle
 import android.util.Log
 import android.view.KeyEvent
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
@@ -42,6 +43,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 保持屏幕常亮：阻止设备因闲置超时进入锁屏/屏保（TV IPTV 应用常驻前台场景）。
+        // FLAG_KEEP_SCREEN_ON 由窗口系统自动管理，无需 WAKE_LOCK 权限，离开应用即失效。
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         // 捕获 Activity 引用，供下方 Compose 树（经 AppContent 间接渲染）回调退出 APP
         val self = this

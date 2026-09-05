@@ -124,7 +124,11 @@ data class PlaybackSettings(
     /** 首播频道模式（登录用户可调；游客忽略该设置，始终续播上次退出时的频道） */
     val startChannelMode: StartChannelMode = StartChannelMode.FAVORITE_FIRST,
     /** 画面诊断 HUD 开关（无 ADB 环境调试用；持久化保存，重启后保持上次选择） */
-    val diagHudEnabled: Boolean = false
+    val diagHudEnabled: Boolean = false,
+    /** 流畅优先：强制降到 720p/4Mbps，降低解码负载，缓解弱机/部分频道音画不同步 */
+    val smoothPriority: Boolean = false,
+    /** 音画同步自动恢复：持续掉帧判定为音视频漂移时自动重载重新同步 */
+    val autoAvSync: Boolean = true
 ) {
     companion object {
         private const val PREF_NAME = "playback_settings"
@@ -134,6 +138,8 @@ data class PlaybackSettings(
         private const val KEY_RENDERER = "renderer_mode"
         private const val KEY_START_CHANNEL = "start_channel_mode"
         private const val KEY_DIAG_HUD = "diag_hud_enabled"
+        private const val KEY_SMOOTH = "smooth_priority"
+        private const val KEY_AUTO_AV_SYNC = "auto_av_sync"
 
         fun load(context: Context): PlaybackSettings {
             val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
@@ -147,7 +153,9 @@ data class PlaybackSettings(
                 ),
                 // 默认值随构建类型：debug 包默认开（便于调试），release 包默认关（对普通用户干净）。
                 // 一旦用户在设置里切换过，就以持久化的值为准。
-                diagHudEnabled = sp.getBoolean(KEY_DIAG_HUD, BuildConfig.DEBUG)
+                diagHudEnabled = sp.getBoolean(KEY_DIAG_HUD, BuildConfig.DEBUG),
+                smoothPriority = sp.getBoolean(KEY_SMOOTH, false),
+                autoAvSync = sp.getBoolean(KEY_AUTO_AV_SYNC, true)
             )
         }
 
@@ -160,6 +168,8 @@ data class PlaybackSettings(
                 .putInt(KEY_RENDERER, s.rendererMode.value)
                 .putInt(KEY_START_CHANNEL, s.startChannelMode.value)
                 .putBoolean(KEY_DIAG_HUD, s.diagHudEnabled)
+                .putBoolean(KEY_SMOOTH, s.smoothPriority)
+                .putBoolean(KEY_AUTO_AV_SYNC, s.autoAvSync)
                 .apply()
         }
     }
@@ -276,6 +286,14 @@ object PlaybackSettingOptions {
         RendererMode.AUTO to "自动(默认)",
         RendererMode.SURFACE to "SurfaceView(性能优)",
         RendererMode.TEXTURE to "TextureView(兼容)"
+    )
+    val smoothPriorityOptions = listOf(
+        false to "关(默认，画质优先)",
+        true to "开(降720p，缓解卡顿/不同步)"
+    )
+    val autoAvSyncOptions = listOf(
+        true to "开(默认，掉帧自动重新同步)",
+        false to "关(仅手动右键重载)"
     )
     val startChannelOptions = listOf(
         StartChannelMode.FAVORITE_FIRST to "收藏第一个(默认)",
@@ -1222,6 +1240,14 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
      * 注意：composedTV 架构中 engine 在 PlayerScreen 创建，VM 不直接持有 engine，
      * 由 PlayerScreen 监听 playbackSettings 变化后调用 engine.applyPlaybackSettings()。
      */
+    fun updateSmoothPriority(v: Boolean) {
+        commitSettings(_uiState.value.playbackSettings.copy(smoothPriority = v))
+    }
+
+    fun updateAutoAvSync(v: Boolean) {
+        commitSettings(_uiState.value.playbackSettings.copy(autoAvSync = v))
+    }
+
     private fun commitSettings(next: PlaybackSettings) {
         PlaybackSettings.save(app, next)
         _uiState.value = _uiState.value.copy(playbackSettings = next)

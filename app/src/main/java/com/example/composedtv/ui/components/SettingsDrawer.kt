@@ -79,6 +79,8 @@ fun SettingsDrawer(
     onStuckTimeoutChange: (Long) -> Unit,
     onProxyTimeoutChange: (Long) -> Unit,
     onRendererChange: (RendererMode) -> Unit,
+    onSmoothPriorityChange: (Boolean) -> Unit = {},
+    onAutoAvSyncChange: (Boolean) -> Unit = {},
     // ===== 首播频道（仅登录用户） =====
     isGuest: Boolean = false,
     onStartChannelModeChange: (StartChannelMode) -> Unit = {},
@@ -90,7 +92,8 @@ fun SettingsDrawer(
     // 分组定义：随设置值与诊断状态变化重建（回调本身稳定，不列入 key 避免无谓重建）
     val groups = remember(
         settings.directTimeoutMs, settings.stuckTimeoutMs, settings.proxyTimeoutMs,
-        settings.rendererMode, settings.startChannelMode, isGuest, diagEnabled
+        settings.rendererMode, settings.startChannelMode, settings.smoothPriority,
+        settings.autoAvSync, isGuest, diagEnabled
     ) {
         listOfNotNull(
             // 游客没有收藏，首播固定为「上次退出频道」，无需该分组
@@ -133,6 +136,22 @@ fun SettingsDrawer(
                 },
                 selectedIndex = PlaybackSettingOptions.rendererOptions
                     .indexOfFirst { it.first == settings.rendererMode }.coerceAtLeast(0)
+            ),
+            SettingGroupDef(
+                title = "流畅优先",
+                options = PlaybackSettingOptions.smoothPriorityOptions.map { (v, label) ->
+                    label to { onSmoothPriorityChange(v) }
+                },
+                selectedIndex = PlaybackSettingOptions.smoothPriorityOptions
+                    .indexOfFirst { it.first == settings.smoothPriority }.coerceAtLeast(0)
+            ),
+            SettingGroupDef(
+                title = "音画同步",
+                options = PlaybackSettingOptions.autoAvSyncOptions.map { (v, label) ->
+                    label to { onAutoAvSyncChange(v) }
+                },
+                selectedIndex = PlaybackSettingOptions.autoAvSyncOptions
+                    .indexOfFirst { it.first == settings.autoAvSync }.coerceAtLeast(0)
             ),
             SettingGroupDef(
                 title = "诊断",

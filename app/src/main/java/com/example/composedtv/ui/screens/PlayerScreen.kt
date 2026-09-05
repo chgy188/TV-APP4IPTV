@@ -574,6 +574,8 @@ fun PlayerScreen(
             onStuckTimeoutChange = { vm.updateStuckTimeout(it) },
             onProxyTimeoutChange = { vm.updateProxyTimeout(it) },
             onRendererChange = { vm.updateRendererMode(it) },
+            onSmoothPriorityChange = { vm.updateSmoothPriority(it) },
+            onAutoAvSyncChange = { vm.updateAutoAvSync(it) },
             isGuest = isGuest,
             onStartChannelModeChange = { vm.updateStartChannelMode(it) },
             diagEnabled = diagVisible,

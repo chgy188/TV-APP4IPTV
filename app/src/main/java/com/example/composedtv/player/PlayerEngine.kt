@@ -114,6 +114,13 @@ class PlayerEngine(private val context: Context) {
         private const val DEFAULT_STUCK_TIMEOUT_MS = 8_000L   // 持续缓冲判定 stuck 的时长
         private const val DEFAULT_DIRECT_TIMEOUT_MS = 6_000L  // 直连候选起播超时（可由设置抽屉注入）
         private const val DEFAULT_PROXY_TIMEOUT_MS = 10_000L  // 代理候选起播超时（可由设置抽屉注入）
+        private const val DEFAULT_SMOOTH_PRIORITY = false      // 流畅优先（降分辨率）默认关
+        private const val DEFAULT_AUTO_AV_SYNC = true          // 音画同步自动恢复默认开
+        // 音画同步自动检测参数
+        private const val AV_SYNC_CHECK_MS = 2_000L             // 采样周期(ms)
+        private const val AV_SYNC_DROP_THRESHOLD = 25          // 窗口内掉帧数 ≥ 该值判定音画漂移
+        private const val AV_SYNC_COOLDOWN_MS = 8_000L         // 两次自动恢复最小间隔(ms)
+        private const val AV_SYNC_MAX_AUTO = 2                 // 单频道自动恢复上限（第2次起临时降分辨率）
 
         // 判定为"国内"的渠道：完全不走代理（CN=中国, SK=韩国, MO/MACAU/澳门）
         private val DOMESTIC_COUNTRIES = setOf("CN", "SK", "MO", "MACAU", "澳门")
@@ -165,6 +172,8 @@ class PlayerEngine(private val context: Context) {
         stuckTimeoutMs = s.stuckTimeoutMs
         directTimeoutMs = s.directTimeoutMs
         proxyTimeoutMs = s.proxyTimeoutMs
+        smoothPriority = s.smoothPriority
+        autoAvSync = s.autoAvSync
         DebugDiagnostics.setEnv(isLegacyDevice(), s.rendererMode.name)
         Log.d(TAG, "applyPlaybackSettings: stuck=${stuckTimeoutMs} direct=${directTimeoutMs} proxy=${proxyTimeoutMs} legacy=${isLegacyDevice()}")
     }
@@ -258,6 +267,10 @@ class PlayerEngine(private val context: Context) {
     /** 代理候选专属起播超时：代理路径多一跳、握手更慢，给更长容忍，避免被误判为不可播。
      *  可由设置抽屉注入（applyPlaybackSettings），默认 [DEFAULT_PROXY_TIMEOUT_MS] */
     var proxyTimeoutMs = DEFAULT_PROXY_TIMEOUT_MS
+    /** 流畅优先：强制降到 720p/4Mbps，降低解码负载，缓解弱机/部分频道音画不同步 */
+    var smoothPriority = DEFAULT_SMOOTH_PRIORITY
+    /** 音画同步自动恢复：持续掉帧判定为音视频漂移时自动重载当前频道重新同步 */
+    var autoAvSync = DEFAULT_AUTO_AV_SYNC
 
     /** 由 PlayerScreen 注入的共享视频 Surface（PlayerView 的 videoSurface）。
      *  串行切换尝试时复用同一 Surface，避免 Surface 重建导致老电视"有声音没画面" */
@@ -275,6 +288,7 @@ class PlayerEngine(private val context: Context) {
         playlist = items
         currentIndex = startIndex.coerceIn(0, (items.size - 1).coerceAtLeast(0))
         consecutiveErrors = 0
+        resetAvSyncForNewChannel()
         if (items.isEmpty()) {
             _state.value = PlayerState(error = "播放列表为空")
             return
@@ -337,6 +351,7 @@ class PlayerEngine(private val context: Context) {
         if (playlist.isEmpty()) return
         currentIndex = (currentIndex + 1) % playlist.size
         showInfoTransient()
+        resetAvSyncForNewChannel()
         playCurrent()
     }
 
@@ -344,6 +359,7 @@ class PlayerEngine(private val context: Context) {
         if (playlist.isEmpty()) return
         currentIndex = (currentIndex - 1 + playlist.size) % playlist.size
         showInfoTransient()
+        resetAvSyncForNewChannel()
         playCurrent()
     }
 
@@ -352,6 +368,7 @@ class PlayerEngine(private val context: Context) {
         if (playlist.isEmpty() || index !in playlist.indices) return
         if (index == currentIndex) return
         currentIndex = index
+        resetAvSyncForNewChannel()
         playCurrent()
     }
 
@@ -401,6 +418,10 @@ class PlayerEngine(private val context: Context) {
         }
         Log.d(TAG, "手动重载当前频道: $currentPlayingUrl")
         showHint("正在重载：${playlist[currentIndex].name}")
+        // 手动重载视为用户主动介入：清零自动恢复计数，使其重新拥有自动自愈机会
+        avSyncAutoCount = 0
+        forceSmoothThisReload = false
+        avSyncCooldownUntil = 0
         reloadCurrentChannel(reason = "manual", ignoreLastMode = true)
     }
 
@@ -601,10 +622,13 @@ class PlayerEngine(private val context: Context) {
         // - 新设备上限 1080p / 10Mbps；老设备上限 720p / 4Mbps（解码能力弱，降级保流畅）
         // - 允许降到任意低码率，保证流畅
         // - 不强制最低/最高，由 ExoPlayer 根据实时带宽自适应
+        // 分辨率/码率上限：流畅优先或自动恢复临时降级时强制 720p/4Mbps，降低解码负载缓解不同步
+        val cap1080 = !legacy && !smoothPriority && !forceSmoothThisReload
+        forceSmoothThisReload = false
         p.trackSelectionParameters = p.trackSelectionParameters
             .buildUpon()
-            .setMaxVideoSize(if (legacy) 1280 else 1920, if (legacy) 720 else 1080)
-            .setMaxVideoBitrate(if (legacy) 4_000_000 else 8_000_000)
+            .setMaxVideoSize(if (cap1080) 1920 else 1280, if (cap1080) 1080 else 720)
+            .setMaxVideoBitrate(if (cap1080) 8_000_000 else 4_000_000)
             .setMinVideoBitrate(0)
             .setForceLowestBitrate(false)
             .setForceHighestSupportedBitrate(false)
@@ -805,6 +829,7 @@ class PlayerEngine(private val context: Context) {
                 pendingResumePositionMs = 0
             }
             attachPlaybackWatcher(winExo, winner.attempt)
+            startAvSyncWatcher(winExo)
         }
         raceCandidates = emptyList()
         updateState(isLoading = false, isPlaying = true, error = null, usingProxy = winner.attempt == "proxy", loadMode = null, loadTimeoutMs = 0, loadRemainMs = 0)
@@ -833,6 +858,16 @@ class PlayerEngine(private val context: Context) {
 
     private var playbackStuckJob: Job? = null
 
+    // ===== 音画同步自动恢复 =====
+    private var avSyncJob: Job? = null
+    private var avSyncPrimed = false
+    private var avSyncLastDropped = 0
+    private var avSyncLastCheck = 0L
+    private var avSyncCooldownUntil = 0L
+    private var avSyncAutoCount = 0
+    /** 自动恢复二次触发时临时强制 720p，降低解码负载以真正跟住音画 */
+    private var forceSmoothThisReload = false
+
     private fun startPlaybackStuckMonitor(exo: ExoPlayer?, attempt: String) {
         stopPlaybackStuckMonitor()
         val target = exo ?: return
@@ -857,6 +892,73 @@ class PlayerEngine(private val context: Context) {
     private fun stopPlaybackStuckMonitor() {
         playbackStuckJob?.cancel()
         playbackStuckJob = null
+    }
+
+    /** 新频道起播：复位音画同步检测计数（避免上一频道的漂移计数污染新频道） */
+    private fun resetAvSyncForNewChannel() {
+        stopAvSyncWatcher()
+        avSyncPrimed = false
+        avSyncLastDropped = 0
+        avSyncLastCheck = 0L
+        avSyncCooldownUntil = 0L
+        avSyncAutoCount = 0
+        forceSmoothThisReload = false
+    }
+
+    /**
+     * 音画同步看门狗：正常播放期间周期性采样视频掉帧计数。
+     * 若 2s 窗口内持续掉帧 ≥ 阈值，说明视频解码跟不上音频（典型音画漂移），
+     * 则自动重载当前频道以重新建立音视频同步（最多 [AV_SYNC_MAX_AUTO] 次，
+     * 第 2 次起临时降到 720p 降低解码负载）。
+     */
+    private fun startAvSyncWatcher(exo: ExoPlayer) {
+        stopAvSyncWatcher()
+        avSyncPrimed = false
+        avSyncLastDropped = exo.videoDecoderCounters?.droppedBufferCount ?: 0
+        avSyncLastCheck = System.currentTimeMillis()
+        avSyncJob = scope.launch {
+            while (true) {
+                delay(AV_SYNC_CHECK_MS)
+                if (!autoAvSync) continue
+                val p = _playerRef.value ?: continue
+                if (p !== exo) break                                 // 已切台/重载，退出
+                if (p.playbackState != Player.STATE_READY || p.isLoading) continue
+                val dropped = p.videoDecoderCounters?.droppedBufferCount ?: avSyncLastDropped
+                val now = System.currentTimeMillis()
+                if (!avSyncPrimed) {                                // 首个 READY 采样仅作基线
+                    avSyncLastDropped = dropped
+                    avSyncLastCheck = now
+                    avSyncPrimed = true
+                    continue
+                }
+                val dt = now - avSyncLastCheck
+                if (dt < AV_SYNC_CHECK_MS) continue
+                val delta = dropped - avSyncLastDropped
+                avSyncLastDropped = dropped
+                avSyncLastCheck = now
+                if (delta >= AV_SYNC_DROP_THRESHOLD) {
+                    Log.w(TAG, "音画漂移检测: ${AV_SYNC_CHECK_MS}ms 内掉帧 $delta，触发自动重新同步")
+                    triggerAvSyncRecover()
+                }
+            }
+        }
+    }
+
+    private fun stopAvSyncWatcher() {
+        avSyncJob?.cancel()
+        avSyncJob = null
+    }
+
+    private fun triggerAvSyncRecover() {
+        val now = System.currentTimeMillis()
+        if (isReloading || now < avSyncCooldownUntil || avSyncAutoCount >= AV_SYNC_MAX_AUTO) return
+        avSyncCooldownUntil = now + AV_SYNC_COOLDOWN_MS
+        avSyncAutoCount++
+        if (avSyncAutoCount >= AV_SYNC_MAX_AUTO) {
+            forceSmoothThisReload = true                           // 持续吃力：临时降到 720p
+        }
+        Log.w(TAG, "音画同步自动恢复[${avSyncAutoCount}/$AV_SYNC_MAX_AUTO] 重载当前频道")
+        reloadCurrentChannel(reason = "av-sync-drift")
     }
 
     /**
@@ -976,6 +1078,7 @@ class PlayerEngine(private val context: Context) {
         raceActive = false
         raceDecided = false
         stopAttemptTimeout()
+        stopAvSyncWatcher()
         for (c in raceCandidates) safeRelease(c.exo)
         raceCandidates = emptyList()
         // 兜底释放可能仅存于 _playerRef 的上一频道 player（胜出但未进入 raceCandidates）
@@ -1101,6 +1204,7 @@ class PlayerEngine(private val context: Context) {
         stopAttemptTimeout()
         resetRace()
         stopPlaybackStuckMonitor()
+        stopAvSyncWatcher()
         safeRelease(player)
         setPlayerRef(null)
         sharedSurface = null
@@ -1117,6 +1221,7 @@ class PlayerEngine(private val context: Context) {
     fun release() {
         stopAttemptTimeout()
         resetRace()
+        stopAvSyncWatcher()
         infoHideJob?.cancel()
         hintHideJob?.cancel()
         safeRelease(player)
