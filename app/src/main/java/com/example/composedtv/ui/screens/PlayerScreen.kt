@@ -4,8 +4,10 @@
 
 package com.example.composedtv.ui.screens
 
+import android.content.Context
 import android.util.Log
 import android.view.KeyEvent
+import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import android.view.LayoutInflater
 import android.view.Surface
@@ -43,6 +45,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.State
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -63,6 +66,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import kotlin.math.abs
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -82,6 +86,30 @@ import com.example.composedtv.ui.components.SettingsDrawer
 import com.example.composedtv.ui.components.SidePanel
 import com.example.composedtv.viewmodel.ChannelEntry
 import com.example.composedtv.viewmodel.PlayerViewModel
+import androidx.core.view.WindowInsetsCompat
+import kotlinx.coroutines.delay
+
+/**
+ * 监测系统软键盘（IME）是否可见。
+ * 用于区分返回键是「收起键盘」还是「退出面板/搜索」，避免输入后按返回直接关闭面板。
+ */
+@Composable
+private fun rememberImeState(): State<Boolean> {
+    val imeState = remember { mutableStateOf(false) }
+    val view = LocalView.current
+    LaunchedEffect(view) {
+        while (true) {
+            val root = view.rootWindowInsets
+            if (root != null) {
+                val insets = WindowInsetsCompat.toWindowInsetsCompat(root)
+                val visible = insets.isVisible(WindowInsetsCompat.Type.ime())
+                if (imeState.value != visible) imeState.value = visible
+            }
+            delay(100)
+        }
+    }
+    return imeState
+}
 
 /**
  * 全屏播放器界面
@@ -229,10 +257,19 @@ fun PlayerScreen(
         }
     }
 
+    // 软键盘可见性（轮询 WindowInsets），用于区分「返回键收起键盘」与「返回键退出面板/搜索」
+    val imeVisible by rememberImeState()
+    val rootView = LocalView.current
     // 侧边栏可见时拦截返回键：
+    // - 软键盘打开时 → 先收起键盘，不直接退出（避免输入后按返回导致面板消失）
     // - 搜索模式下 → 退出搜索模式（回到首个真实分类）
     // - 否则 → 隐藏侧边面板
     androidx.activity.compose.BackHandler(enabled = uiState.sidePanelVisible) {
+        if (imeVisible) {
+            val imm = rootView.context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.hideSoftInputFromWindow(rootView.windowToken, 0)
+            return@BackHandler
+        }
         if (uiState.sidePanel.isSearchMode) {
             vm.exitSearchMode()
         } else {

@@ -3,6 +3,7 @@
 package com.example.composedtv.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
@@ -27,6 +28,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Star
@@ -72,6 +74,8 @@ import com.example.composedtv.viewmodel.PlayerViewModel
 fun LoginScreen(
     vm: PlayerViewModel,
     lastLoginUsername: String?,
+    defaultRememberMe: Boolean = true,
+    loginMessage: String? = null,
     onLoginSuccess: () -> Unit,
     onBack: () -> Unit
 ) {
@@ -80,8 +84,9 @@ fun LoginScreen(
     var password by remember { mutableStateOf("") }
     var isRegister by remember { mutableStateOf(false) }
     var showPassword by remember { mutableStateOf(false) }
+    var rememberMe by remember(defaultRememberMe) { mutableStateOf(defaultRememberMe) }
     var isLoading by remember { mutableStateOf(false) }
-    var errorMsg by remember { mutableStateOf<String?>(null) }
+    var errorMsg by remember(loginMessage) { mutableStateOf(loginMessage) }
     // 密码框聚焦请求器：选中上次用户名后自动聚焦到密码框
     val passwordFocusRequester = remember { androidx.compose.ui.focus.FocusRequester() }
     // 已记住用户名时默认收起用户名输入框（仅输密码即可），腾出垂直空间，
@@ -197,7 +202,7 @@ fun LoginScreen(
                     if (username.isNotBlank() && password.isNotBlank() && !isLoading) {
                         isLoading = true
                         errorMsg = null
-                        vm.login(username, password, isRegister) { ok, msg ->
+                        vm.login(username, password, isRegister, rememberMe = rememberMe) { ok, msg ->
                             isLoading = false
                             if (ok) onLoginSuccess() else errorMsg = msg ?: "操作失败"
                         }
@@ -216,6 +221,13 @@ fun LoginScreen(
                         )
                     }
                 }
+            )
+
+            // 记住密码 / 自动登录开关
+            RememberToggle(
+                checked = rememberMe,
+                onToggle = { rememberMe = !rememberMe },
+                compact = compact
             )
 
             if (errorMsg != null) {
@@ -248,7 +260,7 @@ fun LoginScreen(
                             }
                             isLoading = true
                             errorMsg = null
-                            vm.login(username, password, isRegister) { ok, msg ->
+                            vm.login(username, password, isRegister, rememberMe = rememberMe) { ok, msg ->
                                 isLoading = false
                                 if (ok) {
                                     onLoginSuccess()
@@ -480,5 +492,72 @@ private fun ActionButton(text: String, primary: Boolean, compact: Boolean = fals
             fontSize = if (compact) 15.sp else 16.sp,
             fontWeight = FontWeight.Bold
         )
+    }
+}
+
+/**
+ * 兼容 D-pad 焦点 + 触摸点击的“记住密码”勾选行。
+ * 定义为包级（非 private）以便 UserSelectionScreen 复用。
+ */
+@Composable
+fun RememberToggle(
+    checked: Boolean,
+    onToggle: () -> Unit,
+    compact: Boolean = false,
+    modifier: Modifier = Modifier
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(if (compact) 36.dp else 42.dp)
+            .scale(if (isFocused) 1.03f else 1.0f)
+            .clickable(
+                interactionSource = interactionSource,
+                indication = rememberRipple(),
+                onClick = onToggle
+            ),
+        shape = RoundedCornerShape(8.dp),
+        color = if (isFocused) MaterialTheme.colorScheme.primaryContainer
+                else MaterialTheme.colorScheme.surface,
+        contentColor = if (isFocused) MaterialTheme.colorScheme.onPrimaryContainer
+                      else MaterialTheme.colorScheme.onSurface
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(if (compact) 16.dp else 18.dp)
+                    .border(
+                        if (checked) 0.dp else 1.5.dp,
+                        MaterialTheme.colorScheme.onSurfaceVariant,
+                        RoundedCornerShape(4.dp)
+                    )
+                    .background(
+                        if (checked) MaterialTheme.colorScheme.primary else Color.Transparent,
+                        RoundedCornerShape(4.dp)
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                if (checked) {
+                    Icon(
+                        imageVector = Icons.Default.Check,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.size(if (compact) 12.dp else 14.dp)
+                    )
+                }
+            }
+            Text(
+                text = "记住密码",
+                fontSize = if (compact) 13.sp else 14.sp
+            )
+        }
     }
 }

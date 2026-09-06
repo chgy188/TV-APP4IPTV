@@ -2,6 +2,9 @@
 
 package com.example.composedtv.ui.components
 
+import android.content.Context
+import android.view.inputmethod.InputMethodManager
+import androidx.compose.ui.platform.LocalView
 import com.example.composedtv.data.remote.CountryLangMapper
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -57,6 +60,12 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -618,6 +627,11 @@ private fun SearchColumn(
     onChannelSelected: (ChannelEntry) -> Unit
 ) {
     val searchFieldFocus = remember { FocusRequester() }
+    // 用于强制弹出系统软键盘（TV 端部分设备不会因聚焦自动弹键盘）
+    val searchView = LocalView.current
+    val imm = searchView.context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+    // 输入激活标记：进入搜索默认只聚焦输入框（高亮），用户按 OK/确认 后才弹软键盘
+    var keyboardActivated by remember { mutableStateOf(false) }
 
     Column(
         modifier = modifier
@@ -658,10 +672,33 @@ private fun SearchColumn(
                 onValueChange = onQueryChange,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .focusRequester(searchFieldFocus),
+                    .onKeyEvent { event ->
+                        // 未激活输入时，按 OK/确认 键先弹出软键盘（聚焦→确认→弹键盘的 TV 交互）
+                        if (event.type == KeyEventType.KeyDown &&
+                            (event.key == Key.Enter || event.key == Key.DirectionCenter) &&
+                            !keyboardActivated
+                        ) {
+                            keyboardActivated = true
+                            searchView.post {
+                                imm.showSoftInput(searchView, InputMethodManager.SHOW_IMPLICIT)
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    .focusRequester(searchFieldFocus)
+                    .onFocusChanged {
+                        // 仅当用户已按 OK 确认（激活输入）后才弹键盘；进入搜索默认只高亮输入框、不弹键盘
+                        if (it.isFocused && keyboardActivated) {
+                            searchView.post {
+                                imm.showSoftInput(searchView, InputMethodManager.SHOW_IMPLICIT)
+                            }
+                        }
+                    },
                 placeholder = {
                     Text(
-                        text = "输入频道名…",
+                        text = "按 OK 键输入频道名…",
                         fontSize = 13.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                     )
@@ -738,10 +775,16 @@ private fun SearchColumn(
         }
     }
 
-    // 进入搜索模式时自动聚焦搜索框（弹软键盘）
+    // 进入搜索模式时聚焦搜索框（仅高亮，不弹键盘）。
+    // 带重试：搜索列位于 AnimatedVisibility 滑入动画中，首次 requestFocus 常因视图尚未布局完成而失败
+    // （runCatching 会静默吞掉），失败后焦点没落在输入框、无法响应 OK 弹键盘。
+    // 与频道列焦点逻辑一致，重试多次直到成功；真正的软键盘由用户按 OK 确认后弹出。
     LaunchedEffect(Unit) {
-        delay(120)
-        runCatching { searchFieldFocus.requestFocus() }
+        keyboardActivated = false
+        for (i in 0 until 10) {
+            delay(80)
+            if (runCatching { searchFieldFocus.requestFocus() }.isSuccess) break
+        }
     }
 
     // 结果变化时滚动到选中项

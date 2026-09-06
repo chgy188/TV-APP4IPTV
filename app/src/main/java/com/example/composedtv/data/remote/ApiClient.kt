@@ -166,7 +166,8 @@ object ApiClient {
                     username = o.optString("username", ""),
                     token = o.optString("token", ""),
                     userId = o.optString("userId", ""),
-                    role = o.optString("role", "").takeIf { it.isNotEmpty() }
+                    role = o.optString("role", "").takeIf { it.isNotEmpty() },
+                    rememberPwd = o.optBoolean("rememberPwd", false)
                 ))
             }
             list
@@ -184,6 +185,7 @@ object ApiClient {
                 put("token", u.token)
                 put("userId", u.userId)
                 put("role", u.role ?: JSONObject.NULL)
+                put("rememberPwd", u.rememberPwd)
             })
         }
         prefs?.edit()?.putString(KEY_STORED_USERS, arr.toString())?.apply()
@@ -199,6 +201,7 @@ object ApiClient {
                 put("token", u.token)
                 put("userId", u.userId)
                 put("role", u.role ?: JSONObject.NULL)
+                put("rememberPwd", u.rememberPwd)
             })
         }
         prefs?.edit()?.putString(KEY_STORED_USERS, arr.toString())?.apply()
@@ -560,7 +563,7 @@ object ApiClient {
 
     /* ====================== 认证 ====================== */
 
-    suspend fun auth(action: String, params: Map<String, String> = emptyMap()): AuthResult =
+    suspend fun auth(action: String, params: Map<String, String> = emptyMap(), rememberMe: Boolean = false): AuthResult =
         withContext(Dispatchers.IO) {
             val body = JSONObject().apply { put("action", action); params.forEach { put(it.key, it.value) } }
             return@withContext try {
@@ -584,9 +587,10 @@ object ApiClient {
                         currentUser = user
                         saveStoredUser(StoredUser(
                             username = user.username,
-                            token = t,
+                            token = if (rememberMe) t else "",
                             userId = user.id,
-                            role = user.role
+                            role = user.role,
+                            rememberPwd = rememberMe
                         ))
                         saveLastLoginUsername(user.username)
                     } else if (action == "logout" && okField) {
@@ -604,6 +608,70 @@ object ApiClient {
                 AuthResult(false, null, null, e.message ?: e.toString())
             }
         }
+
+    /** 读取单个已存储用户（按用户名） */
+    fun getStoredUser(username: String): StoredUser? =
+        getStoredUsers().firstOrNull { it.username == username }
+
+    /** 设置某用户是否“记住密码/自动登录”：关闭时同时清除已存 token（下次必输密码） */
+    fun setRememberPwd(username: String, on: Boolean) {
+        val users = getStoredUsers().toMutableList()
+        val idx = users.indexOfFirst { it.username == username }
+        if (idx < 0) return
+        users[idx] = if (on) users[idx].copy(rememberPwd = true)
+                     else users[idx].copy(rememberPwd = false, token = "")
+        persistUsers(users)
+    }
+
+    /** 仅清除某用户已存 token（保留 rememberPwd 偏好，过期后重新登录可再次保存） */
+    private fun clearUserToken(username: String) {
+        val users = getStoredUsers().toMutableList()
+        val idx = users.indexOfFirst { it.username == username }
+        if (idx < 0) return
+        users[idx] = users[idx].copy(token = "")
+        persistUsers(users)
+    }
+
+    private fun persistUsers(users: List<StoredUser>) {
+        val arr = JSONArray()
+        users.forEach { u ->
+            arr.put(JSONObject().apply {
+                put("username", u.username)
+                put("token", u.token)
+                put("userId", u.userId)
+                put("role", u.role ?: JSONObject.NULL)
+                put("rememberPwd", u.rememberPwd)
+            })
+        }
+        prefs?.edit()?.putString(KEY_STORED_USERS, arr.toString())?.apply()
+    }
+
+    /**
+     * 凭已存储 token 直接登录（免输密码）。
+     * 返回 true 表示登录成功；false 表示 token 缺失或已过期（过期 token 会被自动清除）。
+     */
+    suspend fun autoLogin(user: StoredUser): Boolean = withContext(Dispatchers.IO) {
+        if (!user.rememberPwd || user.token.isEmpty()) return@withContext false
+        return@withContext try {
+            // 用存储 token 试探一次需鉴权的接口，验证是否仍有效（过期/失效会抛异常）
+            token = user.token
+            currentUser = ApiUser(
+                id = user.userId,
+                username = user.username,
+                role = user.role,
+                needsDefaultSource = false
+            )
+            getMySources()
+            saveLastLoginUsername(user.username)
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "autoLogin token 失效: ${e.message}")
+            clearUserToken(user.username)
+            token = null
+            currentUser = null
+            false
+        }
+    }
 
     fun logoutLocal() {
         val uname = currentUser?.username

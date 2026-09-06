@@ -15,8 +15,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import com.example.composedtv.data.remote.ApiClient
+import kotlinx.coroutines.launch
 import com.example.composedtv.ui.screens.LoginScreen
 import com.example.composedtv.ui.screens.PlayerScreen
 import com.example.composedtv.ui.screens.UserSelectionScreen
@@ -143,6 +145,7 @@ private fun AppContent(
     var screen by remember { mutableStateOf<Screen>(Screen.UserSelection) }
     val vm = viewModel
     val state by vm.uiState.collectAsState()
+    val scope = rememberCoroutineScope()
 
     // 屏幕切换时同步到 Activity，供 dispatchKeyEvent 兜底判断使用
     LaunchedEffect(screen) {
@@ -154,10 +157,25 @@ private fun AppContent(
             UserSelectionScreen(
                 storedUsers = state.storedUsers,
                 onSelectUser = { username ->
-                    // 不再免密直登：跳转登录界面并预填用户名，仍需输入密码
-                    vm.prepareLoginWithUsername(username)
-                    screen = Screen.Login
+                    val user = vm.getStoredUser(username)
+                    // 记住密码且已存 token：尝试免密直登；否则（含 token 过期）跳登录页输密码
+                    if (user != null && user.rememberPwd && user.token.isNotEmpty()) {
+                        scope.launch {
+                            val ok = vm.autoLogin(user)
+                            if (ok) screen = Screen.Player(isGuest = false)
+                            else {
+                                // 预填用户名（会清空提示），随后重新写入“已过期”提示供登录页展示
+                                vm.prepareLoginWithUsername(username)
+                                vm.setPendingLoginMessage("登录已过期，请重新输入密码")
+                                screen = Screen.Login
+                            }
+                        }
+                    } else {
+                        vm.prepareLoginWithUsername(username)
+                        screen = Screen.Login
+                    }
                 },
+                onToggleRemember = { username -> vm.toggleRememberPwd(username) },
                 onSelectGuest = {
                     vm.enterAsGuest()
                     screen = Screen.Player(isGuest = true)
@@ -173,6 +191,9 @@ private fun AppContent(
             LoginScreen(
                 vm = vm,
                 lastLoginUsername = state.lastLoginUsername,
+                defaultRememberMe = state.lastLoginUsername
+                    ?.let { vm.getStoredUser(it)?.rememberPwd } ?: true,
+                loginMessage = state.pendingLoginMessage,
                 onLoginSuccess = {
                     screen = Screen.Player(isGuest = false)
                 },

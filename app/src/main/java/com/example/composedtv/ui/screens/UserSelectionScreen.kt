@@ -54,6 +54,7 @@ import com.example.composedtv.data.remote.StoredUser
 fun UserSelectionScreen(
     storedUsers: List<StoredUser>,
     onSelectUser: (String) -> Unit,
+    onToggleRemember: (String) -> Unit,
     onSelectGuest: () -> Unit,
     onSelectLogin: () -> Unit
 ) {
@@ -106,8 +107,10 @@ fun UserSelectionScreen(
             items(storedUsers) { user ->
                 UserCard(
                     username = user.username,
+                    rememberPwd = user.rememberPwd,
                     compact = compact,
-                    onClick = { onSelectUser(user.username) }
+                    onSelect = { onSelectUser(user.username) },
+                    onToggleRemember = { onToggleRemember(user.username) }
                 )
             }
             item {
@@ -232,35 +235,56 @@ private fun FocusableCard(
 }
 
 @Composable
-private fun UserCard(username: String, compact: Boolean, onClick: () -> Unit) {
-    FocusableCard(
-        onClick = onClick,
+private fun UserCard(
+    username: String,
+    rememberPwd: Boolean,
+    compact: Boolean,
+    onSelect: () -> Unit,
+    onToggleRemember: () -> Unit
+) {
+    Column(
         modifier = Modifier
             .width(if (compact) 150.dp else 200.dp)
-            .height(if (compact) 84.dp else 120.dp)
+            .height(if (compact) 118.dp else 160.dp),
+        verticalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Column(
+        // 主区域：确认即登录（记住密码则免密直登，否则跳登录页输密码）
+        FocusableCard(
+            onClick = onSelect,
             modifier = Modifier
-                .fillMaxSize()
-                .padding(if (compact) 10.dp else 16.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
+                .fillMaxWidth()
+                .height(if (compact) 76.dp else 108.dp)
         ) {
-            Icon(
-                imageVector = Icons.Default.AccountCircle,
-                contentDescription = null,
-                modifier = Modifier.size(if (compact) 28.dp else 40.dp),
-                tint = MaterialTheme.colorScheme.primary
-            )
-            Spacer(modifier = Modifier.height(if (compact) 4.dp else 8.dp))
-            Text(
-                text = username,
-                fontSize = if (compact) 15.sp else 18.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(if (compact) 10.dp else 16.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Icon(
+                    imageVector = Icons.Default.AccountCircle,
+                    contentDescription = null,
+                    modifier = Modifier.size(if (compact) 28.dp else 40.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Spacer(modifier = Modifier.height(if (compact) 4.dp else 8.dp))
+                Text(
+                    text = username,
+                    fontSize = if (compact) 15.sp else 18.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
+        // 记住密码开关
+        RememberToggle(
+            checked = rememberPwd,
+            onToggle = onToggleRemember,
+            compact = compact
+        )
     }
 }
 

@@ -77,7 +77,9 @@ data class StoredUser(
     val username: String,
     val token: String,
     val userId: String = "",
-    val role: String? = null
+    val role: String? = null,
+    /** 是否“记住密码/自动登录”：true 时 token 已落盘，可直接登录；false 时不保存 token，下次必须输密码 */
+    val rememberPwd: Boolean = false
 )
 
 /**

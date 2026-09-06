@@ -314,6 +314,8 @@ data class PlayerUiState(
     val storedUsers: List<StoredUser> = emptyList(),
     /** 上次成功登录的用户名（用于登录界面预填，null 表示无记录） */
     val lastLoginUsername: String? = null,
+    /** 进入登录界面时的提示语（如 token 已过期），null 表示无 */
+    val pendingLoginMessage: String? = null,
     /** 设置抽屉是否可见（MENU 键切换） */
     val settingsVisible: Boolean = false,
     /** 播放参数设置（由 MENU 设置抽屉调整，持久化保存） */
@@ -1259,25 +1261,60 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
      * 传 null 时清空，让用户手动输入。
      */
     fun prepareLoginWithUsername(username: String?) {
-        _uiState.value = _uiState.value.copy(lastLoginUsername = username)
+        _uiState.value = _uiState.value.copy(lastLoginUsername = username, pendingLoginMessage = null)
+    }
+
+    fun setPendingLoginMessage(msg: String?) {
+        _uiState.value = _uiState.value.copy(pendingLoginMessage = msg)
     }
 
     // ===== 认证 =====
 
-    fun login(username: String, password: String, isRegister: Boolean, onResult: (Boolean, String?) -> Unit) {
+    fun login(
+        username: String,
+        password: String,
+        isRegister: Boolean,
+        rememberMe: Boolean = true,
+        onResult: (Boolean, String?) -> Unit
+    ) {
         viewModelScope.launch {
             val action = if (isRegister) "register" else "login"
             val params = mutableMapOf("username" to username, "password" to password)
             if (isRegister) params["confirm"] = password
-            val res = ApiClient.auth(action, params)
+            val res = ApiClient.auth(action, params, rememberMe)
             if (res.ok) {
                 _uiState.value = _uiState.value.copy(
                     storedUsers = ApiClient.getStoredUsers(),
-                    lastLoginUsername = ApiClient.getLastLoginUsername()
+                    lastLoginUsername = ApiClient.getLastLoginUsername(),
+                    pendingLoginMessage = null
                 )
             }
             onResult(res.ok, res.message)
         }
+    }
+
+    /** 读取单个已存储用户（供界面判断是否可免密直登） */
+    fun getStoredUser(username: String): StoredUser? = ApiClient.getStoredUser(username)
+
+    /** 切换某用户“记住密码”开关（关闭即清除已存 token） */
+    fun toggleRememberPwd(username: String) {
+        val u = ApiClient.getStoredUser(username) ?: return
+        ApiClient.setRememberPwd(username, !u.rememberPwd)
+        _uiState.value = _uiState.value.copy(storedUsers = ApiClient.getStoredUsers())
+    }
+
+    /**
+     * 凭已存储 token 直接登录（免输密码）。
+     * 成功返回 true；token 过期/缺失返回 false，并写入“登录已过期”提示供登录页展示。
+     */
+    suspend fun autoLogin(user: StoredUser): Boolean {
+        val ok = ApiClient.autoLogin(user)
+        _uiState.value = _uiState.value.copy(
+            storedUsers = ApiClient.getStoredUsers(),
+            lastLoginUsername = if (ok) user.username else _uiState.value.lastLoginUsername,
+            pendingLoginMessage = if (ok) null else "登录已过期，请重新输入密码"
+        )
+        return ok
     }
 
     fun enterAsGuest() {
