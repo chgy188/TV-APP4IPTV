@@ -1,9 +1,9 @@
 name: Build APK
 
-# 触发：每次 push 到 main、打 tag(v*)，以及向 main 开 PR 时构建
+# 触发：打 tag(v*) 时做 release 构建并建 Release；向 main 开 PR 时做校验
+# 注：main 的 push 不再触发完整 release 构建，避免与 tag 推送重复构建
 on:
   push:
-    branches: [main]
     tags: ['v*']
   pull_request:
     branches: [main]
