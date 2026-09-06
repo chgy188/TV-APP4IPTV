@@ -6,7 +6,6 @@ import android.content.SharedPreferences
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.composedtv.BuildConfig
 import com.example.composedtv.data.remote.ApiChannel
 import com.example.composedtv.data.remote.ApiClient
 import com.example.composedtv.data.remote.ApiFavorite
@@ -149,9 +148,8 @@ data class PlaybackSettings(
                 startChannelMode = StartChannelMode.fromValue(
                     sp.getInt(KEY_START_CHANNEL, StartChannelMode.FAVORITE_FIRST.value)
                 ),
-                // 默认值随构建类型：debug 包默认开（便于调试），release 包默认关（对普通用户干净）。
-                // 一旦用户在设置里切换过，就以持久化的值为准。
-                diagHudEnabled = sp.getBoolean(KEY_DIAG_HUD, BuildConfig.DEBUG),
+                // 默认关闭（debug / release 一致），保持播放界面干净；用户在设置里手动开启后会持久化。
+                diagHudEnabled = sp.getBoolean(KEY_DIAG_HUD, false),
                 smoothPriority = sp.getBoolean(KEY_SMOOTH, false),
                 autoAvSync = sp.getBoolean(KEY_AUTO_AV_SYNC, true)
             )

@@ -86,6 +86,7 @@ import com.example.composedtv.ui.components.SettingsDrawer
 import com.example.composedtv.ui.components.SidePanel
 import com.example.composedtv.viewmodel.ChannelEntry
 import com.example.composedtv.viewmodel.PlayerViewModel
+import android.os.Build
 import androidx.core.view.WindowInsetsCompat
 import kotlinx.coroutines.delay
 
@@ -99,12 +100,15 @@ private fun rememberImeState(): State<Boolean> {
     val view = LocalView.current
     LaunchedEffect(view) {
         while (true) {
-            val root = view.rootWindowInsets
-            if (root != null) {
-                val insets = WindowInsetsCompat.toWindowInsetsCompat(root)
-                val visible = insets.isVisible(WindowInsetsCompat.Type.ime())
-                if (imeState.value != visible) imeState.value = visible
+            // getRootWindowInsets() 仅 API23+ 可用；老设备（极米 API21/22）直接降级为不可见
+            val visible = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val root = view.rootWindowInsets
+                WindowInsetsCompat.toWindowInsetsCompat(root)
+                    .isVisible(WindowInsetsCompat.Type.ime())
+            } else {
+                false
             }
+            if (imeState.value != visible) imeState.value = visible
             delay(100)
         }
     }

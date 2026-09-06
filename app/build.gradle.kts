@@ -107,6 +107,13 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    // NewApi：把"调用高于 minSdk 的平台 API"从警告提升为 error。
+    // 例：View.getRootWindowInsets()(API23) 在 minSdk=21 的极米上运行时 NoSuchMethodError 闪退，
+    // 设为 error 后打包期即可拦截，避免再出现"高 compileSdk 编译通过、老设备才崩"的问题。
+    lint {
+        error += "NewApi"
+    }
 }
 
 dependencies {
