@@ -38,6 +38,14 @@ object ApiClient {
     private const val KEY_USER = "auth_user"
     private const val KEY_STORED_USERS = "stored_users"
     private const val KEY_LAST_LOGIN_USERNAME = "last_login_username"
+    /** 未登录 / 游客的存储作用域标识 */
+    private const val SCOPE_GUEST = "guest"
+    /** 登录用户存储作用域前缀：u_<userId|username> */
+    private const val SCOPE_PREFIX_USER = "u_"
+    /** 与用户无关的公开数据缓存目录名 */
+    private const val CACHE_DIR_SHARED = "_shared"
+    /** 旧版（无用户后缀）SP 迁移标记前缀 */
+    private const val KEY_MIGRATED_PREFIX = "migrated_pref_"
 
     private val JSON = "application/json; charset=utf-8".toMediaType()
 
@@ -56,11 +64,30 @@ object ApiClient {
         cleanOldDailyCache()
     }
 
-    /* ====================== 每日磁盘缓存 ====================== */
+    /* ====================== 每日磁盘缓存（按用户隔离） ====================== */
     /** 每日缓存根目录：filesDir/daily_cache/ */
-    private fun dailyCacheDir(): File? {
+    private fun dailyCacheRoot(): File? {
         val ctx = appContext ?: return null
         val dir = File(ctx.filesDir, "daily_cache")
+        if (!dir.exists()) dir.mkdirs()
+        return if (dir.exists() && dir.isDirectory) dir else null
+    }
+
+    /**
+     * 按用户隔离的每日缓存目录：filesDir/daily_cache/<scope>/
+     * 承载频道列表、我的源等「与登录用户相关」的数据，避免多账号互相看到对方数据。
+     */
+    private fun dailyCacheDir(): File? = subCacheDir(storageScope)
+
+    /**
+     * 全局共享的每日缓存目录：filesDir/daily_cache/_shared/
+     * 仅用于与用户无关的公开数据（公开源列表），避免每个账号重复下载同一份数据。
+     */
+    private fun sharedCacheDir(): File? = subCacheDir(CACHE_DIR_SHARED)
+
+    private fun subCacheDir(name: String): File? {
+        val root = dailyCacheRoot() ?: return null
+        val dir = File(root, name)
         if (!dir.exists()) dir.mkdirs()
         return if (dir.exists() && dir.isDirectory) dir else null
     }
@@ -69,12 +96,20 @@ object ApiClient {
     private fun todayStr(): String =
         SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
 
-    /** 清理昨天及以前的每日缓存文件 */
+    /** 清理昨天及以前的每日缓存文件（共享目录 + 各用户目录） */
     private fun cleanOldDailyCache() {
-        val dir = dailyCacheDir() ?: return
+        val root = dailyCacheRoot() ?: return
         val today = todayStr()
         try {
-            dir.listFiles()?.forEach { f ->
+            cleanExpiredIn(sharedCacheDir(), today)
+            root.listFiles()?.forEach { d -> if (d.isDirectory) cleanExpiredIn(d, today) }
+        } catch (_: Exception) { }
+    }
+
+    private fun cleanExpiredIn(dir: File?, today: String) {
+        val d = dir ?: return
+        try {
+            d.listFiles()?.forEach { f ->
                 if (f.isFile && f.name.contains("_") && !f.name.startsWith("sources_$today")
                     && !f.name.startsWith("channels_$today")) {
                     f.delete()
@@ -87,9 +122,12 @@ object ApiClient {
     private fun safeFileName(raw: String): String =
         raw.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
 
-    /** 读每日磁盘缓存：成功返回 JSONArray，失败返回 null */
-    private fun readDailyCache(filename: String): JSONArray? = runCatching {
-        val dir = dailyCacheDir() ?: return null
+    /**
+     * 读每日磁盘缓存：成功返回 JSONArray，失败返回 null
+     * @param userScoped true=读当前用户目录；false=读全局共享目录
+     */
+    private fun readDailyCache(filename: String, userScoped: Boolean = true): JSONArray? = runCatching {
+        val dir = (if (userScoped) dailyCacheDir() else sharedCacheDir()) ?: return null
         val f = File(dir, filename)
         if (!f.exists() || !f.isFile) return null
         val text = f.readText(Charsets.UTF_8)
@@ -97,10 +135,10 @@ object ApiClient {
         JSONArray(text)
     }.getOrNull()
 
-    /** 写每日磁盘缓存 */
-    private fun writeDailyCache(filename: String, arr: JSONArray) {
+    /** 写每日磁盘缓存（@param userScoped 同 [readDailyCache]） */
+    private fun writeDailyCache(filename: String, arr: JSONArray, userScoped: Boolean = true) {
         runCatching {
-            val dir = dailyCacheDir() ?: return
+            val dir = (if (userScoped) dailyCacheDir() else sharedCacheDir()) ?: return
             val f = File(dir, filename)
             f.writeText(arr.toString(), Charsets.UTF_8)
         }
@@ -151,6 +189,59 @@ object ApiClient {
         }
 
     val isLoggedIn: Boolean get() = !token.isNullOrEmpty()
+
+    /* ====================== 用户存储作用域（持久化隔离） ====================== */
+
+    /** 当前用户的存储作用域：登录用户 = "u_<userId|用户名>"，未登录/游客 = "guest"。
+     *
+     *  所有「用户级」持久化（播放设置、续播记录、播放模式记忆、频道/我的源缓存）
+     *  都按该标识隔离到各自的 SharedPreferences / 缓存目录，多账号互不干扰。 */
+    val storageScope: String
+        get() {
+            val u = currentUser
+            val raw = when {
+                u == null -> ""
+                u.id.isNotBlank() -> u.id
+                else -> u.username
+            }
+            return if (raw.isBlank()) SCOPE_GUEST else SCOPE_PREFIX_USER + safeFileName(raw)
+        }
+
+    /** 生成按用户隔离的 SharedPreferences 名（各模块的持久化统一走这里） */
+    fun userSpName(base: String): String = "${base}_$storageScope"
+
+    /**
+     * 一次性迁移：把旧版（升级前、无用户后缀）SP 的内容复制给当前用户作用域，
+     * 使老用户升级后不会丢掉原有设置。
+     *
+     * 每个 (SP 名, 作用域) 组合只执行一次；目标 SP 已有数据时不再覆盖。
+     */
+    fun migrateLegacyPref(context: Context, legacyName: String) {
+        val global = prefs ?: return
+        val markKey = KEY_MIGRATED_PREFIX + legacyName + "_" + storageScope
+        if (global.getBoolean(markKey, false)) return
+        global.edit().putBoolean(markKey, true).apply()
+
+        val legacy = context.getSharedPreferences(legacyName, Context.MODE_PRIVATE)
+        val old = legacy.all
+        if (old.isEmpty()) return
+        val target = context.getSharedPreferences(userSpName(legacyName), Context.MODE_PRIVATE)
+        if (target.all.isNotEmpty()) return
+
+        val ed = target.edit()
+        for ((k, v) in old) {
+            when (v) {
+                is String -> ed.putString(k, v)
+                is Int -> ed.putInt(k, v)
+                is Long -> ed.putLong(k, v)
+                is Boolean -> ed.putBoolean(k, v)
+                is Float -> ed.putFloat(k, v)
+                is Set<*> -> ed.putStringSet(k, v.filterIsInstance<String>().toSet())
+            }
+        }
+        ed.apply()
+        Log.d(TAG, "迁移旧版持久化到用户作用域: $legacyName -> ${userSpName(legacyName)}")
+    }
 
     /* ====================== 多用户存储 ====================== */
 
@@ -311,7 +402,8 @@ object ApiClient {
         // 2. 每日磁盘缓存
         val today = todayStr()
         val cacheFile = "sources_public_$today.json"
-        readDailyCache(cacheFile)?.let { arr ->
+        // 公开源与用户无关：存共享目录，多账号复用同一份，避免重复下载
+        readDailyCache(cacheFile, userScoped = false)?.let { arr ->
             val list = parseSourcesFromJson(arr)
             if (list.isNotEmpty()) {
                 cachedPublicSources = list
@@ -323,8 +415,8 @@ object ApiClient {
         val json = execArray(authedGet("/api/public-sources"))
         val list = parseSourcesFromJson(json)
         cachedPublicSources = list
-        // 写入每日缓存
-        writeDailyCache(cacheFile, json)
+        // 写入每日缓存（共享目录）
+        writeDailyCache(cacheFile, json, userScoped = false)
         list
     }
 
@@ -585,6 +677,8 @@ object ApiClient {
                         // 登录/注册成功：保存活跃会话 + 存储到用户列表 + 记住用户名
                         token = t
                         currentUser = user
+                        // 切换账号：清空上一个账号的内存缓存，避免串号看到对方数据
+                        invalidateCache(channels = true, favorites = true, sources = true)
                         saveStoredUser(StoredUser(
                             username = user.username,
                             token = if (rememberMe) t else "",
@@ -661,6 +755,8 @@ object ApiClient {
                 role = user.role,
                 needsDefaultSource = false
             )
+            // 切换账号：清空上一个账号的内存缓存，避免串号看到对方数据
+            invalidateCache(channels = true, favorites = true, sources = true)
             getMySources()
             saveLastLoginUsername(user.username)
             true

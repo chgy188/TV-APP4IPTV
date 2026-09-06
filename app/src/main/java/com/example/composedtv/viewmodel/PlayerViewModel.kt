@@ -139,7 +139,9 @@ data class PlaybackSettings(
         private const val KEY_AUTO_AV_SYNC = "auto_av_sync"
 
         fun load(context: Context): PlaybackSettings {
-            val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+            // 旧版（无用户后缀）数据一次性迁移到当前用户作用域
+            ApiClient.migrateLegacyPref(context, PREF_NAME)
+            val sp = context.getSharedPreferences(ApiClient.userSpName(PREF_NAME), Context.MODE_PRIVATE)
             return PlaybackSettings(
                 directTimeoutMs = sp.getLong(KEY_DIRECT_TIMEOUT, 6_000L),
                 proxyTimeoutMs = sp.getLong(KEY_PROXY_TIMEOUT, 10_000L),
@@ -156,7 +158,8 @@ data class PlaybackSettings(
         }
 
         fun save(context: Context, s: PlaybackSettings) {
-            val sp: SharedPreferences = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+            val sp: SharedPreferences =
+                context.getSharedPreferences(ApiClient.userSpName(PREF_NAME), Context.MODE_PRIVATE)
             sp.edit()
                 .putLong(KEY_DIRECT_TIMEOUT, s.directTimeoutMs)
                 .putLong(KEY_PROXY_TIMEOUT, s.proxyTimeoutMs)
@@ -228,7 +231,9 @@ data class LastPlayedChannel(
         private const val K_ORIGIN_IDX = "origin_index"
 
         fun load(context: Context): LastPlayedChannel? {
-            val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+            // 旧版（无用户后缀）数据一次性迁移到当前用户作用域
+            ApiClient.migrateLegacyPref(context, PREF_NAME)
+            val sp = context.getSharedPreferences(ApiClient.userSpName(PREF_NAME), Context.MODE_PRIVATE)
             val url = sp.getString(K_URL, null)?.takeIf { it.isNotBlank() } ?: return null
             return LastPlayedChannel(
                 name = sp.getString(K_NAME, null) ?: "",
@@ -247,7 +252,7 @@ data class LastPlayedChannel(
         }
 
         fun save(context: Context, c: LastPlayedChannel) {
-            context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit()
+            context.getSharedPreferences(ApiClient.userSpName(PREF_NAME), Context.MODE_PRIVATE).edit()
                 .putString(K_NAME, c.name)
                 .putString(K_URL, c.url)
                 .putString(K_SOURCE_ID, c.sourceId)
@@ -357,7 +362,12 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
 
     /** 初始化：根据是否游客加载初始频道，并预热节目栏数据 */
     fun initialize(isGuest: Boolean) {
-        _uiState.value = _uiState.value.copy(isGuest = isGuest, storedUsers = ApiClient.getStoredUsers())
+        // 每次进入播放界面都按「当前登录用户」重新读取，确保拿到该用户自己的设置
+        _uiState.value = _uiState.value.copy(
+            isGuest = isGuest,
+            storedUsers = ApiClient.getStoredUsers(),
+            playbackSettings = PlaybackSettings.load(app)
+        )
         if (isGuest) {
             // 游客：固定续播上次退出时的频道；首次使用（无记录）才用默认起始频道
             loadGuestStartChannel()
@@ -1245,6 +1255,14 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * 用户切换（登录 / 切号 / 登出 / 进入游客）后重新加载该用户隔离的持久化数据。
+     * 不切换的话，界面上会继续显示上一个账号的设置。
+     */
+    private fun reloadUserScopedSettings() {
+        _uiState.value = _uiState.value.copy(playbackSettings = PlaybackSettings.load(app))
+    }
+
+    /**
      * 准备进入登录界面：可传入用户名用于预填（点击已登录用户卡片时）。
      * 复用 lastLoginUsername 字段承载「待登录用户名」，LoginScreen 会把它显示为预填值。
      * 传 null 时清空，让用户手动输入。
@@ -1277,6 +1295,7 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                     lastLoginUsername = ApiClient.getLastLoginUsername(),
                     pendingLoginMessage = null
                 )
+                reloadUserScopedSettings()
             }
             onResult(res.ok, res.message)
         }
@@ -1303,11 +1322,13 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
             lastLoginUsername = if (ok) user.username else _uiState.value.lastLoginUsername,
             pendingLoginMessage = if (ok) null else "登录已过期，请重新输入密码"
         )
+        if (ok) reloadUserScopedSettings()
         return ok
     }
 
     fun enterAsGuest() {
         ApiClient.enterAsGuest()
+        reloadUserScopedSettings()
     }
 
     fun logout() {
@@ -1315,6 +1336,7 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
             ApiClient.auth("logout")
             ApiClient.logoutLocal()
             _uiState.value = _uiState.value.copy(storedUsers = ApiClient.getStoredUsers())
+            reloadUserScopedSettings()
         }
     }
 }

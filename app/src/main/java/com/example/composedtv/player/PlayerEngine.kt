@@ -498,7 +498,8 @@ class PlayerEngine(private val context: Context) {
     }
 
     private fun loadLastMode(url: String): String? = try {
-        context.getSharedPreferences(PREF_PLAY_MODE, Context.MODE_PRIVATE)
+        // 播放模式记忆按用户隔离（不同账号的频道可达性不同）
+        context.getSharedPreferences(ApiClient.userSpName(PREF_PLAY_MODE), Context.MODE_PRIVATE)
             .getString(KEY_LAST_MODE + modeKey(url), null)
     } catch (e: Exception) {
         null
@@ -506,7 +507,7 @@ class PlayerEngine(private val context: Context) {
 
     private fun saveLastMode(url: String, mode: String) {
         try {
-            val sp = context.getSharedPreferences(PREF_PLAY_MODE, Context.MODE_PRIVATE)
+            val sp = context.getSharedPreferences(ApiClient.userSpName(PREF_PLAY_MODE), Context.MODE_PRIVATE)
             // 条目超限：整体清空后重新累积
             if (sp.all.size >= MAX_PLAY_MODE_ENTRIES) {
                 sp.edit().clear().apply()
