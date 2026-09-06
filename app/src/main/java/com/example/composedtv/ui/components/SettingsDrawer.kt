@@ -64,9 +64,9 @@ private data class SettingGroupDef(
  * 右侧配置抽屉：由遥控器 MENU 键唤出，调整播放参数。
  *
  * 两排模式（现代 TV 设置布局）：
- * - 左排：设置分组（首播频道 / 直连起播超时 / 卡顿判定 / 代理起播超时 / 渲染方式 / 诊断）
+ * - 左排：设置分组（首播频道 / 直连起播超时 / 代理起播超时 / 渲染方式 / 诊断）
  * - 右排：当前分组的选项
- * 相比原先单列纵向堆叠，可聚焦项从 19 个降到「左排 6 + 右排 3」，
+ * 相比原先单列纵向堆叠，可聚焦项从 19 个降到「左排 5 + 右排 3」，
  * 上下键次数大幅减少；←→ 键在两排间切换。
  *
  * @param isGuest 游客模式：不显示「首播频道」分组（游客固定续播上次退出的频道）
@@ -76,7 +76,6 @@ fun SettingsDrawer(
     visible: Boolean,
     settings: PlaybackSettings,
     onDirectTimeoutChange: (Long) -> Unit,
-    onStuckTimeoutChange: (Long) -> Unit,
     onProxyTimeoutChange: (Long) -> Unit,
     onRendererChange: (RendererMode) -> Unit,
     onSmoothPriorityChange: (Boolean) -> Unit = {},
@@ -91,7 +90,7 @@ fun SettingsDrawer(
 ) {
     // 分组定义：随设置值与诊断状态变化重建（回调本身稳定，不列入 key 避免无谓重建）
     val groups = remember(
-        settings.directTimeoutMs, settings.stuckTimeoutMs, settings.proxyTimeoutMs,
+        settings.directTimeoutMs, settings.proxyTimeoutMs,
         settings.rendererMode, settings.startChannelMode, settings.smoothPriority,
         settings.autoAvSync, isGuest, diagEnabled
     ) {
@@ -112,14 +111,6 @@ fun SettingsDrawer(
                 },
                 selectedIndex = PlaybackSettingOptions.directTimeoutOptions
                     .indexOfFirst { it.first == settings.directTimeoutMs }.coerceAtLeast(0)
-            ),
-            SettingGroupDef(
-                title = "卡顿判定",
-                options = PlaybackSettingOptions.stuckOptions.map { (v, label) ->
-                    label to { onStuckTimeoutChange(v) }
-                },
-                selectedIndex = PlaybackSettingOptions.stuckOptions
-                    .indexOfFirst { it.first == settings.stuckTimeoutMs }.coerceAtLeast(0)
             ),
             SettingGroupDef(
                 title = "代理起播超时",

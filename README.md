@@ -1,6 +1,6 @@
 # composedTV（TV-APP4IPTV）
 
-基于 **Jetpack Compose + Android TV** 的 IPTV 直播播放器，对接 `worker4iptv` 后端（见同团队后端仓库）。支持多用户切换、频道分组检索、收藏、HLS 代理播放与竞速（hedged）起播。
+基于 **Jetpack Compose + Android TV** 的 IPTV 直播播放器，对接 `worker4iptv` 后端（见同团队后端仓库）。支持多用户切换、频道分组检索、收藏、HLS 代理播放与直连/代理串行兜底起播。
 
 > 后端 API 客户端默认地址：`https://tv.run4u.dpdns.org`（`ApiClient.baseUrl`，可改）。
 
@@ -22,7 +22,7 @@ app/src/main/java/com/example/composedtv/
 │   ├── ApiClient.kt                # 后端 API 客户端（全部接口封装）
 │   └── Models.kt                   # 数据模型 + 国家/语言中文映射
 ├── player/
-│   ├── PlayerEngine.kt             # ExoPlayer 封装：竞速起播/看门狗/FLV 重试
+│   ├── PlayerEngine.kt             # ExoPlayer 封装：直连/代理串行兜底起播、容器嗅探 FLV、起播超时看门狗
 │   └── PlaylistItem.kt             # 播放列表项（见 PlayerEngine）
 ├── viewmodel/
 │   └── PlayerViewModel.kt          # UI 状态、侧边栏三列数据、收藏/搜索逻辑
@@ -39,12 +39,12 @@ app/src/main/java/com/example/composedtv/
 - **实时搜索**：侧边栏第三列搜索模式，跨当前源所有分类实时筛选频道。
 - **收藏**：登录后可收藏/取消收藏（后端按 `url` 去重），收藏列表作为虚拟分类展示。
 - **播放器能力**（`PlayerEngine`）：
-  - **竞速/hedged 起播**：同时发起主备请求，先到者胜，降低起播延迟（`RACE_HEDGE_MS=1500`）。
-  - **看门狗**：`WATCHDOG_TIMEOUT_MS=15000`，起播/恢复超时自动切换或重试。
-  - **FLV 支持**：内置 `FlvExtractor`，并对 FLV 失败做一次重试（`flvRetryDone`）。
+  - **直连/代理串行兜底起播**：按 `planPlay()` 决定尝试顺序（国内仅直连；海外 HLS 为 `direct → proxy` 串行），同一时刻仅 1 个 ExoPlayer，避免老设备双路解码 OOM。
+  - **起播超时看门狗**：每个尝试按 `directTimeoutMs` / `proxyTimeoutMs`（设置抽屉可调）计时，超时未 READY 或出错即切换下一个，全部失败则切台。
+  - **FLV 支持**：由 ExoPlayer 按流首字节嗅探容器（含 FLV）自动识别解析器，不再依赖 URL 关键字；FLV 失败不再单独重试，并入串行链路统一兜底。
   - **直播 vs 点播**：直播流不做进度恢复；点播内容重载前保存 `pendingResumePositionMs` 恢复进度。
-  - **首帧区分**：`hasRenderedFirstFrame` 区分「首次缓冲」与「播放中卡顿」，UI 提示更准确。
-  - **连续错误计数**：`consecutiveErrors` 触发自动跳台/降级。
+  - **缓冲/加载提示**：起播与播放中缓冲均显示加载态，并展示尝试中的模式（直连/代理）与剩余超时，便于排查卡顿。
+  - **连续错误计数**：`consecutiveErrors` 累计起播失败，达到频道总数则提示「所有频道均无法播放」，否则自动跳下一台。
   - **代理标识**：`usingProxy` 标记当前是否经 HLS 代理播放。
 - **代理播放**：所有播放 url 经 `ApiClient.hlsProxyUrl()` 走后端 `/api/hls`，台标经 `imgProxyUrl()` 走 `/api/img`，规避跨域/防盗链。
 - **缓存策略**（`ApiClient`）：

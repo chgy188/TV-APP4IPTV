@@ -14,8 +14,6 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import androidx.media3.extractor.ExtractorsFactory
-import androidx.media3.extractor.flv.FlvExtractor
 import com.example.composedtv.data.remote.ApiClient
 import com.example.composedtv.debug.DebugDiagnostics
 import kotlinx.coroutines.CoroutineScope
@@ -77,7 +75,6 @@ data class PlayerState(
  * 即切换下一个尝试，全部用尽才走失败处理（切台）。
  *
  * 可配置（见 PlayerViewModel.PlaybackSettings）：
- * - stuckTimeoutMs：持续缓冲超过该时长且播放位置不前进 → 判定卡顿并原地重载
  *
  * 国内频道（country 为 CN/SK/澳门等）：完全不走代理，仅直连。
  */
@@ -111,7 +108,6 @@ class PlayerEngine(private val context: Context) {
         /** 记忆条目上限，超出则整体清空，避免长期运行无界增长 */
         private const val MAX_PLAY_MODE_ENTRIES = 500
         // ===== 可被设置抽屉注入的播放参数（下方 var 为运行时值，此处为默认值） =====
-        private const val DEFAULT_STUCK_TIMEOUT_MS = 8_000L   // 持续缓冲判定 stuck 的时长
         private const val DEFAULT_DIRECT_TIMEOUT_MS = 6_000L  // 直连候选起播超时（可由设置抽屉注入）
         private const val DEFAULT_PROXY_TIMEOUT_MS = 10_000L  // 代理候选起播超时（可由设置抽屉注入）
         private const val DEFAULT_SMOOTH_PRIORITY = false      // 流畅优先（降分辨率）默认关
@@ -127,8 +123,6 @@ class PlayerEngine(private val context: Context) {
     }
 
     // ===== 可注入播放参数（由设置抽屉经 ViewModel 注入） =====
-    /** 持续缓冲超过该时长且播放位置不前进 → 判定 stuck（触发原地重载） */
-    var stuckTimeoutMs = DEFAULT_STUCK_TIMEOUT_MS
 
     /** 由 PlayerScreen 注入共享 Surface（PlayerView 就绪后其视频渲染 Surface 非空）。
      *  之后创建的所有竞速候选（含代理副路）都会绑定该 Surface，实现真正的双路竞速且切换无黑屏。
@@ -169,13 +163,12 @@ class PlayerEngine(private val context: Context) {
 
     /** 把设置抽屉里的值同步进 engine（PlaybackSettings 定义在 PlayerViewModel） */
     fun applyPlaybackSettings(s: com.example.composedtv.viewmodel.PlaybackSettings) {
-        stuckTimeoutMs = s.stuckTimeoutMs
         directTimeoutMs = s.directTimeoutMs
         proxyTimeoutMs = s.proxyTimeoutMs
         smoothPriority = s.smoothPriority
         autoAvSync = s.autoAvSync
         DebugDiagnostics.setEnv(isLegacyDevice(), s.rendererMode.name)
-        Log.d(TAG, "applyPlaybackSettings: stuck=${stuckTimeoutMs} direct=${directTimeoutMs} proxy=${proxyTimeoutMs} legacy=${isLegacyDevice()}")
+        Log.d(TAG, "applyPlaybackSettings: direct=${directTimeoutMs} proxy=${proxyTimeoutMs} legacy=${isLegacyDevice()}")
     }
 
     /** 是否老设备：Android 6.0.1 (API 23) 及以下。老设备解码/渲染能力弱，需要降级策略 */
@@ -229,12 +222,11 @@ class PlayerEngine(private val context: Context) {
 
     private var playlist: List<PlaylistItem> = emptyList()
     private var currentIndex = 0
-    /** 当前正在播放的 URL（供 stuck 复活竞速复用） */
+    /** 当前正在播放的 URL（供原地重载复用） */
     private var currentPlayingUrl: String = ""
     /** 当前频道的自定义请求头（UA/Referer），仅在直连源站时携带 */
     private var currentChannelHeaders: Map<String, String> = emptyMap()
     private var consecutiveErrors = 0
-    private var flvRetryDone = false
 
     /** 重载前保存的播放位置（毫秒），用于点播内容恢复进度 */
     private var pendingResumePositionMs: Long = 0
@@ -275,8 +267,6 @@ class PlayerEngine(private val context: Context) {
     /** 由 PlayerScreen 注入的共享视频 Surface（PlayerView 的 videoSurface）。
      *  串行切换尝试时复用同一 Surface，避免 Surface 重建导致老电视"有声音没画面" */
     private var sharedSurface: android.view.Surface? = null
-    /** 老设备专用：本频道直连失败后是否已顺序重试过代理（最多 1 次，避免双解码） */
-    private var proxyRetryDone = false
 
     // 信息条自动隐藏
     private var infoHideJob: Job? = null
@@ -312,14 +302,13 @@ class PlayerEngine(private val context: Context) {
         resetRace()
         safeRelease(player)
         setPlayerRef(null)
-        flvRetryDone = false
-        proxyRetryDone = false
         currentPlayingUrl = item.url
         // 频道自定义请求头（UA/Referer，防盗链用），仅直连源站时携带
         currentChannelHeaders = buildChannelHeaders(item)
         DebugDiagnostics.setChannel(item.name, item.url, false)
-        // 判断是否直播流：HLS (.m3u8) 和 FLV 视为直播，其余（如 .mp4/.mkv）视为点播
-        isLiveStream = isFlvStream(item.url) || item.url.lowercase().let {
+        // 判断是否直播流：仅 HLS (.m3u8/.m3u) 视为直播；FLV 等容器改由 ExoPlayer 嗅探，
+        // 不再以 URL 关键字判断，故此处不再把 FLV 归入直播（FLV 直播会按点播处理侧边栏暂停）。
+        isLiveStream = item.url.lowercase().let {
             it.contains(".m3u8") || it.contains(".m3u")
         }
         // 信息条：仅在「频道真正变化」时弹出。
@@ -468,15 +457,6 @@ class PlayerEngine(private val context: Context) {
         }
     }
 
-    // ===== FLV 探测 =====
-    private fun isFlvStream(url: String): Boolean {
-        val lower = url.lowercase()
-        if (lower.contains(".flv")) return true
-        return lower.contains("huya") || lower.contains("douyu") ||
-               lower.contains("bilibili") || lower.contains("/live/") ||
-               lower.contains("live.") || lower.contains("/flv/")
-    }
-
     // ===== 播放策略规划 =====
     private fun planPlay(url: String, country: String): List<String> {
         // 国内频道：完全不走代理，仅直连
@@ -486,11 +466,9 @@ class PlayerEngine(private val context: Context) {
         val lower = url.lowercase()
         val isHls = lower.contains(".m3u8") || lower.contains(".m3u")
         if (!isHls) return listOf("direct")
-        // 老设备（海信 Android 6 等）：不启动双路竞速（并行双解码会卡顿），仅直连；
-        // 代理兜底由 handlePlayFailure 顺序重试（单路），避免弱解码器被拖垮
-        if (isLegacyDevice()) return listOf("direct")
-        // 一律直连优先、代理兜底：仅当直连慢（竞速）或失败时才启用代理，
-        // 修复 http:// 源被无条件强制走代理导致"可直连频道误走代理"的问题
+        // 所有设备（含 legacy / 极米）统一串行 [direct, proxy]：
+        // 串行模式下同时刻仅存在 1 个 ExoPlayer，不会双解码 OOM，
+        // legacy 也安全享受"直连失败→代理兜底"，无需 handlePlayFailure 里的旧代理补试分支。
         return listOf("direct", "proxy")
     }
 
@@ -563,7 +541,7 @@ class PlayerEngine(private val context: Context) {
     private fun createCandidatePlayer(url: String, useProxy: Boolean, winner: Boolean): ExoPlayer {
         val lower = url.lowercase()
         val isHls = lower.contains(".m3u8") || lower.contains(".m3u")
-        val isFlv = isFlvStream(url)
+        // 代理只支持 HLS（hlsProxyUrl 仅包裹 .m3u8）；非 HLS 仍走原 url
         val finalUrl = if (useProxy && isHls) ApiClient.hlsProxyUrl(url) else url
         val legacy = isLegacyDevice()
 
@@ -597,14 +575,10 @@ class PlayerEngine(private val context: Context) {
         }
         val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
 
-        val mediaSourceFactory = if (isFlv) {
-            val flvExtractorsFactory = ExtractorsFactory {
-                arrayOf<androidx.media3.extractor.Extractor>(FlvExtractor())
-            }
-            DefaultMediaSourceFactory(dataSourceFactory, flvExtractorsFactory)
-        } else {
-            DefaultMediaSourceFactory(dataSourceFactory)
-        }
+        // 不强制单一 Extractor：DefaultMediaSourceFactory 默认会从流首字节嗅探容器
+        // （FLV 的 "FLV" magic、MP4 的 ftyp、TS 的 0x47…），按实际协议选择解析器，
+        // 从根本上识别 FLV，而非依赖 URL 关键字。
+        val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
 
         val renderersFactory = DefaultRenderersFactory(context)
             // PREFER：优先硬件 MediaCodec 解码（省内存/CPU），仅当硬件不支持时才回退到扩展(ffmpeg)软解。
@@ -643,9 +617,9 @@ class PlayerEngine(private val context: Context) {
         val builder = MediaItem.Builder().setUri(finalUrl)
         when {
             isHls -> builder.setMimeType(MimeTypes.APPLICATION_M3U8)
-            isFlv -> builder.setMimeType(MimeTypes.VIDEO_FLV)
+            // 非 HLS（FLV/MP4/TS 等）不设置 mime，交给容器嗅探
         }
-        if (isHls || isFlv) {
+        if (isHls) {
             builder.setLiveConfiguration(
                 MediaItem.LiveConfiguration.Builder()
                     .setTargetOffsetMs(30_000L)
@@ -661,7 +635,7 @@ class PlayerEngine(private val context: Context) {
         DebugDiagnostics.log(
             "Engine",
             "createCandidate attempt=${if (useProxy) "proxy" else "direct"} winner=$winner " +
-                "hls=$isHls flv=$isFlv legacy=$legacy url=$finalUrl"
+                "hls=$isHls legacy=$legacy url=$finalUrl"
         )
         p.prepare()
         p.playWhenReady = true
@@ -838,25 +812,12 @@ class PlayerEngine(private val context: Context) {
         saveLastMode(currentPlayingUrl, winner.attempt)
 
         // 串行模式：不再并行复活代理（那会引入第二路解码，正是小内存设备 OOM 的主因）。
-        // 播放期卡顿统一由 attachPlaybackWatcher → startPlaybackStuckMonitor 兜底：
-        // 原地重载当前频道 → 仍失败则切下一台。
+        // 播放期卡顿不再自动重载，交由用户手动处理（音画同步自动恢复除外）。
     }
 
-    // ===== 播放期兜底监测（直连 / 代理胜出后均生效） =====
-    // 串行模式下不再有"复活代理"（会引入第二路并行解码）。统一给已稳定播放的
-    // player 增加缓冲超时监测：超时仍未恢复则重载当前频道，
-    // 连续重载 PLAYBACK_RELOAD_MAX 次仍卡则跳下一台（与"双路皆败跳台"语义一致）。
-
-    /** 播放期连续原地重载次数；重载后若成功恢复(STATE_READY)则清零。 */
-    private var playbackReviveCount = 0
-
-    /** 播放期连续重载上限：达到后改为跳下一台。 */
-    private val PLAYBACK_RELOAD_MAX = 1
-
-    /** 重载荷载锁：防止播放期兜底与竞速 watchdog 同时/并发触发同一频道多次 reload */
+    // ===== 重载荷载锁 =====
+    // 防止"手动重载 / 音画同步自动恢复"与竞速流程并发触发同一频道多次 reload
     private var isReloading = false
-
-    private var playbackStuckJob: Job? = null
 
     // ===== 音画同步自动恢复 =====
     private var avSyncJob: Job? = null
@@ -867,32 +828,6 @@ class PlayerEngine(private val context: Context) {
     private var avSyncAutoCount = 0
     /** 自动恢复二次触发时临时强制 720p，降低解码负载以真正跟住音画 */
     private var forceSmoothThisReload = false
-
-    private fun startPlaybackStuckMonitor(exo: ExoPlayer?, attempt: String) {
-        stopPlaybackStuckMonitor()
-        val target = exo ?: return
-        val basePos = target.currentPosition
-        playbackStuckJob = scope.launch {
-            delay(stuckTimeoutMs)
-            val state = target.playbackState
-            val pos = target.currentPosition
-            // 仅在确实还在缓冲且位置未推进时判 stuck。
-            // 注意：API<23 解码器重建/重载初期画面定格也会被观察到 BUFFERING，
-            // 故要求"曾经播放过(playWhenReady 且非 IDLE)"才判 stuck，避免把
-            // 重建/重载过程本身误判为 stuck 进而递归重载（图片轮播的放大器之一）。
-            val everStarted = target.playbackState != Player.STATE_IDLE
-            val stuck = everStarted && (state == Player.STATE_BUFFERING) && (pos <= basePos + 500)
-            if (stuck) {
-                Log.w(TAG, "播放期 stuck(${stuckTimeoutMs}ms) 未恢复，触发兜底: $currentPlayingUrl")
-                onPlaybackFatal(exo, attempt, "stuck")
-            }
-        }
-    }
-
-    private fun stopPlaybackStuckMonitor() {
-        playbackStuckJob?.cancel()
-        playbackStuckJob = null
-    }
 
     /** 新频道起播：复位音画同步检测计数（避免上一频道的漂移计数污染新频道） */
     private fun resetAvSyncForNewChannel() {
@@ -962,67 +897,29 @@ class PlayerEngine(private val context: Context) {
     }
 
     /**
-     * 播放期致命/卡死兜底：先原地重载当前频道；若已连续重载 PLAYBACK_RELOAD_MAX 次仍失败则跳下一台。
-     * 重载成功后(onPlaybackWatcher STATE_READY)会清零 playbackReviveCount，因此只有"连续"卡死才累计跳台。
-     */
-    @Suppress("UNUSED_PARAMETER")
-    private fun onPlaybackFatal(_exo: ExoPlayer?, _attempt: String, reason: String) {
-        if (playlist.isEmpty()) return
-        playbackReviveCount++
-        if (playbackReviveCount > PLAYBACK_RELOAD_MAX) {
-            Log.w(TAG, "播放期连续重载 $playbackReviveCount 次仍失败，跳下一台: $currentPlayingUrl")
-            playbackReviveCount = 0
-            stopPlaybackStuckMonitor()
-            playNext()
-            return
-        }
-        Log.w(TAG, "播放期兜底重载(reason=$reason, count=$playbackReviveCount/$PLAYBACK_RELOAD_MAX): $currentPlayingUrl")
-        stopPlaybackStuckMonitor()
-        reloadCurrentChannel(reason = "playback-$reason")
-    }
-
-
-
-    /**
      * 胜出后的播放期监听器（仅观察状态，不自动重载）：
      * - STATE_BUFFERING：显示 spinner
      * - STATE_READY：恢复 spinner
-     * - STATE_ENDED / onPlayerError：仅记录日志，不再自动重载。
-     *   用户如需恢复，请按右键手动重载。
+     * - STATE_ENDED / onPlayerError：仅记录日志（直播滑窗仍自动 seek 恢复），不再自动重载/跳台。
+     *   用户如需恢复，请按右键手动重载，或交由音画同步自动恢复处理。
      */
     private fun attachPlaybackWatcher(exo: ExoPlayer, attempt: String) {
         exo.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
                 when (state) {
-                    Player.STATE_BUFFERING -> {
-                        updateState(isLoading = true)
-                        // 播放期卡顿监测：进入缓冲即开始计时，超时未恢复则重载
-                        startPlaybackStuckMonitor(exo, attempt)
-                    }
-                    Player.STATE_READY -> {
+                    Player.STATE_BUFFERING -> updateState(isLoading = true)
+                    Player.STATE_READY ->
                         updateState(isLoading = false, isPlaying = true, error = null)
-                        // 恢复播放 → 重置 stuck 计时，避免正常波动误触发重载
-                        stopPlaybackStuckMonitor()
-                        // 重载后成功恢复 → 清零连续重载计数，只有"连续"卡死才累计跳台
-                        if (playbackReviveCount > 0) {
-                            Log.d(TAG, "播放期恢复稳定，清零 playbackReviveCount")
-                            playbackReviveCount = 0
-                        }
-                    }
-                    Player.STATE_ENDED -> {
-                        Log.w(TAG, "播放期 STATE_ENDED，触发重载: $currentPlayingUrl")
-                        onPlaybackFatal(exo, attempt, "ended")
-                    }
-                    Player.STATE_IDLE -> {
-                        // no-op
-                    }
+                    Player.STATE_ENDED ->
+                        Log.w(TAG, "播放期 STATE_ENDED: $currentPlayingUrl")
+                    Player.STATE_IDLE -> { /* no-op */ }
                 }
             }
 
             override fun onPlayerError(error: PlaybackException) {
                 val cause = error.cause
                 if (cause is androidx.media3.exoplayer.source.BehindLiveWindowException) {
-                    // 直播滑出窗口：与竞速期一致，自动重新 seek 恢复，避免黑屏
+                    // 直播滑出窗口：自动重新 seek 恢复，避免黑屏（非卡顿重载，属直播正常补偿）
                     Log.w(TAG, "播放期 BehindLiveWindow，auto-recover: $currentPlayingUrl")
                     exo.stop()
                     exo.clearMediaItems()
@@ -1039,7 +936,8 @@ class PlayerEngine(private val context: Context) {
                 }
                 Log.e(TAG, "播放期 onPlayerError: ${error.errorCodeName} url=$currentPlayingUrl", error)
                 DebugDiagnostics.onError("playback/$attempt", error)
-                onPlaybackFatal(exo, attempt, error.errorCodeName)
+                // 不再自动重载/跳台：显示错误，交由用户手动处理
+                updateState(isLoading = false, error = "播放出错：${error.errorCodeName}")
             }
         })
     }
@@ -1058,8 +956,7 @@ class PlayerEngine(private val context: Context) {
             return
         }
         isReloading = true
-        // 立即终止旧的播放期与起播层监测，避免旧 player 在其延迟/超时窗口内再次触发 reload
-        stopPlaybackStuckMonitor()
+        // 立即终止旧的起播层监测，避免旧 player 在其延迟/超时窗口内再次触发 reload
         stopAttemptTimeout()
         // 点播内容：保存当前播放位置以便重载后恢复
         if (!isLiveStream) {
@@ -1093,31 +990,8 @@ class PlayerEngine(private val context: Context) {
             updateState(error = "无法播放", isLoading = false)
             return
         }
-        val item = playlist.getOrNull(currentIndex)
-        val curUrl = item?.url ?: ""
-        val country = item?.country ?: ""
-        if (isFlvStream(curUrl) && !flvRetryDone) {
-            flvRetryDone = true
-            Log.d(TAG, "FLV 首次失败，原地重试: $curUrl")
-            updateState(isLoading = true)
-            resetRace()
-            safeRelease(player)
-            setPlayerRef(null)
-            playUrl(curUrl, country)
-            return
-        }
-        // 老设备（海信 Android 6 等）：直连失败后顺序重试一次代理（单路，不并行双解码）。
-        // 代理由后端转发，某些源必须经代理才能播放；失败仍不代理则跳下一台
-        if (isLegacyDevice() && !proxyRetryDone && !isDomestic(country) && !isFlvStream(curUrl)) {
-            proxyRetryDone = true
-            Log.d(TAG, "老设备直连失败，顺序重试代理: $curUrl")
-            updateState(isLoading = true)
-            resetRace()
-            safeRelease(player)
-            setPlayerRef(null)
-            playUrl(curUrl, country, forceProxy = true)
-            return
-        }
+        // 所有候选（直连/代理）串行用尽即切下一台；FLV 重试与 legacy 代理补试已并入串行链路，
+        // 不再单独处理。
         consecutiveErrors++
         if (consecutiveErrors >= playlist.size) {
             updateState(error = "所有频道均无法播放", isLoading = false, isPlaying = false)
@@ -1203,7 +1077,6 @@ class PlayerEngine(private val context: Context) {
     fun stopPlayback() {
         stopAttemptTimeout()
         resetRace()
-        stopPlaybackStuckMonitor()
         stopAvSyncWatcher()
         safeRelease(player)
         setPlayerRef(null)

@@ -300,7 +300,7 @@ object ApiClient {
     /* ====================== 公开接口 ====================== */
 
     suspend fun ping(): Boolean = withContext(Dispatchers.IO) {
-        try { getPublicSources(); true } catch (e: Exception) {
+        try { getPublicSources(); true } catch (e: Throwable) {
             Log.w(TAG, "ping failed: ${e.message}"); false
         }
     }
@@ -417,7 +417,7 @@ object ApiClient {
                     ua = o.optString("ua", ""), rf = o.optString("rf", "")
                 )
             } else null
-        } catch (e: Exception) { null }
+        } catch (e: Throwable) { null }
     }
 
     /* ====================== 需登录接口 ====================== */
@@ -470,13 +470,13 @@ object ApiClient {
         if (isLoggedIn) {
             try {
                 getMySources().forEach { result[it.id] = it }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.w(TAG, "getMySources failed: ${e.message}")
             }
         }
         try {
             getPublicSources().forEach { result.putIfAbsent(it.id, it) }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.w(TAG, "getPublicSources failed: ${e.message}")
         }
         result.values.toList()
@@ -604,7 +604,7 @@ object ApiClient {
                 val msg = o.optString("message", "").takeIf { it.isNotEmpty() }
                     ?: o.optString("error", "").takeIf { it.isNotEmpty() }
                 AuthResult(ok, t, user, msg)
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 AuthResult(false, null, null, e.message ?: e.toString())
             }
         }
@@ -664,7 +664,7 @@ object ApiClient {
             getMySources()
             saveLastLoginUsername(user.username)
             true
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.w(TAG, "autoLogin token 失效: ${e.message}")
             clearUserToken(user.username)
             token = null

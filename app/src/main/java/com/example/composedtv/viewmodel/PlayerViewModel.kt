@@ -110,8 +110,6 @@ enum class StartChannelMode(val value: Int) {
 
 /** 播放参数设置（由 MENU 设置抽屉调整，持久化保存） */
 data class PlaybackSettings(
-    /** 直连胜出后持续缓冲判定 stuck 的时长（毫秒） */
-    val stuckTimeoutMs: Long = 8_000L,
     /** 直连候选的起播超时（毫秒）：超过该时长仍未 READY 则切换下一个候选。
      *  默认 6s：既能覆盖正常起播，又不会让"慢但不报错"的源拖太久；
      *  网络差 / 源响应慢时可调到 10s，避免被误判为不可播 */
@@ -132,7 +130,6 @@ data class PlaybackSettings(
 ) {
     companion object {
         private const val PREF_NAME = "playback_settings"
-        private const val KEY_STUCK = "stuck_timeout_ms"
         private const val KEY_DIRECT_TIMEOUT = "direct_timeout_ms"
         private const val KEY_PROXY_TIMEOUT = "proxy_timeout_ms"
         private const val KEY_RENDERER = "renderer_mode"
@@ -144,7 +141,6 @@ data class PlaybackSettings(
         fun load(context: Context): PlaybackSettings {
             val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             return PlaybackSettings(
-                stuckTimeoutMs = sp.getLong(KEY_STUCK, 8_000L),
                 directTimeoutMs = sp.getLong(KEY_DIRECT_TIMEOUT, 6_000L),
                 proxyTimeoutMs = sp.getLong(KEY_PROXY_TIMEOUT, 10_000L),
                 rendererMode = RendererMode.fromValue(sp.getInt(KEY_RENDERER, RendererMode.AUTO.value)),
@@ -162,7 +158,6 @@ data class PlaybackSettings(
         fun save(context: Context, s: PlaybackSettings) {
             val sp: SharedPreferences = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             sp.edit()
-                .putLong(KEY_STUCK, s.stuckTimeoutMs)
                 .putLong(KEY_DIRECT_TIMEOUT, s.directTimeoutMs)
                 .putLong(KEY_PROXY_TIMEOUT, s.proxyTimeoutMs)
                 .putInt(KEY_RENDERER, s.rendererMode.value)
@@ -272,7 +267,6 @@ data class LastPlayedChannel(
 
 /** 设置抽屉可选值集合（供 UI 渲染单选列表） */
 object PlaybackSettingOptions {
-    val stuckOptions = listOf(5_000L to "5秒", 8_000L to "8秒(默认)", 12_000L to "12秒")
     val directTimeoutOptions = listOf(
         6_000L to "6秒(默认)",
         10_000L to "10秒(网络差/源慢)"
@@ -1203,11 +1197,6 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun hideSettingsDrawer() {
         _uiState.value = _uiState.value.copy(settingsVisible = false)
-    }
-
-    fun updateStuckTimeout(ms: Long) {
-        val next = _uiState.value.playbackSettings.copy(stuckTimeoutMs = ms)
-        commitSettings(next)
     }
 
     fun updateDirectTimeout(ms: Long) {

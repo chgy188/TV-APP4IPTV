@@ -608,7 +608,6 @@ fun PlayerScreen(
             visible = uiState.settingsVisible,
             settings = uiState.playbackSettings,
             onDirectTimeoutChange = { vm.updateDirectTimeout(it) },
-            onStuckTimeoutChange = { vm.updateStuckTimeout(it) },
             onProxyTimeoutChange = { vm.updateProxyTimeout(it) },
             onRendererChange = { vm.updateRendererMode(it) },
             onSmoothPriorityChange = { vm.updateSmoothPriority(it) },
