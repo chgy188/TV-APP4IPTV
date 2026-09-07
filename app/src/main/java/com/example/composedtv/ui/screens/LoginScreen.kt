@@ -5,6 +5,7 @@ package com.example.composedtv.ui.screens
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -158,6 +159,8 @@ fun LoginScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
+                        // TV/D-pad：clickable 不提供焦点目标，需显式 focusable 才能导航到此处
+                        .focusable()
                         .clickable {
                             editingUser = true
                             username = ""
@@ -182,9 +185,10 @@ fun LoginScreen(
                 }
             }
 
-            // 展开用户名输入框（切换账号）后自动聚焦，便于直接键入
-            androidx.compose.runtime.LaunchedEffect(editingUser) {
-                if (editingUser && lastLoginUsername != null) {
+            // 需要输入用户名时（无记住账号 / 注册 / 切换账号）自动聚焦用户名框；
+            // 已有记住的用户名则不显示用户名框，焦点落到密码框（见上方 LaunchedEffect）
+            androidx.compose.runtime.LaunchedEffect(showUserField) {
+                if (showUserField) {
                     kotlinx.coroutines.delay(120)
                     runCatching { userFocusRequester.requestFocus() }
                 }
@@ -211,6 +215,7 @@ fun LoginScreen(
                 trailingIcon = {
                     Box(
                         modifier = Modifier
+                            .focusable()
                             .clickable { showPassword = !showPassword }
                             .padding(8.dp)
                     ) {
@@ -351,6 +356,7 @@ private fun BackButton(onClick: () -> Unit) {
     Surface(
         modifier = Modifier
             .scale(if (isFocused) 1.1f else 1.0f)
+            .focusable(interactionSource = interactionSource)
             .clickable(
                 interactionSource = interactionSource,
                 indication = rememberRipple(),
@@ -462,6 +468,7 @@ private fun ActionButton(text: String, primary: Boolean, compact: Boolean = fals
     Surface(
         modifier = Modifier
             .scale(if (isFocused) 1.05f else 1.0f)
+            .focusable(interactionSource = interactionSource)
             .clickable(
                 interactionSource = interactionSource,
                 indication = rememberRipple(),
@@ -513,6 +520,7 @@ fun RememberToggle(
             .fillMaxWidth()
             .height(if (compact) 36.dp else 42.dp)
             .scale(if (isFocused) 1.03f else 1.0f)
+            .focusable(interactionSource = interactionSource)
             .clickable(
                 interactionSource = interactionSource,
                 indication = rememberRipple(),
