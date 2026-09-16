@@ -78,8 +78,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.foundation.text.rememberTextMeasurer
 import com.example.composedtv.viewmodel.CategoryEntry
 import com.example.composedtv.viewmodel.ChannelEntry
 import com.example.composedtv.viewmodel.SidePanelData
@@ -123,18 +121,20 @@ fun SidePanel(
     val categoryListState = rememberLazyListState()
     val channelListState = rememberLazyListState()
 
-    // 节目栏宽度自适应「当前列表最宽项」：测量源/分类/频道三列表中最长名字的像素宽度，
-    // 加上内/外边距与图标占位后作为面板宽度，并夹在 [220dp, 480dp] 之间，避免切层时宽度跳动。
+    // 节目栏宽度自适应「当前列表最宽项」：用 Paint 测量源/分类/频道三列表中最长名字的像素宽度
+    // （与 Compose 文本渲染同用系统默认字体，结果一致），加上内/外边距与图标占位后作为面板宽度，
+    // 并夹在 [220dp, 480dp] 之间，避免切层时宽度跳动。
     val density = LocalDensity.current
-    val textMeasurer = rememberTextMeasurer()
     val panelWidth = remember(data.sources, data.categories, data.channels) {
-        val style = TextStyle(fontSize = 13.sp)
+        // 列表项文字字号 13.sp → px（sp 需额外乘 fontScale）
+        val textSizePx = 13f * density.density * density.fontScale
+        val paint = android.graphics.Paint().apply { textSize = textSizePx }
         val names = data.sources.map { it.name } +
             data.categories.map { it.name } +
             data.channels.map { it.name }
         val maxPx = names.maxOfOrNull { name ->
-            if (name.isBlank()) 0 else textMeasurer.measure(name, style).size.width
-        } ?: 0
+            if (name.isBlank()) 0f else paint.measureText(name)
+        } ?: 0f
         val contentDp = with(density) { maxPx.toDp() }
         // 32dp 面板外边距 + 24dp 列表项内边距 + 22dp 图标占位(14+6) 的冗余
         (contentDp + 78.dp).coerceIn(220.dp, 480.dp)
