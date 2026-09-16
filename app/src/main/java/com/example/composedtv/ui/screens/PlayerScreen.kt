@@ -302,6 +302,7 @@ fun PlayerScreen(
                     _playerState = playerState,
                     sidePanelVisible = uiState.sidePanelVisible,
                     settingsVisible = uiState.settingsVisible,
+                    isSearchMode = uiState.sidePanel.isSearchMode,
                     engine = engine,
                     vm = vm,
                     _onExit = onExit,
@@ -320,6 +321,7 @@ fun PlayerScreen(
                     _playerState = playerState,
                     sidePanelVisible = uiState.sidePanelVisible,
                     settingsVisible = uiState.settingsVisible,
+                    isSearchMode = uiState.sidePanel.isSearchMode,
                     engine = engine,
                     vm = vm,
                     _onExit = onExit,
@@ -604,7 +606,8 @@ fun PlayerScreen(
                 vm.hideSidePanel()
             },
             onAutoHide = { vm.hideSidePanel() },
-            onSearchQueryChange = { q -> vm.updateSearchQuery(q) }
+            onSearchQueryChange = { q -> vm.updateSearchQuery(q) },
+            onExitSearch = { vm.exitSearchMode() }
         )
 
         // 右侧配置抽屉（MENU 键唤出）：调整播放参数
@@ -742,6 +745,7 @@ private fun handlePlayerKeyEvent(
     _playerState: PlayerState,
     sidePanelVisible: Boolean,
     settingsVisible: Boolean,
+    isSearchMode: Boolean,
     engine: PlayerEngine,
     vm: PlayerViewModel,
     _onExit: () -> Unit,
@@ -813,9 +817,13 @@ private fun handlePlayerKeyEvent(
         }
 
         // 数字键 0：开关诊断 HUD（无 ADB 时在画面上直接看解码器/丢帧/Surface 指标）
+        // 搜索模式下不拦截，让搜索框接收数字输入
         KeyEvent.KEYCODE_0 -> {
-            onToggleDiag()
-            true
+            if (isSearchMode) false
+            else {
+                onToggleDiag()
+                true
+            }
         }
 
         // 菜单键：唤出/收起右侧配置抽屉（与侧边栏互斥）

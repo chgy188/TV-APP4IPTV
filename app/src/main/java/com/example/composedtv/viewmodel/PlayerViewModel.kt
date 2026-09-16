@@ -272,12 +272,14 @@ data class LastPlayedChannel(
 object PlaybackSettingOptions {
     val directTimeoutOptions = listOf(
         6_000L to "6秒(默认)",
-        10_000L to "10秒(网络差/源慢)"
+        10_000L to "10秒(网络差/源慢)",
+        20_000L to "20秒(极慢源)"
     )
     val proxyTimeoutOptions = listOf(
         7_000L to "7秒(网络好)",
         10_000L to "10秒(默认)",
-        15_000L to "15秒(网络差)"
+        15_000L to "15秒(网络差)",
+        20_000L to "20秒(极慢/代理不稳)"
     )
     val rendererOptions = listOf(
         RendererMode.AUTO to "自动(默认)",

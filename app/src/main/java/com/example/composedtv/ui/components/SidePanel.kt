@@ -3,6 +3,7 @@
 package com.example.composedtv.ui.components
 
 import android.content.Context
+import android.util.Log
 import android.view.inputmethod.InputMethodManager
 import androidx.compose.ui.platform.LocalView
 import com.example.composedtv.data.remote.CountryLangMapper
@@ -39,6 +40,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -68,7 +70,10 @@ import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -79,6 +84,9 @@ import kotlinx.coroutines.delay
 
 /** 侧边栏自动隐藏超时（毫秒）：无操作 15 秒后自动收起（选台需要足够时间浏览） */
 private const val SIDE_PANEL_TIMEOUT_MS = 15_000L
+
+/** 节目栏单列表模式下的当前层级：源 / 分类 / 频道 */
+private enum class PanelLevel { SOURCE, CATEGORY, CHANNEL }
 
 /**
  * 左侧三排目录面板：源列表、类别列表、频道列表
@@ -96,12 +104,16 @@ fun SidePanel(
     onCategorySelected: (Int) -> Unit,
     onChannelSelected: (ChannelEntry) -> Unit,
     onAutoHide: () -> Unit = {},
-    onSearchQueryChange: (String) -> Unit = {}
+    onSearchQueryChange: (String) -> Unit = {},
+    onExitSearch: () -> Unit = {}
 ) {
     val channelFocusRequester = remember { FocusRequester() }
-    // 分类列（第二列）焦点入口：其顶部固定区包含「收藏 / 搜索」，
-    // 面板打开时把焦点先放到此处，确保遥控能选中收藏 / 搜索（否则它们不在 LazyColumn 焦点链内无法到达）
     val categoryFocusRequester = remember { FocusRequester() }
+    val sourceFocusRequester = remember { FocusRequester() }
+
+    // 当前显示的列表层（单列表模式）：源 / 分类 / 频道。
+    // 开面板默认落在频道层（确定键最先弹出当前频道列表）。
+    var level by remember(isVisible) { mutableStateOf(PanelLevel.CHANNEL) }
 
     // 三个列表的滚动状态提到顶层：用于检测「正在滚动」也算用户活动
     val sourceListState = rememberLazyListState()
@@ -158,49 +170,48 @@ fun SidePanel(
         }
     }
 
-    // 面板打开后的焦点归属：优先落在「当前播放的频道」项上（见下方频道列 effect）。
-    // 本 effect 只做兜底：频道列表迟迟未就绪（加载中 / 源为空）时，先把焦点交给分类列
-    // （收藏 / 搜索所在列），保证面板一定持有焦点、遥控器可用；
-    // 频道列就绪后，其 effect 会再把焦点抢到当前播放的频道上。
-    var channelFocusDone by remember(isVisible) { mutableStateOf(false) }
-    LaunchedEffect(isVisible, data.channels) {
-        if (!isVisible) return@LaunchedEffect
-        // 频道列已就绪 → 交给下方频道 effect 聚焦，此处不抢
-        if (data.channels.isNotEmpty()) return@LaunchedEffect
-        delay(1_000)
-        if (!channelFocusDone) runCatching { categoryFocusRequester.requestFocus() }
-    }
-
-    // 频道列：把「当前播放的频道」滚动到可视区中间
-    LaunchedEffect(isVisible, data.channels, data.selectedChannelIndex) {
-        if (isVisible && !data.isSearchMode && data.channels.isNotEmpty()) {
-            channelListState.scrollCenteredTo(
-                data.selectedChannelIndex.coerceIn(0, data.channels.lastIndex)
-            )
+    // 层切换 / 打开面板时：把焦点放到「当前层」的当前选中项并滚动到可视区中间。
+    // 搜索模式不抢焦点（交给 SearchColumn 自身处理）。
+    // 注意：列表为空时 lastIndex = -1，coerceIn(0, -1) 会抛异常，故先判空再取值。
+    LaunchedEffect(
+        isVisible, level, data.isSearchMode,
+        data.selectedSourceIndex, data.selectedCategoryIndex, data.selectedChannelIndex,
+        data.sources, data.categories, data.channels
+    ) {
+        if (!isVisible || data.isSearchMode) return@LaunchedEffect
+        bumpActivity()
+        when (level) {
+            PanelLevel.SOURCE -> {
+                if (data.sources.isEmpty()) return@LaunchedEffect
+                val idx = data.selectedSourceIndex.coerceIn(0, data.sources.lastIndex)
+                sourceListState.scrollCenteredTo(idx)
+                delay(180)
+                repeat(8) {
+                    delay(100)
+                    if (runCatching { sourceFocusRequester.requestFocus() }.isSuccess) return@LaunchedEffect
+                }
+            }
+            PanelLevel.CATEGORY -> {
+                if (data.categories.isEmpty()) return@LaunchedEffect
+                val idx = data.selectedCategoryIndex.coerceIn(0, data.categories.lastIndex)
+                categoryListState.scrollCenteredTo(idx)
+                delay(180)
+                repeat(8) {
+                    delay(100)
+                    if (runCatching { categoryFocusRequester.requestFocus() }.isSuccess) return@LaunchedEffect
+                }
+            }
+            PanelLevel.CHANNEL -> {
+                if (data.channels.isEmpty()) return@LaunchedEffect
+                val idx = data.selectedChannelIndex.coerceIn(0, data.channels.lastIndex)
+                channelListState.scrollCenteredTo(idx)
+                delay(180)
+                repeat(8) {
+                    delay(100)
+                    if (runCatching { channelFocusRequester.requestFocus() }.isSuccess) return@LaunchedEffect
+                }
+            }
         }
-    }
-
-    // 面板打开时把焦点放到「当前播放的频道」项上（每次打开只做一次，避免后续操作被抢焦点）。
-    // 等待逻辑：换源 / 换分类时频道列表会连续刷新两次（先默认分类，再定位到当前频道所在分类），
-    // 本 effect 以 data.channels / selectedChannelIndex 为 key，列表一变就重启，
-    // 因此自然等到「最后一次刷新 + 稳定 200ms」后才聚焦，不会落在临时的旧列表上。
-    LaunchedEffect(isVisible, data.channels, data.selectedChannelIndex) {
-        if (!isVisible || data.isSearchMode || channelFocusDone) return@LaunchedEffect
-        // 频道列表尚未就绪 → 等数据（effect 会因 key 变化重启）
-        if (data.channels.isEmpty()) return@LaunchedEffect
-        // 稳定期：期间列表若再次变化，本 effect 会重启并重新计时，
-        // 因此只会聚焦到「最后一次刷新」后的列表，不会落在临时旧列表上
-        delay(200)
-        channelFocusDone = true
-        val idx = data.selectedChannelIndex.coerceIn(0, data.channels.lastIndex)
-        channelListState.scrollCenteredTo(idx)
-        // 目标项可能尚未布局完成（滚动/首帧），重试几次再放弃
-        repeat(6) {
-            delay(120)
-            if (runCatching { channelFocusRequester.requestFocus() }.isSuccess) return@LaunchedEffect
-        }
-        // 聚焦失败兜底：交回分类列，保证遥控仍可用
-        runCatching { categoryFocusRequester.requestFocus() }
     }
 
     AnimatedVisibility(
@@ -245,166 +256,207 @@ fun SidePanel(
                     )
             )
 
-            Row(
+            Column(
                 modifier = Modifier
                     .fillMaxHeight()
-                    .padding(16.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    .padding(16.dp)
             ) {
-                // 第一列：源列表
-                LaunchedEffect(isVisible, data.selectedSourceIndex) {
-                    if (isVisible && data.sources.isNotEmpty()) {
-                        sourceListState.scrollCenteredTo(
-                            index = data.selectedSourceIndex.coerceIn(0, data.sources.lastIndex)
-                        )
-                    }
-                }
-                PanelColumn(
-                    title = "直播源",
-                    icon = Icons.Default.PlayArrow,
-                    modifier = Modifier.weight(0.85f)
-                ) {
-                    LazyColumn(
-                        state = sourceListState,
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                        contentPadding = PaddingValues(vertical = 4.dp)
-                    ) {
-                        items(data.sources) { source ->
-                            val index = data.sources.indexOf(source)
-                            PanelItem(
-                                text = source.name,
-                                isSelected = index == data.selectedSourceIndex,
-                                onClick = {
-                                    bumpActivity()
-                                    onSourceSelected(index)
-                                },
-                                onFocused = { bumpActivity() }
-                            )
+                // 面包屑：源 › 分类 › 频道（当前层高亮，可点击直接跳转层级）
+                Breadcrumb(
+                    level = level,
+                    onJump = { l ->
+                        if (!data.isSearchMode) {
+                            level = l
+                            bumpActivity()
                         }
                     }
-                }
+                )
 
-                // 第二列：类别列表（搜索/收藏固定置顶，普通分类滚动）
-                // 滚动定位：分类列现在使用完整 data.categories（含搜索/收藏），
-                // 可直接用 selectedCategoryIndex 在 LazyColumn 内定位。
-                LaunchedEffect(isVisible, data.selectedCategoryIndex) {
-                    if (isVisible && data.categories.isNotEmpty()) {
-                        categoryListState.scrollCenteredTo(data.selectedCategoryIndex)
-                    }
-                }
-                PanelColumn(
-                    title = "分类",
-                    icon = Icons.Default.Star,
-                    modifier = Modifier.weight(0.75f)
-                ) {
-                    if (data.isLoadingCategories && data.categories.isEmpty()) {
-                        Box(
-                            modifier = Modifier.fillMaxWidth().padding(top = 20.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            CircularProgressIndicator(
-                                strokeWidth = 2.5.dp,
-                                modifier = Modifier.size(28.dp),
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                    } else {
-                        // 所有分类项（搜索/收藏 + 普通分类）同处一个 LazyColumn，
-                        // 保证焦点链连续：遥控器上下键可从普通分类首项移到上方收藏/搜索项。
-                        LazyColumn(
-                            state = categoryListState,
-                            verticalArrangement = Arrangement.spacedBy(4.dp),
-                            contentPadding = PaddingValues(vertical = 4.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            itemsIndexed(items = data.categories) { index, category ->
-                                PanelItem(
-                                    focusRequester = if (category.isSearch) {
-                                        categoryFocusRequester
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // 单列表内容区：左右键在三层间平移切换（仅切换显示的列表，不提交高亮项），
+                // OK（clickable 触发）提交当前高亮项并下钻一层；频道层 OK = 切台并关闭。
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .onKeyEvent { event ->
+                            if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
+                            when (event.key) {
+                                Key.DirectionLeft -> {
+                                    if (data.isSearchMode) {
+                                        // 搜索模式下左键=退出搜索，回到分类层
+                                        onExitSearch()
                                     } else {
-                                        null
-                                    },
-                                    text = category.name,
-                                    isSelected = index == data.selectedCategoryIndex,
-                                    icon = when {
-                                        category.isSearch -> Icons.Default.Search
-                                        category.isFavorites -> Icons.Default.Star
-                                        else -> null
-                                    },
-                                    iconTint = MaterialTheme.colorScheme.secondary,
-                                    onClick = {
+                                        when (level) {
+                                            PanelLevel.CHANNEL -> level = PanelLevel.CATEGORY
+                                            PanelLevel.CATEGORY -> level = PanelLevel.SOURCE
+                                            PanelLevel.SOURCE -> {}
+                                        }
+                                    }
+                                    bumpActivity()
+                                    true
+                                }
+                                Key.DirectionRight -> {
+                                    if (!data.isSearchMode) {
+                                        when (level) {
+                                            PanelLevel.SOURCE -> level = PanelLevel.CATEGORY
+                                            PanelLevel.CATEGORY -> level = PanelLevel.CHANNEL
+                                            PanelLevel.CHANNEL -> {}
+                                        }
                                         bumpActivity()
-                                        onCategorySelected(index)
-                                    },
-                                    onFocused = { bumpActivity() }
-                                )
+                                    }
+                                    true
+                                }
+                                else -> false
                             }
                         }
-                    }
-                }
-
-                // 第三列：频道列表 / 搜索结果
-                if (data.isSearchMode) {
-                    // 搜索模式：顶部搜索框 + 结果列表
-                    SearchColumn(
-                        modifier = Modifier.weight(1f),
-                        query = data.searchQuery,
-                        results = data.searchResults,
-                        selectedIndex = data.selectedChannelIndex,
-                        listState = channelListState,
-                        focusRequester = channelFocusRequester,
-                        onQueryChange = {
-                            bumpActivity()
-                            onSearchQueryChange(it)
-                        },
-                        onChannelSelected = { ch ->
-                            bumpActivity()
-                            onChannelSelected(ch)
-                        }
-                    )
-                } else {
-                    PanelColumn(
-                        title = "频道",
-                        icon = Icons.Default.PlayArrow,
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        if (data.isLoadingChannels && data.channels.isEmpty()) {
-                            Box(
+                ) {
+                    when {
+                        data.isSearchMode -> {
+                            SearchColumn(
                                 modifier = Modifier.fillMaxSize(),
-                                contentAlignment = Alignment.Center
+                                query = data.searchQuery,
+                                results = data.searchResults,
+                                selectedIndex = data.selectedChannelIndex,
+                                listState = channelListState,
+                                focusRequester = channelFocusRequester,
+                                onQueryChange = {
+                                    bumpActivity()
+                                    onSearchQueryChange(it)
+                                },
+                                onChannelSelected = { ch ->
+                                    bumpActivity()
+                                    onChannelSelected(ch)
+                                }
+                            )
+                        }
+                        level == PanelLevel.SOURCE -> {
+                            PanelColumn(
+                                title = "直播源",
+                                icon = Icons.Default.PlayArrow,
+                                modifier = Modifier.fillMaxSize()
                             ) {
-                                CircularProgressIndicator(
-                                    strokeWidth = 3.dp,
-                                    modifier = Modifier.size(36.dp),
-                                    color = MaterialTheme.colorScheme.primary
-                                )
+                                if (data.sources.isEmpty()) {
+                                    EmptyHint("无直播源")
+                                } else {
+                                    LazyColumn(
+                                        state = sourceListState,
+                                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                                        contentPadding = PaddingValues(vertical = 4.dp)
+                                    ) {
+                                        items(data.sources) { source ->
+                                            val index = data.sources.indexOf(source)
+                                            PanelItem(
+                                                focusRequester = if (index == data.selectedSourceIndex) {
+                                                    sourceFocusRequester
+                                                } else {
+                                                    null
+                                                },
+                                                text = source.name,
+                                                isSelected = index == data.selectedSourceIndex,
+                                                onClick = {
+                                                    bumpActivity()
+                                                    onSourceSelected(index)
+                                                    level = PanelLevel.CATEGORY
+                                                },
+                                                onFocused = { bumpActivity() }
+                                            )
+                                        }
+                                    }
+                                }
                             }
-                        } else {
-                            LazyColumn(
-                                state = channelListState,
-                                verticalArrangement = Arrangement.spacedBy(4.dp),
-                                contentPadding = PaddingValues(vertical = 4.dp)
+                        }
+                        level == PanelLevel.CATEGORY -> {
+                            PanelColumn(
+                                title = "分类",
+                                icon = Icons.Default.Star,
+                                modifier = Modifier.fillMaxSize()
                             ) {
-                                itemsIndexed(data.channels) { index, channel ->
-                                    PanelItem(
-                                        // 焦点入口挂在当前播放的频道项上：面板打开即聚焦到它
-                                        focusRequester = if (index == data.selectedChannelIndex) {
-                                            channelFocusRequester
-                                        } else {
-                                            null
-                                        },
-                                        text = channel.name,
-                                        isSelected = index == data.selectedChannelIndex,
-                                        icon = if (channel.isFavorite) Icons.Default.Star else null,
-                                        iconTint = MaterialTheme.colorScheme.secondary,
-                                        countryText = CountryLangMapper.countryCn(channel.countryAttr),
-                                        langText = CountryLangMapper.langsCn(channel.langs),
-                                        onClick = {
-                                            bumpActivity()
-                                            onChannelSelected(channel)
-                                        },
-                                        onFocused = { bumpActivity() }
-                                    )
+                                if (data.isLoadingCategories && data.categories.isEmpty()) {
+                                    LoadingSpinner()
+                                } else if (data.categories.isEmpty()) {
+                                    EmptyHint("无分类")
+                                } else {
+                                    LazyColumn(
+                                        state = categoryListState,
+                                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                                        contentPadding = PaddingValues(vertical = 4.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        itemsIndexed(items = data.categories) { index, category ->
+                                            PanelItem(
+                                                focusRequester = if (index == data.selectedCategoryIndex) {
+                                                    categoryFocusRequester
+                                                } else {
+                                                    null
+                                                },
+                                                text = category.name,
+                                                isSelected = index == data.selectedCategoryIndex,
+                                                icon = when {
+                                                    category.isSearch -> Icons.Default.Search
+                                                    category.isFavorites -> Icons.Default.Star
+                                                    else -> null
+                                                },
+                                                iconTint = MaterialTheme.colorScheme.secondary,
+                                                onClick = {
+                                                    bumpActivity()
+                                                    onCategorySelected(index)
+                                                    level = PanelLevel.CHANNEL
+                                                },
+                                                onFocused = { bumpActivity() }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        else -> {
+                            PanelColumn(
+                                title = "频道",
+                                icon = Icons.Default.PlayArrow,
+                                modifier = Modifier.fillMaxSize()
+                            ) {
+                                if (data.isLoadingChannels && data.channels.isEmpty()) {
+                                    Box(
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        CircularProgressIndicator(
+                                            strokeWidth = 3.dp,
+                                            modifier = Modifier.size(36.dp),
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                } else if (data.channels.isEmpty()) {
+                                    EmptyHint("无频道")
+                                } else {
+                                    LazyColumn(
+                                        state = channelListState,
+                                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                                        contentPadding = PaddingValues(vertical = 4.dp)
+                                    ) {
+                                        itemsIndexed(data.channels) { index, channel ->
+                                            PanelItem(
+                                                focusRequester = if (index == data.selectedChannelIndex) {
+                                                    channelFocusRequester
+                                                } else {
+                                                    null
+                                                },
+                                                text = channel.name,
+                                                isSelected = index == data.selectedChannelIndex,
+                                                icon = if (channel.isFavorite) Icons.Default.Star else null,
+                                                iconTint = MaterialTheme.colorScheme.secondary,
+                                                countryText = CountryLangMapper.countryCn(channel.countryAttr),
+                                                langText = CountryLangMapper.langsCn(channel.langs),
+                                                onClick = {
+                                                    bumpActivity()
+                                                    onChannelSelected(channel)
+                                                },
+                                                onFocused = { bumpActivity() }
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -450,6 +502,81 @@ private fun PanelColumn(
         Box(modifier = Modifier.fillMaxSize()) {
             content()
         }
+    }
+}
+
+@Composable
+private fun Breadcrumb(
+    level: PanelLevel,
+    onJump: (PanelLevel) -> Unit
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        BreadcrumbChip("源", level == PanelLevel.SOURCE) { onJump(PanelLevel.SOURCE) }
+        Text(
+            text = "›",
+            fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        BreadcrumbChip("分类", level == PanelLevel.CATEGORY) { onJump(PanelLevel.CATEGORY) }
+        Text(
+            text = "›",
+            fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        BreadcrumbChip("频道", level == PanelLevel.CHANNEL) { onJump(PanelLevel.CHANNEL) }
+    }
+}
+
+@Composable
+private fun BreadcrumbChip(
+    text: String,
+    active: Boolean,
+    onClick: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(6.dp),
+        color = if (active) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+        contentColor = if (active) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.clickable(onClick = onClick)
+    ) {
+        Text(
+            text = text,
+            fontSize = 13.sp,
+            fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+        )
+    }
+}
+
+@Composable
+private fun LoadingSpinner() {
+    Box(
+        modifier = Modifier.fillMaxWidth().padding(top = 20.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        CircularProgressIndicator(
+            strokeWidth = 2.5.dp,
+            modifier = Modifier.size(28.dp),
+            color = MaterialTheme.colorScheme.primary
+        )
+    }
+}
+
+@Composable
+private fun EmptyHint(text: String) {
+    Box(
+        modifier = Modifier.fillMaxWidth().padding(top = 20.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = text,
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+        )
     }
 }
 
@@ -630,8 +757,24 @@ private fun SearchColumn(
     // 用于强制弹出系统软键盘（TV 端部分设备不会因聚焦自动弹键盘）
     val searchView = LocalView.current
     val imm = searchView.context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+    // Compose 推荐的软键盘控制：内部会正确关联当前焦点节点，比 imm.showSoftInput(view) 更可靠
+    val keyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     // 输入激活标记：进入搜索默认只聚焦输入框（高亮），用户按 OK/确认 后才弹软键盘
     var keyboardActivated by remember { mutableStateOf(false) }
+    // 设备是否存在已启用的输入法：多数 TV 没有输入法，此时由应用自行把硬件按键
+    // 转成编辑操作，保证任何设备都能输入（见 handleHardwareKey）
+    val hasIme = remember { imm.enabledInputMethodList.isNotEmpty() }
+    // 用 TextFieldValue 维护文本与光标位置：无输入法时也能显示光标并可编辑
+    var fieldValue by remember { mutableStateOf(TextFieldValue(query)) }
+    // 输入框是否「真正」拿到了焦点（由 onFocusChanged 更新）。
+    // 关键：requestFocus() 未生效时也不会抛异常，所以绝不能用 isSuccess 判断成功，
+    // 必须以这里记录的真实焦点状态作为重试依据。
+    var focusConfirmed by remember { mutableStateOf(false) }
+    val focusConfirmedRef by rememberUpdatedState(focusConfirmed)
+    // 外部 query 变化（如清空搜索）时同步回输入框
+    LaunchedEffect(query) {
+        if (query != fieldValue.text) fieldValue = fieldValue.copy(text = query)
+    }
 
     Column(
         modifier = modifier
@@ -660,6 +803,11 @@ private fun SearchColumn(
         }
 
         // 搜索输入框
+        // 用 BasicTextField（与登录页 InputField 同款）。关键原因：
+        // Material3 TextField 的 modifier 加在「外层装饰容器」上，真正持有焦点的是内层 BasicTextField，
+        // 导致 focusRequester / onKeyEvent / onFocusChanged 全部落在外层而失效
+        // （表现为聚焦失败、按键收不到、无法输入）。BasicTextField 的 modifier 与焦点目标同一节点，
+        // 请求焦点与按键处理都能生效，且支持 cursorBrush（TextField 不支持该参数）。
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -667,62 +815,81 @@ private fun SearchColumn(
             shape = RoundedCornerShape(8.dp),
             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
         ) {
-            TextField(
-                value = query,
-                onValueChange = onQueryChange,
+            // 关键：这里绝不能用 decorationBox！
+            // 带 decorationBox 时，真正的焦点目标 innerTextField() 在「内层」，
+            // 而 modifier（focusRequester / onKeyEvent / onFocusChanged）挂在「外层」，
+            // 结果：请求焦点落空、按键收不到（登录页 InputField 正是没用 decorationBox 才正常）。
+            // 因此改为外层 Row 放图标，placeholder 用下层的 Text 叠加实现（不拦截点击）。
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .onKeyEvent { event ->
-                        // 未激活输入时，按 OK/确认 键先弹出软键盘（聚焦→确认→弹键盘的 TV 交互）
-                        if (event.type == KeyEventType.KeyDown &&
-                            (event.key == Key.Enter || event.key == Key.DirectionCenter) &&
-                            !keyboardActivated
-                        ) {
-                            keyboardActivated = true
-                            searchView.post {
-                                imm.showSoftInput(searchView, InputMethodManager.SHOW_IMPLICIT)
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    .focusRequester(searchFieldFocus)
-                    .onFocusChanged {
-                        // 仅当用户已按 OK 确认（激活输入）后才弹键盘；进入搜索默认只高亮输入框、不弹键盘
-                        if (it.isFocused && keyboardActivated) {
-                            searchView.post {
-                                imm.showSoftInput(searchView, InputMethodManager.SHOW_IMPLICIT)
-                            }
-                        }
-                    },
-                placeholder = {
-                    Text(
-                        text = "按 OK 键输入频道名…",
-                        fontSize = 13.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-                    )
-                },
-                leadingIcon = {
-                    Icon(
-                        imageVector = Icons.Default.Search,
-                        contentDescription = null,
-                        modifier = Modifier.width(18.dp).height(18.dp)
-                    )
-                },
-                singleLine = true,
-                textStyle = androidx.compose.ui.text.TextStyle(
-                    fontSize = 14.sp,
-                    color = MaterialTheme.colorScheme.onSurface
-                ),
-                colors = TextFieldDefaults.colors(
-                    focusedContainerColor = androidx.compose.ui.graphics.Color.Transparent,
-                    unfocusedContainerColor = androidx.compose.ui.graphics.Color.Transparent,
-                    disabledContainerColor = androidx.compose.ui.graphics.Color.Transparent,
-                    focusedIndicatorColor = MaterialTheme.colorScheme.primary,
-                    unfocusedIndicatorColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f)
+                    .height(44.dp)
+                    .padding(horizontal = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Search,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-            )
+                Spacer(modifier = Modifier.width(8.dp))
+                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                    // placeholder 先声明 → 位于下层，不会拦截点击（BasicTextField 在上层）
+                    if (fieldValue.text.isEmpty()) {
+                        Text(
+                            text = "输入频道名…",
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                            modifier = Modifier.align(Alignment.CenterStart)
+                        )
+                    }
+                    BasicTextField(
+                        value = fieldValue,
+                        onValueChange = { newValue ->
+                            fieldValue = newValue
+                            onQueryChange(newValue.text)
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .align(Alignment.CenterStart)
+                            .onKeyEvent { event ->
+                                if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
+                                Log.d("SidePanel", "搜索框收到按键 key=${event.key} code=${event.nativeKeyEvent.keyCode}")
+                                // 按 OK/确认 键拉起软键盘（有输入法时）
+                                if ((event.key == Key.Enter || event.key == Key.DirectionCenter) && !keyboardActivated) {
+                                    keyboardActivated = true
+                                    keyboardController?.show()
+                                    return@onKeyEvent true
+                                }
+                                // 兜底：把硬件按键直接转成编辑操作，保证任何设备 / 任何 IME 状态下都能键入。
+                                // 若 IME 已接管输入，按键会被 IME 消费、不会到达这里，因此不会重复输入；
+                                // 而无输入法、或虽有输入法但未激活（模拟器接了物理键盘时系统默认不弹软键盘）时，
+                                // 由这里兜底保证可以输入。
+                                return@onKeyEvent handleHardwareKey(event, fieldValue) { newValue ->
+                                    fieldValue = newValue
+                                    onQueryChange(newValue.text)
+                                }
+                            }
+                            .focusRequester(searchFieldFocus)
+                            .onFocusChanged {
+                                focusConfirmed = it.isFocused
+                                Log.d("SidePanel", "搜索框焦点变化 isFocused=${it.isFocused} activated=$keyboardActivated")
+                                // 仅当用户已按 OK 确认（激活输入）后才弹键盘；进入搜索默认只高亮输入框、不弹键盘
+                                if (it.isFocused && keyboardActivated) {
+                                    keyboardController?.show()
+                                }
+                            },
+                        singleLine = true,
+                        textStyle = androidx.compose.ui.text.TextStyle(
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.onSurface
+                        ),
+                        // 显式光标颜色：保证聚焦时任何设备上都能看到输入光标
+                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary)
+                    )
+                }
+            }
         }
 
         // 结果列表
@@ -775,15 +942,25 @@ private fun SearchColumn(
         }
     }
 
-    // 进入搜索模式时聚焦搜索框（仅高亮，不弹键盘）。
+    // 进入搜索模式时聚焦搜索框。
     // 带重试：搜索列位于 AnimatedVisibility 滑入动画中，首次 requestFocus 常因视图尚未布局完成而失败
-    // （runCatching 会静默吞掉），失败后焦点没落在输入框、无法响应 OK 弹键盘。
-    // 与频道列焦点逻辑一致，重试多次直到成功；真正的软键盘由用户按 OK 确认后弹出。
+    // （runCatching 会静默吞掉），失败后焦点没落在输入框。
     LaunchedEffect(Unit) {
         keyboardActivated = false
-        for (i in 0 until 10) {
-            delay(80)
-            if (runCatching { searchFieldFocus.requestFocus() }.isSuccess) break
+        var lastError: String? = null
+        for (i in 0 until 20) {
+            delay(if (i == 0) 200 else 100)
+            if (focusConfirmedRef) break
+            runCatching { searchFieldFocus.requestFocus() }
+                .onFailure { lastError = "${it.javaClass.simpleName}: ${it.message}" }
+        }
+        Log.d("SidePanel", "搜索框聚焦结果 已确认焦点=$focusConfirmedRef 输入法可用=$hasIme 错误=$lastError")
+        // 聚焦后主动拉起输入法：原设计需用户先按 OK 确认才弹键盘，交互不直观、易被认为"无法输入"。
+        // 设备有输入法时直接拉起，进入搜索即可键入；无输入法则 keyboardController?.show() 静默失败，保持原行为。
+        if (focusConfirmedRef && hasIme) {
+            delay(200)
+            keyboardActivated = true
+            keyboardController?.show()
         }
     }
 
@@ -794,4 +971,70 @@ private fun SearchColumn(
             listState.scrollCenteredTo(idx)
         }
     }
+}
+
+/**
+ * 无输入法兜底：把硬件按键直接转成文本编辑操作（插入/删除/移动光标）。
+ *
+ * Android 的文本输入必须经过 IME，设备没有输入法时任何 TextField 都收不到字符，
+ * 这里自行处理按键，保证搜索框在任意设备上都能输入。
+ *
+ * @return 是否消费该按键事件
+ */
+private fun handleHardwareKey(
+    event: androidx.compose.ui.input.key.KeyEvent,
+    value: TextFieldValue,
+    onValueChange: (TextFieldValue) -> Unit
+): Boolean {
+    val start = value.selection.start.coerceIn(0, value.text.length)
+    val end = value.selection.end.coerceIn(start, value.text.length)
+    when (event.key) {
+        Key.Backspace -> {
+            when {
+                start != end -> {
+                    val newText = value.text.removeRange(start, end)
+                    onValueChange(TextFieldValue(newText, TextRange(start)))
+                }
+                start > 0 -> {
+                    val newText = value.text.removeRange(start - 1, start)
+                    onValueChange(TextFieldValue(newText, TextRange(start - 1)))
+                }
+            }
+            return true
+        }
+        Key.Delete -> {
+            when {
+                start != end -> {
+                    val newText = value.text.removeRange(start, end)
+                    onValueChange(TextFieldValue(newText, TextRange(start)))
+                }
+                end < value.text.length -> {
+                    val newText = value.text.removeRange(end, end + 1)
+                    onValueChange(TextFieldValue(newText, TextRange(start)))
+                }
+            }
+            return true
+        }
+        Key.DirectionLeft -> {
+            onValueChange(value.copy(selection = TextRange((start - 1).coerceAtLeast(0))))
+            return true
+        }
+        Key.DirectionRight -> {
+            onValueChange(value.copy(selection = TextRange((end + 1).coerceAtMost(value.text.length))))
+            return true
+        }
+        else -> {
+            val ch = event.nativeKeyEvent.getUnicodeChar(event.nativeKeyEvent.metaState)
+            Log.d("SidePanel", "兜底处理按键 key=${event.key} unicode=$ch")
+            if (ch > 0) {
+                val c = ch.toChar()
+                if (!c.isISOControl()) {
+                    val newText = value.text.substring(0, start) + c + value.text.substring(end)
+                    onValueChange(TextFieldValue(newText, TextRange(start + 1)))
+                    return true
+                }
+            }
+        }
+    }
+    return false
 }

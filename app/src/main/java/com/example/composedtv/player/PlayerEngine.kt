@@ -117,6 +117,12 @@ class PlayerEngine(private val context: Context) {
         private const val AV_SYNC_DROP_THRESHOLD = 25          // 窗口内掉帧数 ≥ 该值判定音画漂移
         private const val AV_SYNC_COOLDOWN_MS = 8_000L         // 两次自动恢复最小间隔(ms)
         private const val AV_SYNC_MAX_AUTO = 2                 // 单频道自动恢复上限（第2次起临时降分辨率）
+        // 起播/重载后热身窗口：解码器爬坡期掉帧属正常，期间不判定音画漂移，避免误触发重载
+        private const val AV_SYNC_WARMUP_MS = 6_000L
+        // 直播滑窗(BLW)恢复节流 / 升级参数
+        private const val BLW_THROTTLE_MS = 3_000L             // 两次重建解码器最小间隔，避免高频重建
+        private const val BLW_WINDOW_MS = 30_000L              // 滑窗计数窗口
+        private const val BLW_MAX_PER_WINDOW = 4               // 窗口内超过该次数 → 升级降码率 / 停自动恢复
 
         // 判定为"国内"的渠道：完全不走代理（CN=中国, SK=韩国, MO/MACAU/澳门）
         private val DOMESTIC_COUNTRIES = setOf("CN", "SK", "MO", "MACAU", "澳门")
@@ -263,6 +269,8 @@ class PlayerEngine(private val context: Context) {
     var smoothPriority = DEFAULT_SMOOTH_PRIORITY
     /** 音画同步自动恢复：持续掉帧判定为音视频漂移时自动重载当前频道重新同步 */
     var autoAvSync = DEFAULT_AUTO_AV_SYNC
+    /** 右键重载顺序：本次是否优先代理（每次重载 toggle，方便排查"哪条路径能播"） */
+    private var manualReloadProxyFirst = false
 
     /** 由 PlayerScreen 注入的共享视频 Surface（PlayerView 的 videoSurface）。
      *  串行切换尝试时复用同一 Surface，避免 Surface 重建导致老电视"有声音没画面" */
@@ -294,7 +302,7 @@ class PlayerEngine(private val context: Context) {
         return headers
     }
 
-    private fun playCurrent(ignoreLastMode: Boolean = false) {
+    private fun playCurrent(ignoreLastMode: Boolean = false, proxyFirst: Boolean = false) {
         if (playlist.isEmpty()) return
         val item = playlist[currentIndex.coerceIn(0, playlist.lastIndex)]
         // 进入新一轮起播：清除重载荷载锁，允许后续（若仍卡死）再次兜底重载
@@ -333,7 +341,7 @@ class PlayerEngine(private val context: Context) {
             // 重载同一频道：只更新加载态，不动信息条显隐
             updateState(isLoading = true, error = null)
         }
-        playUrl(item.url, item.country, ignoreLastMode = ignoreLastMode)
+        playUrl(item.url, item.country, ignoreLastMode = ignoreLastMode, proxyFirst = proxyFirst)
     }
 
     fun playNext() {
@@ -405,13 +413,22 @@ class PlayerEngine(private val context: Context) {
             showHint("暂无频道可重载")
             return
         }
-        Log.d(TAG, "手动重载当前频道: $currentPlayingUrl")
-        showHint("正在重载：${playlist[currentIndex].name}")
+        // 每次右键重载 toggle 直连/代理优先顺序，方便排查"哪条路径能播"。
+        // 首次按为直连优先（与默认一致），再次按切到代理优先，如此交替。
+        val proxyFirst = manualReloadProxyFirst
+        manualReloadProxyFirst = !manualReloadProxyFirst
+        Log.d(TAG, "手动重载当前频道(代理优先=$proxyFirst): $currentPlayingUrl")
+        showHint(
+            "正在重载：${playlist[currentIndex].name}（${if (proxyFirst) "代理优先" else "直连优先"}）"
+        )
         // 手动重载视为用户主动介入：清零自动恢复计数，使其重新拥有自动自愈机会
         avSyncAutoCount = 0
         forceSmoothThisReload = false
         avSyncCooldownUntil = 0
-        reloadCurrentChannel(reason = "manual", ignoreLastMode = true)
+        // 清空直播滑窗升级/节流状态，给用户一个干净的重新起播机会
+        blwEscalated = false
+        blwRecoverCount = 0
+        reloadCurrentChannel(reason = "manual", ignoreLastMode = true, proxyFirst = proxyFirst)
     }
 
     fun toggleFavorite() {
@@ -522,19 +539,27 @@ class PlayerEngine(private val context: Context) {
         url: String,
         country: String = "",
         forceProxy: Boolean = false,
-        ignoreLastMode: Boolean = false
+        ignoreLastMode: Boolean = false,
+        proxyFirst: Boolean = false
     ) {
         if (url.isBlank()) {
             handlePlayFailure()
             return
         }
         currentPlayingUrl = url
-        // 手动重载时忽略"记忆上次成功模式"，强制按 planPlay 原序（直连→代理）完整串行，
-        // 避免上次代理胜出后重载直接跳到代理、漏掉直连这一遍。
-        val attempts = if (forceProxy) listOf("proxy")
-        else if (ignoreLastMode) planPlay(url, country)
-        else reorderByLastMode(url, planPlay(url, country))
-        Log.d(TAG, "planPlay($url) -> $attempts country=$country forceProxy=$forceProxy ignoreLastMode=$ignoreLastMode")
+        // 手动重载时若指定代理优先：把 proxy 提到队首（国内频道仍完全不走代理，保持直连）；
+        // 否则按原逻辑（直连→代理，或记忆上次成功模式）。
+        val attempts = if (forceProxy) {
+            listOf("proxy")
+        } else if (proxyFirst) {
+            val base = planPlay(url, country)
+            if (base == listOf("direct")) base else listOf("proxy") + base
+        } else if (ignoreLastMode) {
+            planPlay(url, country)
+        } else {
+            reorderByLastMode(url, planPlay(url, country))
+        }
+        Log.d(TAG, "planPlay($url) -> $attempts country=$country forceProxy=$forceProxy ignoreLastMode=$ignoreLastMode proxyFirst=$proxyFirst")
         startRace(url, attempts)
     }
 
@@ -829,6 +854,13 @@ class PlayerEngine(private val context: Context) {
     private var avSyncAutoCount = 0
     /** 自动恢复二次触发时临时强制 720p，降低解码负载以真正跟住音画 */
     private var forceSmoothThisReload = false
+    // 起播/重载后热身截止时间(ms)：热身期内忽略掉帧，避免解码器爬坡误判音画漂移
+    private var avSyncWarmupUntil = 0L
+    // 直播滑窗(BLW)恢复节流状态
+    private var lastBehindLiveRecoverMs = 0L
+    private var blwRecoverCount = 0
+    private var blwRecoverWindowStart = 0L
+    private var blwEscalated = false                           // 本频道是否已升级到降码率重载
 
     /** 新频道起播：复位音画同步检测计数（避免上一频道的漂移计数污染新频道） */
     private fun resetAvSyncForNewChannel() {
@@ -839,19 +871,27 @@ class PlayerEngine(private val context: Context) {
         avSyncCooldownUntil = 0L
         avSyncAutoCount = 0
         forceSmoothThisReload = false
+        // 重置热身与直播滑窗节流状态（避免上一频道的漂移/重连计数污染新频道）
+        avSyncWarmupUntil = 0L
+        lastBehindLiveRecoverMs = 0L
+        blwRecoverCount = 0
+        blwRecoverWindowStart = 0L
+        blwEscalated = false
     }
 
     /**
      * 音画同步看门狗：正常播放期间周期性采样视频掉帧计数。
      * 若 2s 窗口内持续掉帧 ≥ 阈值，说明视频解码跟不上音频（典型音画漂移），
      * 则自动重载当前频道以重新建立音视频同步（最多 [AV_SYNC_MAX_AUTO] 次，
-     * 第 2 次起临时降到 720p 降低解码负载）。
+     * 首次即临时降到 720p 降低解码负载；多档源才能真正跟住，单档源降码率无效时停止自动恢复）。
      */
     private fun startAvSyncWatcher(exo: ExoPlayer) {
         stopAvSyncWatcher()
         avSyncPrimed = false
         avSyncLastDropped = exo.videoDecoderCounters?.droppedBufferCount ?: 0
         avSyncLastCheck = System.currentTimeMillis()
+        // 起播/重载后的热身窗口：解码器爬坡期会大量掉帧，属正常，期间不判定漂移
+        avSyncWarmupUntil = System.currentTimeMillis() + AV_SYNC_WARMUP_MS
         avSyncJob = scope.launch {
             while (true) {
                 delay(AV_SYNC_CHECK_MS)
@@ -861,6 +901,12 @@ class PlayerEngine(private val context: Context) {
                 if (p.playbackState != Player.STATE_READY || p.isLoading) continue
                 val dropped = p.videoDecoderCounters?.droppedBufferCount ?: avSyncLastDropped
                 val now = System.currentTimeMillis()
+                // 热身窗口内：仅更新基线，不判定（避免解码器爬坡掉帧误触发重载）
+                if (now < avSyncWarmupUntil) {
+                    avSyncLastDropped = dropped
+                    avSyncLastCheck = now
+                    continue
+                }
                 if (!avSyncPrimed) {                                // 首个 READY 采样仅作基线
                     avSyncLastDropped = dropped
                     avSyncLastCheck = now
@@ -885,16 +931,78 @@ class PlayerEngine(private val context: Context) {
         avSyncJob = null
     }
 
+    /**
+     * 音画同步自动恢复：检测到漂移后降级重载当前频道。
+     * 优化点（P0 防"频繁解码器重启"）：
+     * - 第 1 次漂移即强制降码率重载（降分辨率才是真正解药，避免"同分辨率重载→仍卡→再重载"的空转）；
+     * - 已降到 720p 仍漂移（弱机/单档源）：停止自动恢复并提示用户手动处理，不再反复重建解码器。
+     */
     private fun triggerAvSyncRecover() {
         val now = System.currentTimeMillis()
         if (isReloading || now < avSyncCooldownUntil || avSyncAutoCount >= AV_SYNC_MAX_AUTO) return
         avSyncCooldownUntil = now + AV_SYNC_COOLDOWN_MS
         avSyncAutoCount++
+        // 首次漂移直接强制降码率重载：多档源降到 720p 真正缓解，单档源无效则第 2 次停止
+        forceSmoothThisReload = true
         if (avSyncAutoCount >= AV_SYNC_MAX_AUTO) {
-            forceSmoothThisReload = true                           // 持续吃力：临时降到 720p
+            // 已尝试降码率仍漂移：停止自动恢复，避免无限重建解码器，交用户手动处理
+            Log.w(TAG, "音画同步自动恢复已达上限(${AV_SYNC_MAX_AUTO})，停止自动重载，请手动处理")
+            showHint("已降码率仍卡顿，请按右键手动重载")
+            return
         }
-        Log.w(TAG, "音画同步自动恢复[${avSyncAutoCount}/$AV_SYNC_MAX_AUTO] 重载当前频道")
+        Log.w(TAG, "音画同步自动恢复[${avSyncAutoCount}/$AV_SYNC_MAX_AUTO] 降码率重载当前频道")
         reloadCurrentChannel(reason = "av-sync-drift")
+    }
+
+    /**
+     * 直播滑窗(BLW)恢复：弱网下播放位置滑出直播窗口时 ExoPlayer 抛 BehindLiveWindowException。
+     * 朴素地"每次都重建解码器"会在弱网高清频道形成死循环（落后→重建→重缓冲→再落后→再重建），
+     * 表现为"频繁解码器重启 + 1~2s 频繁缓冲"。这里加入节流与升级：
+     * - [BLW_THROTTLE_MS] 内不重复重建解码器（让其自然追赶/缓冲）；
+     * - [BLW_WINDOW_MS] 窗口内超过 [BLW_MAX_PER_WINDOW] 次 → 判定带宽不足，强制降码率重载；
+     * - 已降过码率仍反复 → 彻底停止自动恢复，避免无限重建，交用户手动处理。
+     */
+    private fun recoverBehindLiveWindow(exo: ExoPlayer, attempt: String) {
+        val now = System.currentTimeMillis()
+        // 节流：距上次重建不足阈值，先跳过本次，避免高频重建解码器
+        if (now - lastBehindLiveRecoverMs < BLW_THROTTLE_MS) {
+            Log.d(TAG, "BehindLiveWindow 重建节流中(${now - lastBehindLiveRecoverMs}ms)，本次跳过")
+            return
+        }
+        lastBehindLiveRecoverMs = now
+        // 滑动窗口计数：超出窗口则重置
+        if (now - blwRecoverWindowStart > BLW_WINDOW_MS) {
+            blwRecoverWindowStart = now
+            blwRecoverCount = 0
+        }
+        blwRecoverCount++
+        if (blwRecoverCount >= BLW_MAX_PER_WINDOW) {
+            if (!blwEscalated) {
+                // 首次升级：强制降码率重载（多档源降到 720p，根因是带宽不足）
+                blwEscalated = true
+                Log.w(TAG, "BehindLiveWindow 反复触发(${blwRecoverCount}次/窗口)，升级为降码率重载")
+                forceSmoothThisReload = true
+                reloadCurrentChannel(reason = "blw-escalate")
+            } else {
+                // 已降过码率仍反复：停止自动恢复，避免无限重建解码器，交用户手动处理
+                Log.w(TAG, "BehindLiveWindow 升级降码率后仍反复，停止自动恢复: $currentPlayingUrl")
+                showHint("直播流频繁重连，已停止自动恢复，请按右键重载或换源")
+            }
+            return
+        }
+        // 常规轻量恢复：同一 ExoPlayer 内重建 MediaItem 并重 prepare（追直播边缘），不新建解码器实例
+        Log.w(TAG, "直播滑窗补偿(${blwRecoverCount}/${BLW_MAX_PER_WINDOW}): $currentPlayingUrl")
+        exo.stop()
+        exo.clearMediaItems()
+        val finalUrl = if (attempt == "proxy") ApiClient.hlsProxyUrl(currentPlayingUrl) else currentPlayingUrl
+        val builder = MediaItem.Builder().setUri(finalUrl).setMimeType(MimeTypes.APPLICATION_M3U8)
+        builder.setLiveConfiguration(
+            MediaItem.LiveConfiguration.Builder()
+                .setTargetOffsetMs(30_000L).setMinOffsetMs(10_000L).setMaxOffsetMs(60_000L).build()
+        )
+        exo.setMediaItem(builder.build())
+        exo.prepare()
+        exo.playWhenReady = true
     }
 
     /**
@@ -920,19 +1028,9 @@ class PlayerEngine(private val context: Context) {
             override fun onPlayerError(error: PlaybackException) {
                 val cause = error.cause
                 if (cause is androidx.media3.exoplayer.source.BehindLiveWindowException) {
-                    // 直播滑出窗口：自动重新 seek 恢复，避免黑屏（非卡顿重载，属直播正常补偿）
+                    // 直播滑出窗口：自动恢复（带节流/升级，避免弱网高清频道"频繁解码器重启"死循环）
                     Log.w(TAG, "播放期 BehindLiveWindow，auto-recover: $currentPlayingUrl")
-                    exo.stop()
-                    exo.clearMediaItems()
-                    val finalUrl = if (attempt == "proxy") ApiClient.hlsProxyUrl(currentPlayingUrl) else currentPlayingUrl
-                    val builder = MediaItem.Builder().setUri(finalUrl).setMimeType(MimeTypes.APPLICATION_M3U8)
-                    builder.setLiveConfiguration(
-                        MediaItem.LiveConfiguration.Builder()
-                            .setTargetOffsetMs(30_000L).setMinOffsetMs(10_000L).setMaxOffsetMs(60_000L).build()
-                    )
-                    exo.setMediaItem(builder.build())
-                    exo.prepare()
-                    exo.playWhenReady = true
+                    recoverBehindLiveWindow(exo, attempt)
                     return
                 }
                 Log.e(TAG, "播放期 onPlayerError: ${error.errorCodeName} url=$currentPlayingUrl", error)
@@ -948,7 +1046,7 @@ class PlayerEngine(private val context: Context) {
      * 对于点播内容（非直播），保存当前播放位置，重载后 seekTo 恢复进度。
      * 与 handlePlayFailure 不同：不增加 consecutiveErrors、不跳下一台。
      */
-    private fun reloadCurrentChannel(reason: String, ignoreLastMode: Boolean = false) {
+    private fun reloadCurrentChannel(reason: String, ignoreLastMode: Boolean = false, proxyFirst: Boolean = false) {
         if (playlist.isEmpty()) return
         // 重载荷载锁：若已在 reload 流程中（竞速 watchdog / 播放期兜底可能同时触发），直接忽略，
         // 避免同一频道被并发多次 reload（表现为反复重新加载、台名反复闪烁）
@@ -969,7 +1067,7 @@ class PlayerEngine(private val context: Context) {
         }
         Log.d(TAG, "reloadCurrentChannel(reason=$reason) idx=$currentIndex url=$currentPlayingUrl isLive=$isLiveStream")
         DebugDiagnostics.onReload(reason)
-        playCurrent(ignoreLastMode = ignoreLastMode)
+        playCurrent(ignoreLastMode = ignoreLastMode, proxyFirst = proxyFirst)
     }
 
     private fun resetRace() {
