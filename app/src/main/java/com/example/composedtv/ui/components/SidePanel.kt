@@ -77,6 +77,9 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.foundation.text.rememberTextMeasurer
 import com.example.composedtv.viewmodel.CategoryEntry
 import com.example.composedtv.viewmodel.ChannelEntry
 import com.example.composedtv.viewmodel.SidePanelData
@@ -119,6 +122,23 @@ fun SidePanel(
     val sourceListState = rememberLazyListState()
     val categoryListState = rememberLazyListState()
     val channelListState = rememberLazyListState()
+
+    // 节目栏宽度自适应「当前列表最宽项」：测量源/分类/频道三列表中最长名字的像素宽度，
+    // 加上内/外边距与图标占位后作为面板宽度，并夹在 [220dp, 480dp] 之间，避免切层时宽度跳动。
+    val density = LocalDensity.current
+    val textMeasurer = rememberTextMeasurer()
+    val panelWidth = remember(data.sources, data.categories, data.channels) {
+        val style = TextStyle(fontSize = 13.sp)
+        val names = data.sources.map { it.name } +
+            data.categories.map { it.name } +
+            data.channels.map { it.name }
+        val maxPx = names.maxOfOrNull { name ->
+            if (name.isBlank()) 0 else textMeasurer.measure(name, style).size.width
+        } ?: 0
+        val contentDp = with(density) { maxPx.toDp() }
+        // 32dp 面板外边距 + 24dp 列表项内边距 + 22dp 图标占位(14+6) 的冗余
+        (contentDp + 78.dp).coerceIn(220.dp, 480.dp)
+    }
 
     // ===== 无操作超时自动隐藏 =====
     // 记录「最后一次用户活动」时间戳；每次点击/焦点/选中/滚动时 bump 一下；
@@ -219,11 +239,11 @@ fun SidePanel(
         enter = slideInHorizontally(initialOffsetX = { -it }) + fadeIn(),
         exit = slideOutHorizontally(targetOffsetX = { -it }) + fadeOut()
     ) {
-        // 外层：圆角 + 边框（玻璃边缘高光）
+        // 外层：圆角 + 边框（玻璃边缘高光）；宽度自适应频道名，见 panelWidth
         Box(
             modifier = Modifier
                 .fillMaxHeight()
-                .widthIn(min = 300.dp, max = 440.dp)
+                .width(panelWidth)
                 // 毛玻璃感：半透明深色底（alpha ~73%）+ 微白色高光边框 + 圆角
                 .background(
                     color = Color(0xBB1A1C23),
