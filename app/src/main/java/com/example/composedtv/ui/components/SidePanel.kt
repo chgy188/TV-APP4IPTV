@@ -41,6 +41,8 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -73,6 +75,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -621,18 +624,16 @@ private fun PanelItem(
         modifier = modifier
             .fillMaxWidth()
             .scale(scale)
-            // 单一焦点节点：clickable 自带焦点能力；此处仅用 focusRequester 附加定位，
-            // 不再外加独立 focusable，避免 Surface 上出现嵌套双焦点节点导致焦点锁定。
             .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
-            .onFocusChanged {
-                if (it.isFocused) onFocused()
-                focused = it.isFocused
-            }
             .clickable(
                 interactionSource = interactionSource,
                 indication = androidx.compose.material.ripple.rememberRipple(),
                 onClick = onClick
-            ),
+            )
+            .onFocusChanged {
+                if (it.isFocused) onFocused()
+                focused = it.isFocused
+            },
         shape = RoundedCornerShape(6.dp),
         color = when {
             focused -> MaterialTheme.colorScheme.primaryContainer
@@ -774,6 +775,8 @@ private fun SearchColumn(
     onChannelSelected: (ChannelEntry) -> Unit
 ) {
     val searchFieldFocus = remember { FocusRequester() }
+    val firstResultFocus = remember { FocusRequester() }
+    var shouldFocusFirstResult by remember { mutableStateOf(false) }
     // 用于强制弹出系统软键盘（TV 端部分设备不会因聚焦自动弹键盘）
     val searchView = LocalView.current
     val imm = searchView.context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
@@ -781,6 +784,8 @@ private fun SearchColumn(
     val keyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     // 输入激活标记：进入搜索默认只聚焦输入框（高亮），用户按 OK/确认 后才弹软键盘
     var keyboardActivated by remember { mutableStateOf(false) }
+    var shouldRestoreFocus by remember { mutableStateOf(false) }
+    var isEditing by remember { mutableStateOf(true) }
     // 设备是否存在已启用的输入法：多数 TV 没有输入法，此时由应用自行把硬件按键
     // 转成编辑操作，保证任何设备都能输入（见 handleHardwareKey）
     val hasIme = remember { imm.enabledInputMethodList.isNotEmpty() }
@@ -828,18 +833,15 @@ private fun SearchColumn(
         // 导致 focusRequester / onKeyEvent / onFocusChanged 全部落在外层而失效
         // （表现为聚焦失败、按键收不到、无法输入）。BasicTextField 的 modifier 与焦点目标同一节点，
         // 请求焦点与按键处理都能生效，且支持 cursorBrush（TextField 不支持该参数）。
-        Surface(
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(bottom = 8.dp),
-            shape = RoundedCornerShape(8.dp),
-            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                .padding(bottom = 8.dp)
+                .background(
+                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                    RoundedCornerShape(8.dp)
+                )
         ) {
-            // 关键：这里绝不能用 decorationBox！
-            // 带 decorationBox 时，真正的焦点目标 innerTextField() 在「内层」，
-            // 而 modifier（focusRequester / onKeyEvent / onFocusChanged）挂在「外层」，
-            // 结果：请求焦点落空、按键收不到（登录页 InputField 正是没用 decorationBox 才正常）。
-            // 因此改为外层 Row 放图标，placeholder 用下层的 Text 叠加实现（不拦截点击）。
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -855,7 +857,6 @@ private fun SearchColumn(
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                    // placeholder 先声明 → 位于下层，不会拦截点击（BasicTextField 在上层）
                     if (fieldValue.text.isEmpty()) {
                         Text(
                             text = "输入频道名…",
@@ -873,40 +874,84 @@ private fun SearchColumn(
                         modifier = Modifier
                             .fillMaxWidth()
                             .align(Alignment.CenterStart)
-                            .onKeyEvent { event ->
-                                if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
-                                Log.d("SidePanel", "搜索框收到按键 key=${event.key} code=${event.nativeKeyEvent.keyCode}")
-                                // 按 OK/确认 键拉起软键盘（有输入法时）
-                                if ((event.key == Key.Enter || event.key == Key.DirectionCenter) && !keyboardActivated) {
-                                    keyboardActivated = true
+                            .focusRequester(searchFieldFocus)
+                            .focusable()
+                            .onFocusChanged {
+                                Log.d("SidePanel", "搜索框焦点变化 isFocused=${it.isFocused} keyboardActivated=$keyboardActivated isEditing=$isEditing")
+                                focusConfirmed = it.isFocused
+                                if (it.isFocused) {
                                     keyboardController?.show()
-                                    return@onKeyEvent true
-                                }
-                                // 兜底：把硬件按键直接转成编辑操作，保证任何设备 / 任何 IME 状态下都能键入。
-                                // 若 IME 已接管输入，按键会被 IME 消费、不会到达这里，因此不会重复输入；
-                                // 而无输入法、或虽有输入法但未激活（模拟器接了物理键盘时系统默认不弹软键盘）时，
-                                // 由这里兜底保证可以输入。
-                                return@onKeyEvent handleHardwareKey(event, fieldValue) { newValue ->
-                                    fieldValue = newValue
-                                    onQueryChange(newValue.text)
+                                } else {
+                                    if (keyboardActivated) {
+                                        keyboardActivated = false
+                                        isEditing = false
+                                    }
                                 }
                             }
-                            .focusRequester(searchFieldFocus)
-                            .onFocusChanged {
-                                focusConfirmed = it.isFocused
-                                Log.d("SidePanel", "搜索框焦点变化 isFocused=${it.isFocused} activated=$keyboardActivated")
-                                // 仅当用户已按 OK 确认（激活输入）后才弹键盘；进入搜索默认只高亮输入框、不弹键盘
-                                if (it.isFocused && keyboardActivated) {
-                                    keyboardController?.show()
+                            .onKeyEvent { event ->
+                                if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
+                                Log.d("SidePanel", "搜索框按键 key=${event.key} nativeCode=${event.nativeKeyEvent.keyCode} isEditing=$isEditing keyboardActivated=$keyboardActivated")
+                                if ((event.key == Key.Enter || event.key == Key.DirectionCenter)) {
+                                    Log.d("SidePanel", "检测到Enter/Center keyboardActivated=$keyboardActivated")
+                                    if (keyboardActivated) {
+                                        keyboardController?.hide()
+                                        keyboardActivated = false
+                                        isEditing = false
+                                    } else {
+                                        keyboardController?.show()
+                                        keyboardActivated = true
+                                        isEditing = true
+                                    }
+                                    return@onKeyEvent true
                                 }
+                                val isBackKey = event.key == Key.Escape || event.nativeKeyEvent.keyCode == android.view.KeyEvent.KEYCODE_BACK
+                                if (isBackKey) {
+                                    Log.d("SidePanel", "检测到Back键 keyboardActivated=$keyboardActivated")
+                                    if (keyboardActivated) {
+                                        keyboardController?.hide()
+                                        keyboardActivated = false
+                                        isEditing = false
+                                    }
+                                    return@onKeyEvent true
+                                }
+                                if (!isEditing) {
+                                    if (event.key == Key.DirectionDown) {
+                                        if (results.isNotEmpty()) {
+                                            shouldFocusFirstResult = true
+                                        }
+                                        return@onKeyEvent true
+                                    }
+                                    return@onKeyEvent false
+                                }
+                                if (isEditing) {
+                                    if (event.key == Key.DirectionDown || event.key == Key.DirectionUp ||
+                                        event.key == Key.DirectionLeft || event.key == Key.DirectionRight) {
+                                        return@onKeyEvent false
+                                    }
+                                    return@onKeyEvent handleHardwareKey(event, fieldValue) { newValue ->
+                                        fieldValue = newValue
+                                        onQueryChange(newValue.text)
+                                    }
+                                }
+                                return@onKeyEvent false
                             },
                         singleLine = true,
                         textStyle = androidx.compose.ui.text.TextStyle(
                             fontSize = 14.sp,
                             color = MaterialTheme.colorScheme.onSurface
                         ),
-                        // 显式光标颜色：保证聚焦时任何设备上都能看到输入光标
-                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary)
+                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                        keyboardOptions = KeyboardOptions(
+                            imeAction = ImeAction.Search
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onSearch = {
+                                Log.d("SidePanel", "软键盘Search动作")
+                                keyboardController?.hide()
+                                keyboardActivated = false
+                                isEditing = false
+                            }
+                        )
                     )
                 }
             }
@@ -946,9 +991,9 @@ private fun SearchColumn(
                     contentPadding = PaddingValues(vertical = 4.dp),
                     modifier = Modifier.focusRequester(focusRequester)
                 ) {
-                    items(results) { channel ->
-                        val index = results.indexOf(channel)
+                    itemsIndexed(results) { index, channel ->
                         PanelItem(
+                            focusRequester = if (index == 0) firstResultFocus else null,
                             text = channel.name,
                             isSelected = index == selectedIndex,
                             icon = if (channel.isFavorite) Icons.Default.Star else null,
@@ -966,6 +1011,7 @@ private fun SearchColumn(
     // 带重试：搜索列位于 AnimatedVisibility 滑入动画中，首次 requestFocus 常因视图尚未布局完成而失败
     // （runCatching 会静默吞掉），失败后焦点没落在输入框。
     LaunchedEffect(Unit) {
+        focusConfirmed = false
         keyboardActivated = false
         var lastError: String? = null
         for (i in 0 until 20) {
@@ -989,6 +1035,30 @@ private fun SearchColumn(
         if (results.isNotEmpty()) {
             val idx = selectedIndex.coerceIn(0, results.lastIndex)
             listState.scrollCenteredTo(idx)
+        }
+    }
+
+    // 当 shouldRestoreFocus 为 true 时，恢复搜索框焦点（键盘隐藏后）
+    LaunchedEffect(shouldRestoreFocus) {
+        if (shouldRestoreFocus) {
+            shouldRestoreFocus = false
+            delay(200)
+            searchFieldFocus.requestFocus()
+        }
+    }
+
+    // 当 shouldFocusFirstResult 为 true 时，聚焦到结果列表第一项
+    LaunchedEffect(shouldFocusFirstResult) {
+        if (shouldFocusFirstResult && results.isNotEmpty()) {
+            shouldFocusFirstResult = false
+            listState.scrollToItem(0)
+            delay(500)
+            for (i in 0 until 20) {
+                val success = runCatching { firstResultFocus.requestFocus() }.isSuccess
+                Log.d("SidePanel", "第一项结果聚焦 attempt=$i success=$success")
+                if (success) break
+                delay(100)
+            }
         }
     }
 }
@@ -1043,9 +1113,27 @@ private fun handleHardwareKey(
             onValueChange(value.copy(selection = TextRange((end + 1).coerceAtMost(value.text.length))))
             return true
         }
+        Key.DirectionCenter -> {
+            return true
+        }
         else -> {
-            val ch = event.nativeKeyEvent.getUnicodeChar(event.nativeKeyEvent.metaState)
-            Log.d("SidePanel", "兜底处理按键 key=${event.key} unicode=$ch")
+            var ch = event.nativeKeyEvent.getUnicodeChar(event.nativeKeyEvent.metaState)
+            if (ch <= 0) {
+                val keyCode = event.nativeKeyEvent.keyCode
+                ch = when {
+                    keyCode in android.view.KeyEvent.KEYCODE_0..android.view.KeyEvent.KEYCODE_9 ->
+                        ('0' + (keyCode - android.view.KeyEvent.KEYCODE_0)).code
+                    keyCode == android.view.KeyEvent.KEYCODE_MINUS -> '-'.code
+                    keyCode == android.view.KeyEvent.KEYCODE_EQUALS -> '='.code
+                    keyCode == android.view.KeyEvent.KEYCODE_SPACE -> ' '.code
+                    keyCode in android.view.KeyEvent.KEYCODE_A..android.view.KeyEvent.KEYCODE_Z -> {
+                        val isShifted = (event.nativeKeyEvent.metaState and android.view.KeyEvent.META_SHIFT_ON) != 0
+                        val base = if (isShifted) 'A' else 'a'
+                        (base + (keyCode - android.view.KeyEvent.KEYCODE_A)).code
+                    }
+                    else -> 0
+                }
+            }
             if (ch > 0) {
                 val c = ch.toChar()
                 if (!c.isISOControl()) {
