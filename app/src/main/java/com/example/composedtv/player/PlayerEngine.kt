@@ -583,7 +583,7 @@ class PlayerEngine(private val context: Context) {
             .setBufferDurationsMs(
                 if (legacy) 10_000 else 20_000,
                 if (legacy) 30_000 else 40_000,
-                1_000, 2_500
+                500, 2_500
             )
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
@@ -648,9 +648,9 @@ class PlayerEngine(private val context: Context) {
         if (isHls) {
             builder.setLiveConfiguration(
                 MediaItem.LiveConfiguration.Builder()
-                    .setTargetOffsetMs(30_000L)
-                    .setMinOffsetMs(10_000L)
-                    .setMaxOffsetMs(60_000L)
+                    .setTargetOffsetMs(15_000L)
+                    .setMinOffsetMs(5_000L)
+                    .setMaxOffsetMs(45_000L)
                     .build()
             )
         }
@@ -784,7 +784,7 @@ class PlayerEngine(private val context: Context) {
                     val builder = MediaItem.Builder().setUri(finalUrl).setMimeType(MimeTypes.APPLICATION_M3U8)
                     builder.setLiveConfiguration(
                         MediaItem.LiveConfiguration.Builder()
-                            .setTargetOffsetMs(30_000L).setMinOffsetMs(10_000L).setMaxOffsetMs(60_000L).build()
+                            .setTargetOffsetMs(15_000L).setMinOffsetMs(5_000L).setMaxOffsetMs(45_000L).build()
                     )
                     exo.setMediaItem(builder.build())
                     exo.prepare()
@@ -998,7 +998,7 @@ class PlayerEngine(private val context: Context) {
         val builder = MediaItem.Builder().setUri(finalUrl).setMimeType(MimeTypes.APPLICATION_M3U8)
         builder.setLiveConfiguration(
             MediaItem.LiveConfiguration.Builder()
-                .setTargetOffsetMs(30_000L).setMinOffsetMs(10_000L).setMaxOffsetMs(60_000L).build()
+                .setTargetOffsetMs(15_000L).setMinOffsetMs(5_000L).setMaxOffsetMs(45_000L).build()
         )
         exo.setMediaItem(builder.build())
         exo.prepare()
