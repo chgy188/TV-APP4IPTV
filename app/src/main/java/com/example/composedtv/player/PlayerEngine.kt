@@ -14,6 +14,9 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.common.C
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import com.example.composedtv.data.remote.ApiClient
 import com.example.composedtv.debug.DebugDiagnostics
 import kotlinx.coroutines.CoroutineScope
@@ -96,7 +99,7 @@ class PlayerEngine(private val context: Context) {
         private val playHttpClient: OkHttpClient by lazy {
             OkHttpClient.Builder()
                 .connectTimeout(15, TimeUnit.SECONDS)
-                .readTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(45, TimeUnit.SECONDS)   // 切片下载半路卡住时给更长的续传窗口，抗抖动
                 .connectionPool(ConnectionPool(8, 30, TimeUnit.SECONDS))
                 .retryOnConnectionFailure(true)
                 .build()
@@ -107,6 +110,38 @@ class PlayerEngine(private val context: Context) {
         private const val KEY_LAST_MODE = "last_mode_"
         /** 记忆条目上限，超出则整体清空，避免长期运行无界增长 */
         private const val MAX_PLAY_MODE_ENTRIES = 500
+    /**
+     * 宽松加载错误策略：公共直播源切片常抖动/缺失/偶发 404。
+     * - 提高切片与播放列表的重试次数（HLS 默认仅 3 次）；
+     * - 放宽"子流排除"时长：默认对 403/404/410/416/500/503 排除 60s，
+     *   这里缩短到 15s(track)/30s(location)，让偶发故障的子流更早被重试，
+     *   避免误伤可用线路导致频繁转圈/重启。
+     */
+    private class LenientLoadErrorHandlingPolicy : DefaultLoadErrorHandlingPolicy() {
+        override fun getMinimumLoadableRetryCount(dataType: Int): Int =
+            if (dataType == C.DATA_TYPE_MEDIA
+                || dataType == C.DATA_TYPE_MEDIA_PROGRESSIVE_LIVE
+                || dataType == C.DATA_TYPE_MANIFEST) 6 else 3
+
+        override fun getFallbackSelectionFor(
+            fallbackOptions: LoadErrorHandlingPolicy.FallbackOptions,
+            loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo
+        ): LoadErrorHandlingPolicy.FallbackSelection? {
+            // 复用父类对 403/404/410/416/500/503 的判定
+            if (!isEligibleForFallback(loadErrorInfo.exception)) return null
+            if (fallbackOptions.isFallbackAvailable(LoadErrorHandlingPolicy.FALLBACK_TYPE_LOCATION)) {
+                return LoadErrorHandlingPolicy.FallbackSelection(
+                    LoadErrorHandlingPolicy.FALLBACK_TYPE_LOCATION, 30_000L
+                )
+            } else if (fallbackOptions.isFallbackAvailable(LoadErrorHandlingPolicy.FALLBACK_TYPE_TRACK)) {
+                return LoadErrorHandlingPolicy.FallbackSelection(
+                    LoadErrorHandlingPolicy.FALLBACK_TYPE_TRACK, 15_000L
+                )
+            }
+            return null
+        }
+    }
+
         // ===== 可被设置抽屉注入的播放参数（下方 var 为运行时值，此处为默认值） =====
         private const val DEFAULT_DIRECT_TIMEOUT_MS = 6_000L  // 直连候选起播超时（可由设置抽屉注入）
         private const val DEFAULT_PROXY_TIMEOUT_MS = 10_000L  // 代理候选起播超时（可由设置抽屉注入）
@@ -571,19 +606,17 @@ class PlayerEngine(private val context: Context) {
         val finalUrl = if (useProxy && isHls) ApiClient.hlsProxyUrl(url) else url
         val legacy = isLegacyDevice()
 
-        // 调优后的缓冲策略：
-        // - minBuffer 20s：稳定播放所需的最小缓冲
-        // - maxBuffer 60s：网络好时多缓冲，应对后续波动
-        // - initialBuffer 1s：起播快（仅需 1s 数据即开始播放）
-        // - rebuffer 2.5s：卡顿后需更多缓冲才恢复，减少二次卡顿
-        // 老设备内存/解码弱：缓冲减半，降低内存占用与起播压力
-        // 缓冲策略（兼顾流畅与内存）：峰值内存 ≈ bitrate × maxBuffer。
-        // 非老设备 maxBuffer 由 60s 降到 40s、老设备保持 30s，避免高码率 HLS 在小内存电视上撑爆内存 OOM。
+        // 缓冲策略（兼顾出画速度 / 抗抖动 / 内存）：
+        // - initialBuffer 500ms：起播快（仅攒 0.5s 数据即出画）
+        // - minBuffer 30s（老设备 15s）：起播后维持的最小缓冲，调大以吸收网络抖动、少转圈
+        // - maxBuffer 40s（老设备 30s）：网络好时多缓冲应对后续波动；峰值内存 ≈ bitrate × maxBuffer，
+        //   非老设备由 60s 降到 40s、老设备保持 30s，避免高码率 HLS 在小内存电视上撑爆内存 OOM
+        // - rebuffer 后缓冲 5s：卡顿恢复后需更多缓冲，减少二次卡顿
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                if (legacy) 10_000 else 20_000,
+                if (legacy) 15_000 else 30_000,   // minBuffer 调大：起播后吸收抖动，少转圈
                 if (legacy) 30_000 else 40_000,
-                500, 2_500
+                500, 5_000                         // 初缓冲仍 500ms（起播快）；rebuffer 后缓冲 2.5s→5s，减少二次卡顿
             )
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
@@ -605,6 +638,7 @@ class PlayerEngine(private val context: Context) {
         // （FLV 的 "FLV" magic、MP4 的 ftyp、TS 的 0x47…），按实际协议选择解析器，
         // 从根本上识别 FLV，而非依赖 URL 关键字。
         val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
+            .setLoadErrorHandlingPolicy(LenientLoadErrorHandlingPolicy())
 
         val renderersFactory = DefaultRenderersFactory(context)
             // PREFER：优先硬件 MediaCodec 解码（省内存/CPU），仅当硬件不支持时才回退到扩展(ffmpeg)软解。
@@ -648,9 +682,9 @@ class PlayerEngine(private val context: Context) {
         if (isHls) {
             builder.setLiveConfiguration(
                 MediaItem.LiveConfiguration.Builder()
-                    .setTargetOffsetMs(15_000L)
-                    .setMinOffsetMs(5_000L)
-                    .setMaxOffsetMs(45_000L)
+                    .setTargetOffsetMs(25_000L)
+                    .setMinOffsetMs(10_000L)
+                    .setMaxOffsetMs(60_000L)
                     .build()
             )
         }
@@ -784,7 +818,7 @@ class PlayerEngine(private val context: Context) {
                     val builder = MediaItem.Builder().setUri(finalUrl).setMimeType(MimeTypes.APPLICATION_M3U8)
                     builder.setLiveConfiguration(
                         MediaItem.LiveConfiguration.Builder()
-                            .setTargetOffsetMs(15_000L).setMinOffsetMs(5_000L).setMaxOffsetMs(45_000L).build()
+                            .setTargetOffsetMs(25_000L).setMinOffsetMs(10_000L).setMaxOffsetMs(60_000L).build()
                     )
                     exo.setMediaItem(builder.build())
                     exo.prepare()
@@ -998,7 +1032,7 @@ class PlayerEngine(private val context: Context) {
         val builder = MediaItem.Builder().setUri(finalUrl).setMimeType(MimeTypes.APPLICATION_M3U8)
         builder.setLiveConfiguration(
             MediaItem.LiveConfiguration.Builder()
-                .setTargetOffsetMs(15_000L).setMinOffsetMs(5_000L).setMaxOffsetMs(45_000L).build()
+                .setTargetOffsetMs(25_000L).setMinOffsetMs(10_000L).setMaxOffsetMs(60_000L).build()
         )
         exo.setMediaItem(builder.build())
         exo.prepare()
