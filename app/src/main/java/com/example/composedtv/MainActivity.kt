@@ -1,5 +1,7 @@
 package com.example.composedtv
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.view.KeyEvent
@@ -46,6 +48,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // 其他 App（文件管理器/浏览器）以 ACTION_VIEW 调起本 App 播放本地视频文件
+        val externalUri: Uri? = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data
+        if (externalUri != null) {
+            Log.d("MainActivity", "外部视频打开: $externalUri")
+        }
+
         // 保持屏幕常亮：阻止设备因闲置超时进入锁屏/屏保（TV IPTV 应用常驻前台场景）。
         // FLAG_KEEP_SCREEN_ON 由窗口系统自动管理，无需 WAKE_LOCK 权限，离开应用即失效。
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -71,7 +79,8 @@ class MainActivity : ComponentActivity() {
                 AppContent(
                     viewModel = vm,
                     onScreenChanged = { currentScreenRef = it },
-                    onExitApp = { self.finishAffinity() }
+                    onExitApp = { self.finishAffinity() },
+                    externalUri = externalUri
                 )
             }
         }
@@ -91,6 +100,8 @@ class MainActivity : ComponentActivity() {
                 if (!uiState.sidePanelVisible) {
                     when (event.keyCode) {
                         KeyEvent.KEYCODE_DPAD_LEFT -> {
+                            // 点播(VOD)模式：左右键交给 Compose 处理（快退/快进），不在此拦截
+                            if (vm.isVod.value) return super.dispatchKeyEvent(event)
                             // 设置抽屉打开时：左右键需在「左排分类 ↔ 右排选项」间导航，
                             // 不能拦截，否则既无法移动焦点，右键还会被误判为重载。
                             if (uiState.settingsVisible) return super.dispatchKeyEvent(event)
@@ -101,6 +112,8 @@ class MainActivity : ComponentActivity() {
                             return true // 拦截 DOWN + UP，防止系统焦点导航抢键
                         }
                         KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                            // 点播(VOD)模式：左右键交给 Compose 处理（快退/快进），不在此拦截
+                            if (vm.isVod.value) return super.dispatchKeyEvent(event)
                             // 同上：设置抽屉打开时不拦截，交由 Compose 焦点导航处理
                             if (uiState.settingsVisible) return super.dispatchKeyEvent(event)
                             if (event.action == KeyEvent.ACTION_DOWN) {
@@ -124,6 +137,8 @@ class MainActivity : ComponentActivity() {
                             KeyEvent.KEYCODE_DPAD_CENTER,
                             KeyEvent.KEYCODE_ENTER,
                             KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                                // 点播(VOD)模式：确定/OK 交给 Compose 处理（暂停/播放），不在此打开侧边栏
+                                if (vm.isVod.value) return super.dispatchKeyEvent(event)
                                 vm.toggleSidePanelFromActivity()
                                 return true
                             }
@@ -140,9 +155,14 @@ class MainActivity : ComponentActivity() {
 private fun AppContent(
     viewModel: PlayerViewModel,
     onScreenChanged: (Screen) -> Unit,
-    onExitApp: () -> Unit
+    onExitApp: () -> Unit,
+    externalUri: Uri? = null
 ) {
-    var screen by remember { mutableStateOf<Screen>(Screen.UserSelection) }
+    var screen by remember {
+        mutableStateOf<Screen>(
+            if (externalUri != null) Screen.Player(isGuest = true) else Screen.UserSelection
+        )
+    }
     val vm = viewModel
     val state by vm.uiState.collectAsState()
     val scope = rememberCoroutineScope()
@@ -211,7 +231,8 @@ private fun AppContent(
                     // 返回用户选择界面
                     screen = Screen.UserSelection
                 },
-                onExitApp = onExitApp
+                onExitApp = onExitApp,
+                externalUri = externalUri
             )
         }
     }

@@ -110,9 +110,9 @@ enum class StartChannelMode(val value: Int) {
 /** 播放参数设置（由 MENU 设置抽屉调整，持久化保存） */
 data class PlaybackSettings(
     /** 直连候选的起播超时（毫秒）：超过该时长仍未 READY 则切换下一个候选。
-     *  默认 6s：既能覆盖正常起播，又不会让"慢但不报错"的源拖太久；
-     *  网络差 / 源响应慢时可调到 10s，避免被误判为不可播 */
-    val directTimeoutMs: Long = 6_000L,
+     *  默认 20s（设置抽屉里的"最长"可选项）：弱网 / 慢源也能稳定起播，不被过早切走；
+     *  点播场景直连不设时限（见 PlayerEngine），此处仅影响直播直连。 */
+    val directTimeoutMs: Long = 20_000L,
     /** 代理候选的起播超时（毫秒）：代理路径多一跳、握手更慢，需比直连更长容忍。
      *  超过该时长仍未 READY 则切换下一个候选；网络差 / 代理慢时可调大，避免被误判为不可播 */
     val proxyTimeoutMs: Long = 10_000L,
@@ -142,7 +142,7 @@ data class PlaybackSettings(
             ApiClient.migrateLegacyPref(context, PREF_NAME)
             val sp = context.getSharedPreferences(ApiClient.userSpName(PREF_NAME), Context.MODE_PRIVATE)
             return PlaybackSettings(
-                directTimeoutMs = sp.getLong(KEY_DIRECT_TIMEOUT, 6_000L),
+                directTimeoutMs = sp.getLong(KEY_DIRECT_TIMEOUT, 20_000L),
                 proxyTimeoutMs = sp.getLong(KEY_PROXY_TIMEOUT, 10_000L),
                 rendererMode = RendererMode.fromValue(sp.getInt(KEY_RENDERER, RendererMode.AUTO.value)),
                 startChannelMode = StartChannelMode.fromValue(
@@ -271,9 +271,9 @@ data class LastPlayedChannel(
 /** 设置抽屉可选值集合（供 UI 渲染单选列表） */
 object PlaybackSettingOptions {
     val directTimeoutOptions = listOf(
-        6_000L to "6秒(默认)",
+        6_000L to "6秒",
         10_000L to "10秒(网络差/源慢)",
-        20_000L to "20秒(极慢源)"
+        20_000L to "20秒(极慢源/默认)"
     )
     val proxyTimeoutOptions = listOf(
         7_000L to "7秒(网络好)",
@@ -682,6 +682,13 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
         Log.d(TAG, "发送重载信号")
         viewModelScope.launch { _manualReloadSignal.send(Unit) }
     }
+
+    /** 点播(VOD)模式标志：由 PlayerScreen 根据当前源是否直播写入。
+     *  MainActivity 在 dispatchKeyEvent 中读取，以决定是否拦截左右/确定键
+     *  （VOD 下这些键交给 Compose 处理：快退/快进/暂停）。 */
+    private val _isVod = MutableStateFlow(false)
+    val isVod: StateFlow<Boolean> get() = _isVod
+    fun setIsVod(v: Boolean) { _isVod.value = v }
 
     // ===== 侧边栏数据加载 =====
 

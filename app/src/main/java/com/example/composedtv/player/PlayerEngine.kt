@@ -63,7 +63,9 @@ data class PlayerState(
     /** 起播超时（毫秒）：超过该时长仍未 READY 则自动切换下一个候选；0 表示不展示 */
     val loadTimeoutMs: Long = 0L,
     /** 当前尝试的剩余超时（毫秒），每秒刷新，供 UI 倒计时显示；0 表示不展示 */
-    val loadRemainMs: Long = 0L
+    val loadRemainMs: Long = 0L,
+    /** 当前播放是否为直播（false 表示点播，可 seek / 显示控制条） */
+    val isLive: Boolean = true
 )
 
 /**
@@ -143,7 +145,7 @@ class PlayerEngine(private val context: Context) {
     }
 
         // ===== 可被设置抽屉注入的播放参数（下方 var 为运行时值，此处为默认值） =====
-        private const val DEFAULT_DIRECT_TIMEOUT_MS = 6_000L  // 直连候选起播超时（可由设置抽屉注入）
+        private const val DEFAULT_DIRECT_TIMEOUT_MS = 20_000L  // 直连候选起播超时（可由设置抽屉注入）；默认取最长可选项 20s
         private const val DEFAULT_PROXY_TIMEOUT_MS = 10_000L  // 代理候选起播超时（可由设置抽屉注入）
         private const val DEFAULT_SMOOTH_PRIORITY = false      // 流畅优先（降分辨率）默认关
         private const val DEFAULT_AUTO_AV_SYNC = true          // 音画同步自动恢复默认开
@@ -201,6 +203,9 @@ class PlayerEngine(private val context: Context) {
      * 用于修复 TextureView 场景下 Surface(surfaceTexture) 每次 new 新对象、
      * 幂等判断（===）失效、导致 API<23 反复重建解码器的问题。 */
     private var lastSetSurface: android.view.Surface? = null
+
+    /** 字幕偏好语言（外部本地文件播放时设置，如 ["zh","en"]）；null 表示不强制 */
+    private var preferredTextLanguages: List<String>? = null
 
     /** 把设置抽屉里的值同步进 engine（PlaybackSettings 定义在 PlayerViewModel） */
     fun applyPlaybackSettings(s: com.example.composedtv.viewmodel.PlaybackSettings) {
@@ -271,8 +276,8 @@ class PlayerEngine(private val context: Context) {
 
     /** 重载前保存的播放位置（毫秒），用于点播内容恢复进度 */
     private var pendingResumePositionMs: Long = 0
-    /** 当前播放是否为直播流 */
-    private var isLiveStream = false
+    /** 当前播放是否为直播流（默认按直播处理，避免电视直播误显示点播控制条） */
+    private var isLiveStream = true
 
     // 竞速状态
     private data class RaceCandidate(
@@ -293,8 +298,8 @@ class PlayerEngine(private val context: Context) {
     /** 单个尝试的起播超时协程：超时未 READY 即切下一个尝试 */
     private var attemptTimeoutJob: Job? = null
     /** 直连候选的起播超时：超时即切换下一个（连接类错误会立即切换，不走这里）。
-     *  默认 6s：既能覆盖正常起播，又不会让"慢但不报错"的源拖太久；
-     *  网络差 / 源响应慢时可在设置抽屉调到 10s，避免被误判为不可播。
+     *  默认 20s（设置里的最长可选项）：弱网 / 慢源也能稳定起播，不被过早切走；
+     *  点播场景直连不设时限（见 [startAttemptTimeout]），此处仅用于直播直连。
      *  可由设置抽屉注入（applyPlaybackSettings），默认 [DEFAULT_DIRECT_TIMEOUT_MS] */
     var directTimeoutMs = DEFAULT_DIRECT_TIMEOUT_MS
     /** 代理候选专属起播超时：代理路径多一跳、握手更慢，给更长容忍，避免被误判为不可播。
@@ -315,6 +320,69 @@ class PlayerEngine(private val context: Context) {
     private var infoHideJob: Job? = null
     // transientHint 自动清理
     private var hintHideJob: Job? = null
+
+    /** 字幕选项（供外部播放时 UI 展示与选择） */
+    data class SubtitleOption(
+        val id: String,
+        val label: String,
+        val language: String?,
+        val selected: Boolean
+    )
+
+    /** 设置字幕偏好语言顺序（如 ["zh","en"]）；对当前与后续创建的播放器生效 */
+    fun setPreferredTextLanguages(langs: List<String>) {
+        preferredTextLanguages = langs
+        applyPreferredTextLanguages()
+    }
+
+    /** 读取当前播放器的字幕轨列表（仅 text 类型） */
+    fun getSubtitleTracks(): List<SubtitleOption> {
+        val player = playerFlow.value ?: return emptyList()
+        val result = mutableListOf<SubtitleOption>()
+        player.currentTracks.groups.forEachIndexed { gi, group ->
+            if (group.type != C.TRACK_TYPE_TEXT) return@forEachIndexed
+            for (i in 0 until group.length) {
+                val fmt = group.getTrackFormat(i)
+                val label = fmt.label ?: fmt.language ?: "字幕 ${i + 1}"
+                result.add(
+                    SubtitleOption(
+                        id = "$gi:$i",
+                        label = label,
+                        language = fmt.language,
+                        selected = group.isTrackSelected(i)
+                    )
+                )
+            }
+        }
+        return result
+    }
+
+    /** 选择字幕：传 null 关闭字幕；否则按该轨语言启用，并记忆为后续播放器的偏好 */
+    fun selectSubtitle(option: SubtitleOption?) {
+        val player = playerFlow.value ?: return
+        val params = player.trackSelectionParameters.buildUpon()
+        if (option == null) {
+            params.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+            preferredTextLanguages = null
+        } else {
+            params.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+            if (option.language != null) {
+                preferredTextLanguages = listOf(option.language)
+                params.setPreferredTextLanguages(option.language)
+            }
+        }
+        player.trackSelectionParameters = params.build()
+    }
+
+    /** 将已设置的字幕偏好语言应用到当前播放器 */
+    private fun applyPreferredTextLanguages() {
+        val langs = preferredTextLanguages ?: return
+        playerFlow.value?.let { p ->
+            p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
+                .setPreferredTextLanguages(*langs.toTypedArray())
+                .build()
+        }
+    }
 
     /** 设置播放列表并播放指定 index */
     fun setPlaylist(items: List<PlaylistItem>, startIndex: Int = 0) {
@@ -349,10 +417,13 @@ class PlayerEngine(private val context: Context) {
         // 频道自定义请求头（UA/Referer，防盗链用），仅直连源站时携带
         currentChannelHeaders = buildChannelHeaders(item)
         DebugDiagnostics.setChannel(item.name, item.url, false)
-        // 判断是否直播流：仅 HLS (.m3u8/.m3u) 视为直播；FLV 等容器改由 ExoPlayer 嗅探，
-        // 不再以 URL 关键字判断，故此处不再把 FLV 归入直播（FLV 直播会按点播处理侧边栏暂停）。
-        isLiveStream = item.url.lowercase().let {
-            it.contains(".m3u8") || it.contains(".m3u")
+            // 直播/点播判定（初始猜测；起播后由 refineLiveFromPlayer 用 ExoPlayer 二次校正）：
+        // 本地文件 / 点播容器扩展名 → 点播；直播协议 / .m3u/.m3u8/.ts/.flv / 直播平台关键字 → 直播。
+        // .m3u8 含 #EXT-X-ENDLIST 的「点播型」与 FLV 直播由播放器解析后校正。详见 isLiveStreamUrl。
+        isLiveStream = isLiveStreamUrl(item.url)
+        // 点播内容：默认优先中文字幕（zh→en 回退），用户手动选择后以用户选择为准
+        if (!isLiveStream && preferredTextLanguages == null) {
+            setPreferredTextLanguages(listOf("zh", "en"))
         }
         // 信息条：仅在「频道真正变化」时弹出。
         // 原地重载（watchdog / 播放期兜底）会反复调用 playCurrent，若每次都
@@ -413,6 +484,77 @@ class PlayerEngine(private val context: Context) {
         p.playWhenReady = !p.playWhenReady
         _state.value = _state.value.copy(isPlaying = p.playWhenReady)
         showInfoTransient()
+    }
+
+    /** 是否为直播（false 表示点播，可 seek） */
+    val isLive: Boolean get() = isLiveStream
+
+    /**
+     * 根据 URL 初步判断是否为直播流（初始猜测；HLS (.m3u8/.m3u/.ts/.flv) 是否含 #EXT-X-ENDLIST
+     * 最终以播放器解析为准，见 [refineLiveFromPlayer]）。优先级从高到低：
+     *  1) 本地/外部文件（file://、content://）→ 点播
+     *  2) 明确的点播容器扩展名（mp4/mkv/mov/webm/avi/wmv/3gp/mpeg/mpg/vob/m2ts/m4v）→ 点播
+     *  3) 明确的直播协议（rtmp/rtsp/udp/rtp/srt）→ 直播
+     *  4) 明确的直播格式（.m3u/.m3u8/.ts/.flv）→ 直播
+     *  5) 直播平台关键字（live/flv/rtmp/hls/huya/douyu 等，无扩展名兜底）→ 直播
+     *  6) 其余（无扩展名、无关键字的普通 http(s) 直链）→ 默认点播，交给播放器校正
+     */
+    private fun isLiveStreamUrl(rawUrl: String): Boolean {
+        val u = rawUrl.lowercase()
+        if (u.startsWith("file://") || u.startsWith("content://")) return false
+        if (u.contains(".mp4") || u.contains(".mkv") || u.contains(".mov") ||
+            u.contains(".webm") || u.contains(".avi") || u.contains(".wmv") ||
+            u.contains(".3gp") || u.contains(".mpeg") || u.contains(".mpg") ||
+            u.contains(".vob") || u.contains(".m2ts") || u.contains(".m4v")
+        ) return false
+        if (u.startsWith("rtmp://") || u.startsWith("rtsp://") ||
+            u.startsWith("udp://") || u.startsWith("rtp://") || u.startsWith("srt://")
+        ) return true
+        if (u.contains(".m3u8") || u.contains(".m3u") || u.contains(".ts") || u.contains(".flv")) return true
+        if (u.contains("live") || u.contains("flv") || u.contains("rtmp") ||
+            u.contains("hls") || u.contains("huya") || u.contains("douyu")
+        ) return true
+        return false
+    }
+
+    /**
+     * 起播后由 ExoPlayer 二次校正直播/点播判定：
+     * - HLS（.m3u/.m3u8/.ts/.flv）：以播放器解析结果为准——含 #EXT-X-ENDLIST 的「点播型 m3u8」会识别为点播；
+     * - 无扩展名直播关键字：ExoPlayer 无法判别是否直播，信任 URL 启发式（保持直播）；
+     * - 其余（容器格式 / 本地文件）：URL 启发式已判为点播，保持不变。
+     */
+    private fun refineLiveFromPlayer(exo: ExoPlayer, rawUrl: String) {
+        val url = rawUrl.lowercase()
+        val isHlsOrTs = url.contains(".m3u8") || url.contains(".m3u") || url.contains(".ts") || url.contains(".flv")
+        val exoLive = exo.isCurrentMediaItemLive()
+        val finalLive = if (isHlsOrTs) exoLive else isLiveStream
+        if (finalLive != isLiveStream) {
+            isLiveStream = finalLive
+            updateState(isLive = finalLive)
+            if (!finalLive) setPreferredTextLanguages(listOf("zh", "en"))
+            Log.d(TAG, "refineLiveFromPlayer: $rawUrl -> isLive=$finalLive (exoLive=$exoLive)")
+        }
+    }
+
+    /** 当前播放位置（ms）；直播返回 0 */
+    fun getCurrentPosition(): Long = player?.currentPosition ?: 0L
+
+    /** 总时长（ms）；未知/直播返回 0（ExoPlayer 用 C.TIME_UNSET 表示未知） */
+    fun getDuration(): Long {
+        val p = player ?: return 0L
+        val d = p.duration
+        return if (d == C.TIME_UNSET) 0L else d
+    }
+
+    /** 点播跳转（绝对位置，ms） */
+    fun seekTo(positionMs: Long) {
+        player?.seekTo(positionMs.coerceAtLeast(0L))
+    }
+
+    /** 点播相对跳转（ms，可正可负） */
+    fun seekBy(deltaMs: Long) {
+        val p = player ?: return
+        seekTo(p.currentPosition + deltaMs)
     }
 
     /** 是否因为侧边栏打开而手动暂停（点播） */
@@ -668,6 +810,13 @@ class PlayerEngine(private val context: Context) {
             .setForceHighestSupportedBitrate(false)
             .build()
 
+            // 外部本地文件播放时设置的字幕偏好语言（中文→英文），应用到本播放器
+            preferredTextLanguages?.let { langs ->
+            p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
+            .setPreferredTextLanguages(*langs.toTypedArray())
+            .build()
+            }
+
         if (!winner) p.volume = 0f
 
         // 共享 Surface：副路候选（如代理）也绑定 PlayerView 的 Surface，才能真正出画参与竞速；
@@ -748,7 +897,12 @@ class PlayerEngine(private val context: Context) {
         val attempt = currentAttempts[nextIndex]
         Log.d(TAG, "串行尝试[$nextIndex/${currentAttempts.size}]: $attempt")
         // 简洁展示：UI 加载区显示当前正在尝试的模式（直连/代理）与超时阈值
-        val loadTimeout = if (attempt == "proxy") proxyTimeoutMs else directTimeoutMs
+        // 点播直连不设时限：VOD 采用无限等待，直至出画或连接类错误（不会因超时被切走）
+        val loadTimeout = when {
+            attempt == "proxy" -> proxyTimeoutMs
+            isLiveStream -> directTimeoutMs
+            else -> 0L
+        }
         updateState(loadMode = attempt, loadTimeoutMs = loadTimeout, loadRemainMs = loadTimeout)
 
         // 先释放上一个尝试的 player，确保同一时刻只有 1 个 ExoPlayer（内存恒定单路）
@@ -765,7 +919,12 @@ class PlayerEngine(private val context: Context) {
     /** 单个尝试的起播超时：超过阈值仍未 READY → 切换下一个尝试；代理候选用更长超时 */
     private fun startAttemptTimeout(url: String, token: Int) {
         val attempt = currentAttempts.getOrNull(currentAttemptIndex) ?: return
-        val timeout = if (attempt == "proxy") proxyTimeoutMs else directTimeoutMs
+        // 点播直连不设时限：不启动超时协程，直至出画或连接类错误（不会因超时被切走）
+        val timeout = when {
+            attempt == "proxy" -> proxyTimeoutMs
+            isLiveStream -> directTimeoutMs
+            else -> return
+        }
         attemptTimeoutJob?.cancel()
         attemptTimeoutJob = scope.launch {
             // 每秒刷新剩余时间供 UI 倒计时；倒计时归零即切换下一个候选。
@@ -797,6 +956,7 @@ class PlayerEngine(private val context: Context) {
                 when (state) {
                     Player.STATE_READY -> {
                         stopAttemptTimeout()
+                        refineLiveFromPlayer(exo, url)
                         onRaceWin(cand, token)
                     }
                     Player.STATE_BUFFERING -> {
@@ -1051,8 +1211,10 @@ class PlayerEngine(private val context: Context) {
             override fun onPlaybackStateChanged(state: Int) {
                 when (state) {
                     Player.STATE_BUFFERING -> updateState(isLoading = true)
-                    Player.STATE_READY ->
+                    Player.STATE_READY -> {
+                        refineLiveFromPlayer(exo, currentPlayingUrl)
                         updateState(isLoading = false, isPlaying = true, error = null)
+                    }
                     Player.STATE_ENDED ->
                         Log.w(TAG, "播放期 STATE_ENDED: $currentPlayingUrl")
                     Player.STATE_IDLE -> { /* no-op */ }
@@ -1148,7 +1310,8 @@ class PlayerEngine(private val context: Context) {
         usingProxy: Boolean = _state.value.usingProxy,
         loadMode: String? = _state.value.loadMode,
         loadTimeoutMs: Long = _state.value.loadTimeoutMs,
-        loadRemainMs: Long = _state.value.loadRemainMs
+        loadRemainMs: Long = _state.value.loadRemainMs,
+        isLive: Boolean = isLiveStream
     ) {
         _state.value = PlayerState(
             currentIndex = currentIndex,
@@ -1163,7 +1326,8 @@ class PlayerEngine(private val context: Context) {
             usingProxy = usingProxy,
             loadMode = loadMode,
             loadTimeoutMs = loadTimeoutMs,
-            loadRemainMs = loadRemainMs
+            loadRemainMs = loadRemainMs,
+            isLive = isLive
         )
     }
 

@@ -35,6 +35,8 @@ import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -53,6 +55,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.focusTarget
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.foundation.focusable
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -81,12 +84,15 @@ import com.example.composedtv.debug.DebugDiagnostics
 import com.example.composedtv.debug.DebugHudHost
 import com.example.composedtv.player.PlayerEngine
 import com.example.composedtv.player.PlayerState
+import com.example.composedtv.data.VodProgressStore
 import com.example.composedtv.player.PlaylistItem
 import com.example.composedtv.ui.components.SettingsDrawer
 import com.example.composedtv.ui.components.SidePanel
 import com.example.composedtv.viewmodel.ChannelEntry
 import com.example.composedtv.viewmodel.PlayerViewModel
+import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
 import androidx.core.view.WindowInsetsCompat
 import kotlinx.coroutines.delay
 
@@ -116,6 +122,24 @@ private fun rememberImeState(): State<Boolean> {
 }
 
 /**
+ * 点播（VOD）遥控按键映射：外部视频文件播放时启用控制条 / 续播记忆。
+ * 左右键快退/快进、确定/空格暂停播放，其余按键（返回/菜单）仍交给直播逻辑处理。
+ */
+private val VOD_SEEK_KEYS = setOf(
+    android.view.KeyEvent.KEYCODE_DPAD_LEFT,
+    android.view.KeyEvent.KEYCODE_MEDIA_REWIND,
+    android.view.KeyEvent.KEYCODE_DPAD_RIGHT,
+    android.view.KeyEvent.KEYCODE_MEDIA_FAST_FORWARD
+)
+private val VOD_PLAY_PAUSE_KEYS = setOf(
+    android.view.KeyEvent.KEYCODE_DPAD_CENTER,
+    android.view.KeyEvent.KEYCODE_ENTER,
+    android.view.KeyEvent.KEYCODE_NUMPAD_ENTER,
+    android.view.KeyEvent.KEYCODE_SPACE,
+    android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+)
+
+/**
  * 全屏播放器界面
  *
  * 行为：
@@ -129,7 +153,8 @@ fun PlayerScreen(
     vm: PlayerViewModel,
     isGuest: Boolean,
     onExit: () -> Unit,
-    onExitApp: () -> Unit
+    onExitApp: () -> Unit,
+    externalUri: Uri? = null
 ) {
     val context = LocalContext.current
     val uiState by vm.uiState.collectAsState()
@@ -196,6 +221,59 @@ fun PlayerScreen(
     val currentPlayer by engine.playerFlow.collectAsState()
     var engineInitialized by remember { mutableStateOf(false) }
 
+    // ===== 字幕选择（外部本地文件播放时可用；CC 键唤出）=====
+    var subtitleChooserVisible by remember { mutableStateOf(false) }
+    var subtitleOptions by remember { mutableStateOf<List<PlayerEngine.SubtitleOption>>(emptyList()) }
+    var subtitleSelectedIndex by remember { mutableStateOf(0) }
+
+    // ===== VOD（点播）控制：由 engine 的 isLive（PlayerState）驱动，随播放源变化实时切换。
+    // 另：通过其他 App 以 ACTION_VIEW 打开的本地/网络文件（externalUri != null）必然可 seek，
+    // 故直接判定为点播，避免首帧误判为直播（如 .ts 录制文件）导致控制条/进度/字幕不可用。
+    val isVod = externalUri != null || !playerState.isLive
+    val vodId = externalUri?.toString() ?: ""
+    var vodControlsVisible by remember { mutableStateOf(true) }
+    var vodPosition by remember { mutableStateOf(0L) }
+    var vodDuration by remember { mutableStateOf(0L) }
+    var vodResumeDone by remember { mutableStateOf(false) }
+    val vodSavedPos = remember(vodId) { if (vodId.isNotBlank()) VodProgressStore.load(context, vodId) else 0L }
+
+    // 把 VOD 模式同步给 ViewModel，供 MainActivity 在 dispatchKeyEvent 中决定是否拦截左右/确定键
+    LaunchedEffect(isVod) { vm.setIsVod(isVod) }
+
+    val openSubtitleChooser: () -> Unit = {
+        subtitleOptions = engine.getSubtitleTracks()
+        subtitleSelectedIndex = subtitleOptions.indexOfFirst { it.selected }.takeIf { it >= 0 } ?: 0
+        subtitleChooserVisible = true
+    }
+    val confirmSubtitleSelection: () -> Unit = {
+        val opt = subtitleOptions.getOrNull(subtitleSelectedIndex)
+        engine.selectSubtitle(opt)
+        subtitleChooserVisible = false
+        Toast.makeText(context, "字幕：${opt?.label ?: "关闭"}", Toast.LENGTH_SHORT).show()
+    }
+    fun handleSubtitleChooserKey(event: androidx.compose.ui.input.key.KeyEvent): Boolean {
+        if (event.type != KeyEventType.KeyDown) return false
+        when (event.key) {
+            Key.DirectionUp -> {
+                subtitleSelectedIndex = (subtitleSelectedIndex - 1).coerceAtLeast(0)
+                return true
+            }
+            Key.DirectionDown -> {
+                subtitleSelectedIndex = (subtitleSelectedIndex + 1).coerceAtMost(subtitleOptions.lastIndex.coerceAtLeast(0))
+                return true
+            }
+            Key.DirectionCenter, Key.Enter -> {
+                confirmSubtitleSelection()
+                return true
+            }
+            Key.Back, Key.Menu -> {
+                subtitleChooserVisible = false
+                return true
+            }
+            else -> return false
+        }
+    }
+
     // 焦点管理：确保播放器容器持有焦点，遥控器按键才能被正确接收
     val focusRequester = remember { FocusRequester() }
 
@@ -210,11 +288,56 @@ fun PlayerScreen(
         }
     }
 
-    // 初始化 VM
+    // 初始化 VM（外部视频文件播放时跳过：无需登录/频道列表，直接单文件起播）
     LaunchedEffect(isGuest) {
-        if (!engineInitialized) {
+        if (externalUri == null && !engineInitialized) {
             vm.initialize(isGuest)
             engineInitialized = true
+        }
+    }
+
+    // 外部视频文件播放（来自其他 App 的 ACTION_VIEW）：绕过登录/频道列表，直接单文件播放，
+    // 并设置字幕默认偏好顺序为中文→英文（无中文字幕时回退英文，均无则关闭）。
+    LaunchedEffect(externalUri) {
+        if (externalUri != null) {
+            val name = resolveDisplayName(context, externalUri)
+            engine.setPreferredTextLanguages(listOf("zh", "en"))
+            engine.setPlaylist(
+                listOf(PlaylistItem(name = name, url = externalUri.toString(), country = "")),
+                0
+            )
+        }
+    }
+
+    // VOD：轮询进度，并做断点续播 + 周期保存播放位置
+    LaunchedEffect(isVod) {
+        if (!isVod) return@LaunchedEffect
+        var saveCounter = 0
+        while (true) {
+            vodPosition = engine.getCurrentPosition()
+            vodDuration = engine.getDuration()
+            // 续播：拿到时长后跳到上次位置（仅一次）
+            if (!vodResumeDone && vodDuration > 0 && vodSavedPos > 0) {
+                engine.seekTo(vodSavedPos)
+                vodResumeDone = true
+                Log.d("PlayerScreen", "VOD 续播：跳至 ${vodSavedPos}ms")
+            }
+            // 播放到末尾：清除记录，下次从头开始；否则每 ~5s 保存一次
+            if (vodDuration > 0 && vodPosition >= vodDuration - 1500) {
+                VodProgressStore.clear(context, vodId)
+            } else if (++saveCounter >= 10) {
+                VodProgressStore.save(context, vodId, vodPosition)
+                saveCounter = 0
+            }
+            delay(500)
+        }
+    }
+
+    // VOD：播放中控制条自动隐藏（任意交互会重新显示）
+    LaunchedEffect(vodControlsVisible, playerState.isPlaying) {
+        if (isVod && vodControlsVisible && playerState.isPlaying) {
+            delay(2500)
+            vodControlsVisible = false
         }
     }
 
@@ -257,6 +380,9 @@ fun PlayerScreen(
     // 生命周期：onResume / onPause / onDestroy
     DisposableEffect(engine) {
         onDispose {
+            if (externalUri != null) {
+                VodProgressStore.save(context, externalUri.toString(), engine.getCurrentPosition())
+            }
             engine.release()
         }
     }
@@ -297,23 +423,47 @@ fun PlayerScreen(
             // 双重按键监听：onPreviewKeyEvent（事件下沉阶段）+ onKeyEvent（事件上浮阶段）
             // 某些 Android TV 设备/PlayerView 可能在下沉阶段消费掉事件，此时上浮阶段仍能捕获
             .onPreviewKeyEvent { event ->
-                handlePlayerKeyEvent(
-                    event = event,
-                    _playerState = playerState,
-                    sidePanelVisible = uiState.sidePanelVisible,
-                    settingsVisible = uiState.settingsVisible,
-                    isSearchMode = uiState.sidePanel.isSearchMode,
-                    engine = engine,
-                    vm = vm,
-                    _onExit = onExit,
-                    onExitApp = onExitApp,
-                    onToggleDiag = toggleDiag,
-                    currentPlaylistProvider = {
-                        val playlist = engine.getCurrentPlaylist()
-                        val idx = engine.getCurrentIndex()
-                        if (idx in playlist.indices) playlist[idx] else null
+                when {
+                    subtitleChooserVisible -> handleSubtitleChooserKey(event)
+                    event.key.nativeKeyCode == KeyEvent.KEYCODE_CAPTIONS && event.type == KeyEventType.KeyDown -> {
+                        openSubtitleChooser()
+                        true
                     }
-                )
+                    isVod && event.type == KeyEventType.KeyDown && event.key.nativeKeyCode in VOD_SEEK_KEYS -> {
+                        engine.seekBy(
+                            if (event.key.nativeKeyCode == KeyEvent.KEYCODE_DPAD_LEFT
+                                || event.key.nativeKeyCode == KeyEvent.KEYCODE_MEDIA_REWIND
+                            ) -10_000 else 10_000
+                        )
+                        vodControlsVisible = true
+                        true
+                    }
+                    isVod && event.type == KeyEventType.KeyDown && event.key.nativeKeyCode in VOD_PLAY_PAUSE_KEYS -> {
+                        engine.togglePause()
+                        vodControlsVisible = true
+                        val cur = engine.run { getCurrentPlaylist().getOrNull(getCurrentIndex()) }
+                        vm.toggleSidePanel(cur)
+                        true
+                    }
+                    else -> handlePlayerKeyEvent(
+                        event = event,
+                        _playerState = playerState,
+                        sidePanelVisible = uiState.sidePanelVisible,
+                        settingsVisible = uiState.settingsVisible,
+                        isSearchMode = uiState.sidePanel.isSearchMode,
+                        engine = engine,
+                        vm = vm,
+                        _onExit = onExit,
+                        onExitApp = onExitApp,
+                        onToggleDiag = toggleDiag,
+                        currentPlaylistProvider = {
+                            val playlist = engine.getCurrentPlaylist()
+                            val idx = engine.getCurrentIndex()
+                            if (idx in playlist.indices) playlist[idx] else null
+                        },
+                        isVod = isVod
+                    )
+                }
             }
             .onKeyEvent { event ->
                 handlePlayerKeyEvent(
@@ -331,7 +481,8 @@ fun PlayerScreen(
                         val playlist = engine.getCurrentPlaylist()
                         val idx = engine.getCurrentIndex()
                         if (idx in playlist.indices) playlist[idx] else null
-                    }
+                    },
+                    isVod = isVod
                 )
             }
             // 手势仅在侧边栏与设置抽屉「都关闭」时启用，避免与列表项点击 / 滚动冲突。
@@ -341,11 +492,14 @@ fun PlayerScreen(
             // 表现为「点了分类、还没选右排选项就退出」。
             // 注意：本手势用 awaitFirstDown(requireUnconsumed = false)，指针事件即使
             // 已被抽屉内部消费，这里仍会收到，因此必须在抽屉打开时主动 return。
-            .pointerInput(uiState.sidePanelVisible, uiState.settingsVisible) {
+            .pointerInput(uiState.sidePanelVisible, uiState.settingsVisible, isVod) {
                 if (uiState.sidePanelVisible || uiState.settingsVisible) return@pointerInput
                 detectTapAndVerticalDragGestures(
                     onTap = { isRightSide ->
-                        if (isRightSide) {
+                        if (isVod) {
+                            // 点播：点击画面切换控制条显隐
+                            vodControlsVisible = !vodControlsVisible
+                        } else if (isRightSide) {
                             // 右半屏 tap：弹出设置抽屉
                             vm.toggleSettingsDrawer()
                         } else {
@@ -354,17 +508,17 @@ fun PlayerScreen(
                             vm.toggleSidePanel(cur)
                         }
                     },
-                    onSwipeUp = {
-                        // 上划：下一频道（与频道列表方向一致）
-                        engine.playNext()
-                    },
-                    onSwipeDown = {
-                        // 下划：上一频道
-                        engine.playPrev()
-                    },
-                    onLongPress = {
-                        // 长按：切换当前频道收藏状态
-                        engine.toggleFavorite()
+                    onSwipeUp = { if (!isVod) engine.playNext() },
+                    onSwipeDown = { if (!isVod) engine.playPrev() },
+                    onLongPress = { if (!isVod) engine.toggleFavorite() },
+                    onHorizontalDrag = { dx ->
+                        // 点播：水平滑动快进/快退（手机手势）；整屏宽度对应整段时长
+                        if (isVod && vodDuration > 0) {
+                            val screenW = context.resources.displayMetrics.widthPixels
+                                .toFloat().coerceAtLeast(1f)
+                            engine.seekBy((dx * (vodDuration / screenW)).toLong())
+                            vodControlsVisible = true
+                        }
                     }
                 )
             }
@@ -610,6 +764,38 @@ fun PlayerScreen(
             onExitSearch = { vm.exitSearchMode() }
         )
 
+        // 字幕选择弹层（CC 键唤出）：列出当前视频的字幕轨，可手动选择或关闭
+        if (subtitleChooserVisible) {
+            SubtitleChooser(
+                options = subtitleOptions,
+                selectedIndex = subtitleSelectedIndex,
+                onSelect = { idx ->
+                    subtitleSelectedIndex = idx
+                    confirmSubtitleSelection()
+                },
+                onDismiss = { subtitleChooserVisible = false }
+            )
+        }
+
+        // VOD 控制条（外部本地文件播放时显示：进度/快退快进/字幕/暂停）
+        if (isVod && vodControlsVisible) {
+            VodControlBar(
+                positionMs = vodPosition,
+                durationMs = vodDuration,
+                isPlaying = playerState.isPlaying,
+                onSeekDelta = { engine.seekBy(it); vodControlsVisible = true },
+                onSeekTo = { engine.seekTo(it); vodControlsVisible = true },
+                onPlayPause = { engine.togglePause(); vodControlsVisible = true },
+                onOpenPlaylist = {
+                    vodControlsVisible = false
+                    val cur = engine.run { getCurrentPlaylist().getOrNull(getCurrentIndex()) }
+                    vm.toggleSidePanel(cur)
+                },
+                onSubtitle = { openSubtitleChooser() },
+                modifier = Modifier.align(Alignment.BottomCenter)
+            )
+        }
+
         // 右侧配置抽屉（MENU 键唤出）：调整播放参数
         SettingsDrawer(
             visible = uiState.settingsVisible,
@@ -751,7 +937,8 @@ private fun handlePlayerKeyEvent(
     _onExit: () -> Unit,
     onExitApp: () -> Unit,
     onToggleDiag: () -> Unit = {},
-    currentPlaylistProvider: () -> PlaylistItem? = { null }
+    currentPlaylistProvider: () -> PlaylistItem? = { null },
+    isVod: Boolean = false
 ): Boolean {
     if (event.type != KeyEventType.KeyDown) return false
 
@@ -841,7 +1028,7 @@ private fun handlePlayerKeyEvent(
                 vm.hideSidePanel()
                 true
             } else if (_playerState.isPlaying) {
-                // 正在播放：立即停播（释放解码器/资源，停留在当前界面）
+                // 正在播放（直播或点播）：立即停播（释放解码器/资源，停留在当前界面）
                 engine.stopPlayback()
                 true
             } else {
@@ -868,14 +1055,17 @@ private suspend fun PointerInputScope.detectTapAndVerticalDragGestures(
     onTap: (isRightSide: Boolean) -> Unit,
     onSwipeUp: () -> Unit,
     onSwipeDown: () -> Unit,
-    onLongPress: () -> Unit = {}
+    onLongPress: () -> Unit = {},
+    onHorizontalDrag: (Float) -> Unit = {}
 ) {
     val slop = viewConfiguration.touchSlop
     // 长按阈值固定为 250ms（系统默认约 400ms+，用户反馈太长）
     val longPressTimeout = 250L
     val halfWidth = size.width / 2f
     awaitEachGesture {
-        val down = awaitFirstDown(requireUnconsumed = false)
+        // requireUnconsumed = true：子组件（控制条按钮、抽屉）已消费的点击不再下发到本手势，
+        // 避免「点节目栏按钮」时被手势同时把控制条重新置为可见，盖住节目栏。
+        val down = awaitFirstDown(requireUnconsumed = true)
         val downTime = System.currentTimeMillis()
         val startX = down.position.x
         var totalDy = 0f
@@ -886,6 +1076,10 @@ private suspend fun PointerInputScope.detectTapAndVerticalDragGestures(
             val change = event.changes.firstOrNull() ?: break
             totalDy += change.positionChange().y
             totalDx += change.positionChange().x
+            // 水平滑动（点播 seek）：横向位移超过阈值且明显大于纵向时，逐帧上报横向位移
+            if (abs(totalDx) > slop && abs(totalDx) > abs(totalDy)) {
+                onHorizontalDrag(change.positionChange().x)
+            }
             // 长按判定：未移动超过 slop 且按下时间超过阈值
             if (!longPressFired && change.pressed) {
                 val held = System.currentTimeMillis() - downTime
@@ -912,6 +1106,160 @@ private suspend fun PointerInputScope.detectTapAndVerticalDragGestures(
             }
         }
     }
+}
+
+@Composable
+private fun VodControlBar(
+    positionMs: Long,
+    durationMs: Long,
+    isPlaying: Boolean,
+    onSeekDelta: (Long) -> Unit,
+    onSeekTo: (Long) -> Unit,
+    onPlayPause: () -> Unit,
+    onOpenPlaylist: () -> Unit,
+    onSubtitle: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(Color.Transparent, Color(0x99000000), Color(0xCC000000))
+                )
+            )
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .focusProperties { canFocus = false }
+    ) {
+        val ratio = if (durationMs > 0) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
+        Slider(
+            value = ratio,
+            onValueChange = { newRatio ->
+                if (durationMs > 0) onSeekTo((newRatio * durationMs).toLong())
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(20.dp),
+            colors = SliderDefaults.colors(
+                thumbColor = Color.White,
+                activeTrackColor = Color(0xFF4FC3F7),
+                inactiveTrackColor = Color(0x33FFFFFF),
+                disabledThumbColor = Color.Transparent,
+                disabledActiveTrackColor = Color.Transparent,
+                disabledInactiveTrackColor = Color.Transparent
+            )
+        )
+        Spacer(Modifier.height(2.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            CtlFocusButton("«10s") { onSeekDelta(-10_000) }
+            CtlFocusButton(if (isPlaying) "⏸" else "▶") { onPlayPause() }
+            CtlFocusButton("10s»") { onSeekDelta(10_000) }
+            CtlFocusButton("列表") { onOpenPlaylist() }
+            Spacer(Modifier.width(8.dp))
+            Text(formatTime(positionMs), color = Color(0xCCFFFFFF), fontSize = 12.sp)
+            Text("/", color = Color(0x66FFFFFF), fontSize = 12.sp)
+            Text(formatTime(durationMs), color = Color(0xCCFFFFFF), fontSize = 12.sp)
+            CtlFocusButton("字幕") { onSubtitle() }
+            Spacer(Modifier.fillMaxWidth())
+        }
+    }
+}
+
+@Composable
+private fun CtlFocusButton(text: String, onClick: () -> Unit) {
+    TvSurface(
+        onClick = onClick,
+        modifier = Modifier
+            .focusable()
+            .onKeyEvent { event ->
+                if (event.type == KeyEventType.KeyDown &&
+                    (event.key == Key.DirectionCenter || event.key == Key.Enter)) {
+                    onClick()
+                    true
+                } else false
+            },
+        shape = ClickableSurfaceDefaults.shape(shape = RoundedCornerShape(6.dp)),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Color.Transparent,
+            focusedContainerColor = Color(0x33FFFFFF),
+            pressedContainerColor = Color(0x55FFFFFF)
+        ),
+        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.08f)
+    ) {
+        Text(
+            text = text,
+            color = Color(0xEEFFFFFF),
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
+        )
+    }
+}
+
+private fun formatTime(ms: Long): String {
+    if (ms <= 0) return "00:00"
+    val totalSec = ms / 1000
+    val h = totalSec / 3600
+    val m = (totalSec % 3600) / 60
+    val s = totalSec % 60
+    return if (h > 0) String.format("%02d:%02d:%02d", h, m, s)
+    else String.format("%02d:%02d", m, s)
+}
+
+@Composable
+private fun SubtitleChooser(
+    options: List<PlayerEngine.SubtitleOption>,
+    selectedIndex: Int,
+    onSelect: (Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val items = listOf<PlayerEngine.SubtitleOption?>(null) + options
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xAA000000))
+            .clickable { onDismiss() }
+    ) {
+        Column(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .background(Color(0xEE222222), RoundedCornerShape(10.dp))
+                .padding(20.dp)
+        ) {
+            Text("选择字幕", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(8.dp))
+            items.forEachIndexed { idx, opt ->
+                val isSel = idx == selectedIndex
+                Text(
+                    text = opt?.label ?: "关闭字幕",
+                    color = if (isSel) Color.Yellow else Color.White,
+                    fontSize = 16.sp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onSelect(idx) }
+                        .padding(8.dp)
+                )
+            }
+        }
+    }
+}
+
+/** 从 Uri 读取视频文件名（content:// 取 DISPLAY_NAME，否则取最后路径段） */
+private fun resolveDisplayName(context: Context, uri: Uri): String {
+    if (uri.scheme == "content") {
+        runCatching {
+            context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) return c.getString(idx) ?: ""
+                }
+            }
+        }
+    }
+    return uri.lastPathSegment ?: uri.toString()
 }
 
 @Composable

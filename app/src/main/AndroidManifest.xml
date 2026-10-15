@@ -5,6 +5,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 本地视频文件播放所需读取权限（content:// 凭调用方授予的临时权限即可，以下为 file:// 兜底） -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
 
     <uses-feature android:name="android.hardware.type.television" android:required="false" />
     <uses-feature android:name="android.software.leanback" android:required="false" />
@@ -34,6 +37,39 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+
+            <!-- 作为本地/网络视频播放器：可被文件管理器/浏览器以 ACTION_VIEW 调起播放视频文件 -->
+            <!-- 1) 按 MIME 类型匹配（content://、http(s):// 视频链接，以及带 video/* MIME 的 file://） -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" android:mimeType="video/*" />
+                <data android:scheme="file" android:mimeType="video/*" />
+                <data android:scheme="http" android:mimeType="video/*" />
+                <data android:scheme="https" android:mimeType="video/*" />
+            </intent-filter>
+
+            <!-- 2) 按文件扩展名匹配（file:// 视频文件，即使没有 MIME 类型也能被识别并出现在「选择播放器」里） -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="file" android:pathPattern=".*\\.mkv" />
+                <data android:scheme="file" android:pathPattern=".*\\.mp4" />
+                <data android:scheme="file" android:pathPattern=".*\\.ts" />
+                <data android:scheme="file" android:pathPattern=".*\\.webm" />
+                <data android:scheme="file" android:pathPattern=".*\\.mov" />
+                <data android:scheme="file" android:pathPattern=".*\\.avi" />
+                <data android:scheme="file" android:pathPattern=".*\\.flv" />
+                <data android:scheme="file" android:pathPattern=".*\\.m2ts" />
+                <data android:scheme="file" android:pathPattern=".*\\.wmv" />
+                <data android:scheme="file" android:pathPattern=".*\\.3gp" />
+                <data android:scheme="file" android:pathPattern=".*\\.mpeg" />
+                <data android:scheme="file" android:pathPattern=".*\\.mpg" />
+                <data android:scheme="file" android:pathPattern=".*\\.vob" />
+                <data android:scheme="file" android:pathPattern=".*\\.m3u8" />
             </intent-filter>
         </activity>
 
