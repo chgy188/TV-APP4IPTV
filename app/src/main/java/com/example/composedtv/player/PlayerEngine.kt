@@ -2,6 +2,8 @@ package com.example.composedtv.player
 
 import android.content.Context
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import androidx.media3.common.MediaItem
@@ -14,6 +16,7 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
 import androidx.media3.common.C
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
@@ -65,7 +68,9 @@ data class PlayerState(
     /** 当前尝试的剩余超时（毫秒），每秒刷新，供 UI 倒计时显示；0 表示不展示 */
     val loadRemainMs: Long = 0L,
     /** 当前播放是否为直播（false 表示点播，可 seek / 显示控制条） */
-    val isLive: Boolean = true
+    val isLive: Boolean = true,
+    /** 当前加载速度估算（Kbps），0 表示暂无数据；加载中/播放中都可用 */
+    val loadSpeedKbps: Int = 0
 )
 
 /**
@@ -792,6 +797,15 @@ class PlayerEngine(private val context: Context) {
         val p = ExoPlayer.Builder(context, renderersFactory)
             .setMediaSourceFactory(mediaSourceFactory)
             .setLoadControl(loadControl)
+            .setBandwidthMeter(
+                DefaultBandwidthMeter.Builder(context).build().also { bwm ->
+                    bwm.addEventListener(Handler(Looper.getMainLooper())) { _, _, bitrateEstimate ->
+                        if (bitrateEstimate > 0) {
+                            updateState(loadSpeedKbps = (bitrateEstimate / 1000).toInt())
+                        }
+                    }
+                }
+            )
             .build()
 
         // 自适应码率（ABR）：信号差自动降分辨率，信号好自动升分辨率
@@ -1311,7 +1325,8 @@ class PlayerEngine(private val context: Context) {
         loadMode: String? = _state.value.loadMode,
         loadTimeoutMs: Long = _state.value.loadTimeoutMs,
         loadRemainMs: Long = _state.value.loadRemainMs,
-        isLive: Boolean = isLiveStream
+        isLive: Boolean = isLiveStream,
+        loadSpeedKbps: Int = _state.value.loadSpeedKbps
     ) {
         _state.value = PlayerState(
             currentIndex = currentIndex,
@@ -1327,7 +1342,8 @@ class PlayerEngine(private val context: Context) {
             loadMode = loadMode,
             loadTimeoutMs = loadTimeoutMs,
             loadRemainMs = loadRemainMs,
-            isLive = isLive
+            isLive = isLive,
+            loadSpeedKbps = loadSpeedKbps
         )
     }
 

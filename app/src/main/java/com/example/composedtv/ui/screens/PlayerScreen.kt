@@ -1,7 +1,3 @@
-@file:OptIn(
-    androidx.tv.material3.ExperimentalTvMaterial3Api::class
-)
-
 package com.example.composedtv.ui.screens
 
 import android.content.Context
@@ -19,6 +15,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,8 +25,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Star
@@ -50,11 +50,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.State
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.focusTarget
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
@@ -76,9 +80,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.ui.PlayerView
-import com.example.composedtv.viewmodel.RendererMode
-import androidx.tv.material3.ClickableSurfaceDefaults
-import androidx.tv.material3.Surface as TvSurface
 import com.example.composedtv.R
 import com.example.composedtv.debug.DebugDiagnostics
 import com.example.composedtv.debug.DebugHudHost
@@ -242,24 +243,29 @@ fun PlayerScreen(
 
     val openSubtitleChooser: () -> Unit = {
         subtitleOptions = engine.getSubtitleTracks()
-        subtitleSelectedIndex = subtitleOptions.indexOfFirst { it.selected }.takeIf { it >= 0 } ?: 0
+        // UI 索引：0=关闭字幕, 1..N 对应 options[0..N-1]
+        val selIdx = subtitleOptions.indexOfFirst { it.selected }
+        subtitleSelectedIndex = if (selIdx >= 0) selIdx + 1 else 0
         subtitleChooserVisible = true
     }
     val confirmSubtitleSelection: () -> Unit = {
-        val opt = subtitleOptions.getOrNull(subtitleSelectedIndex)
+        // UI 索引 0=关闭, >=1 对应 options[idx-1]
+        val opt = if (subtitleSelectedIndex <= 0) null
+                  else subtitleOptions.getOrNull(subtitleSelectedIndex - 1)
         engine.selectSubtitle(opt)
         subtitleChooserVisible = false
         Toast.makeText(context, "字幕：${opt?.label ?: "关闭"}", Toast.LENGTH_SHORT).show()
     }
     fun handleSubtitleChooserKey(event: androidx.compose.ui.input.key.KeyEvent): Boolean {
         if (event.type != KeyEventType.KeyDown) return false
+        val uiCount = subtitleOptions.size + 1 // +1 for "关闭字幕"
         when (event.key) {
             Key.DirectionUp -> {
                 subtitleSelectedIndex = (subtitleSelectedIndex - 1).coerceAtLeast(0)
                 return true
             }
             Key.DirectionDown -> {
-                subtitleSelectedIndex = (subtitleSelectedIndex + 1).coerceAtMost(subtitleOptions.lastIndex.coerceAtLeast(0))
+                subtitleSelectedIndex = (subtitleSelectedIndex + 1).coerceAtMost(uiCount - 1)
                 return true
             }
             Key.DirectionCenter, Key.Enter -> {
@@ -654,6 +660,18 @@ fun PlayerScreen(
                         color = Color.White,
                         fontSize = 15.sp
                     )
+                    if (playerState.loadSpeedKbps > 0) {
+                        val speedText = if (playerState.loadSpeedKbps >= 1000) {
+                            String.format("%.1f Mb/s", playerState.loadSpeedKbps / 1000f)
+                        } else {
+                            "${playerState.loadSpeedKbps} Kb/s"
+                        }
+                        Text(
+                            text = speedText,
+                            color = Color(0xFF4FC3F7),
+                            fontSize = 13.sp
+                        )
+                    }
                     if (playerState.loadRemainMs > 0) {
                         // 向上取整，避免最后一秒显示 0
                         val remainSec = (playerState.loadRemainMs + 999) / 1000
@@ -1170,9 +1188,26 @@ private fun VodControlBar(
 
 @Composable
 private fun CtlFocusButton(text: String, onClick: () -> Unit) {
-    TvSurface(
-        onClick = onClick,
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+    val isPressed by interactionSource.collectIsPressedAsState()
+
+    Box(
+        contentAlignment = Alignment.Center,
         modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(
+                when {
+                    isPressed -> Color(0x55FFFFFF)
+                    isFocused -> Color(0x33FFFFFF)
+                    else -> Color.Transparent
+                }
+            )
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = onClick
+            )
             .focusable()
             .onKeyEvent { event ->
                 if (event.type == KeyEventType.KeyDown &&
@@ -1180,21 +1215,14 @@ private fun CtlFocusButton(text: String, onClick: () -> Unit) {
                     onClick()
                     true
                 } else false
-            },
-        shape = ClickableSurfaceDefaults.shape(shape = RoundedCornerShape(6.dp)),
-        colors = ClickableSurfaceDefaults.colors(
-            containerColor = Color.Transparent,
-            focusedContainerColor = Color(0x33FFFFFF),
-            pressedContainerColor = Color(0x55FFFFFF)
-        ),
-        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.08f)
+            }
+            .padding(horizontal = 10.dp, vertical = 3.dp)
     ) {
         Text(
             text = text,
             color = Color(0xEEFFFFFF),
             fontSize = 13.sp,
-            fontWeight = FontWeight.Medium,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
+            fontWeight = FontWeight.Medium
         )
     }
 }
@@ -1216,32 +1244,66 @@ private fun SubtitleChooser(
     onSelect: (Int) -> Unit,
     onDismiss: () -> Unit
 ) {
-    val items = listOf<PlayerEngine.SubtitleOption?>(null) + options
+    val uiItems = listOf<String?>(null) + options.map { it.label }
+    val listState = rememberLazyListState(
+        initialFirstVisibleItemIndex = selectedIndex.coerceIn(0, uiItems.lastIndex.coerceAtLeast(0))
+    )
+    LaunchedEffect(selectedIndex) {
+        listState.animateScrollToItem(selectedIndex)
+    }
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xAA000000))
-            .clickable { onDismiss() }
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onDismiss
+            )
     ) {
-        Column(
+        Surface(
             modifier = Modifier
                 .align(Alignment.Center)
-                .background(Color(0xEE222222), RoundedCornerShape(10.dp))
-                .padding(20.dp)
+                .widthIn(max = 340.dp)
+                .heightIn(max = 500.dp),
+            shape = RoundedCornerShape(10.dp),
+            color = Color(0xEE222222)
         ) {
-            Text("选择字幕", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-            Spacer(modifier = Modifier.height(8.dp))
-            items.forEachIndexed { idx, opt ->
-                val isSel = idx == selectedIndex
+            Column {
                 Text(
-                    text = opt?.label ?: "关闭字幕",
-                    color = if (isSel) Color.Yellow else Color.White,
-                    fontSize = 16.sp,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { onSelect(idx) }
-                        .padding(8.dp)
+                    "选择字幕",
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(start = 20.dp, top = 16.dp, end = 20.dp, bottom = 8.dp)
                 )
+                LazyColumn(state = listState, modifier = Modifier.weight(1f)) {
+                    itemsIndexed(uiItems, key = { idx, _ -> idx }) { idx, label ->
+                        val isSel = idx == selectedIndex
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .then(
+                                    if (isSel) Modifier.background(Color(0x44FFEB3B))
+                                    else Modifier
+                                )
+                                .clickable { onSelect(idx) }
+                                .padding(horizontal = 20.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = label ?: "关闭字幕",
+                                color = if (isSel) Color.Yellow else Color(0xCCFFFFFF),
+                                fontSize = 16.sp,
+                                fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal
+                            )
+                            if (isSel) {
+                                Spacer(Modifier.weight(1f))
+                                Text("✓", color = Color.Yellow, fontSize = 16.sp)
+                            }
+                        }
+                    }
+                }
             }
         }
     }
