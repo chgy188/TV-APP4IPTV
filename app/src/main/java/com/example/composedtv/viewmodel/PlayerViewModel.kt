@@ -608,10 +608,13 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "loadFirstFavoriteChannel failed", e)
-                _uiState.value = _uiState.value.copy(
-                    isLoading = false,
-                    errorMessage = "加载收藏失败：${e.message}"
-                )
+                if (e is kotlinx.coroutines.CancellationException) {
+                    _uiState.value = _uiState.value.copy(isLoading = false)
+                    throw e
+                }
+                // 非取消异常：退化为游客起始频道，保证用户至少能看
+                Log.w(TAG, "加载收藏异常，退化为游客起始频道")
+                loadGuestStartChannel()
             }
         }
     }

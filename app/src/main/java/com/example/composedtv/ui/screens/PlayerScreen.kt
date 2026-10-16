@@ -132,10 +132,12 @@ private val VOD_SEEK_KEYS = setOf(
     android.view.KeyEvent.KEYCODE_DPAD_RIGHT,
     android.view.KeyEvent.KEYCODE_MEDIA_FAST_FORWARD
 )
-private val VOD_PLAY_PAUSE_KEYS = setOf(
+private val VOD_SIDE_PANEL_KEYS = setOf(
     android.view.KeyEvent.KEYCODE_DPAD_CENTER,
     android.view.KeyEvent.KEYCODE_ENTER,
-    android.view.KeyEvent.KEYCODE_NUMPAD_ENTER,
+    android.view.KeyEvent.KEYCODE_NUMPAD_ENTER
+)
+private val VOD_TOGGLE_PAUSE_KEYS = setOf(
     android.view.KeyEvent.KEYCODE_SPACE,
     android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
 )
@@ -233,6 +235,9 @@ fun PlayerScreen(
     val isVod = externalUri != null || !playerState.isLive
     val vodId = externalUri?.toString() ?: ""
     var vodControlsVisible by remember { mutableStateOf(true) }
+    var vodControlsAutoHideKey by remember { mutableStateOf(0) }
+    /** 控制条按钮焦点索引：null=无按钮聚焦，0..5 对应 «10s / ⏸ / 10s» / 列表 / 收藏 / 字幕 */
+    var vodButtonFocusIndex by remember { mutableStateOf<Int?>(null) }
     var vodPosition by remember { mutableStateOf(0L) }
     var vodDuration by remember { mutableStateOf(0L) }
     var vodResumeDone by remember { mutableStateOf(false) }
@@ -340,10 +345,13 @@ fun PlayerScreen(
     }
 
     // VOD：播放中控制条自动隐藏（任意交互会重新显示）
-    LaunchedEffect(vodControlsVisible, playerState.isPlaying) {
+    // 注意：isVod 必须在 key 中。开播时 isLive 默认为 true → isVod=false，
+    // 控制条不渲染；等引擎识别为点播后 isVod 变 true，LaunchedEffect 必须重启才能启动 timer。
+    LaunchedEffect(isVod, vodControlsVisible, playerState.isPlaying, vodControlsAutoHideKey) {
         if (isVod && vodControlsVisible && playerState.isPlaying) {
             delay(2500)
             vodControlsVisible = false
+            vodButtonFocusIndex = null
         }
     }
 
@@ -435,6 +443,60 @@ fun PlayerScreen(
                         openSubtitleChooser()
                         true
                     }
+                    // VOD 控制条按钮焦点导航（遥控器方向键 / 确定键）
+                    // 仅当侧边栏和设置抽屉都关闭时才拦截；否则让事件传给面板内焦点项
+                    !uiState.sidePanelVisible && !uiState.settingsVisible &&
+                    isVod && vodControlsVisible && vodButtonFocusIndex != null && event.type == KeyEventType.KeyDown -> {
+                        val key = event.key.nativeKeyCode
+                        val btnCount = 6 // «10s / ⏸ / 10s» / 列表 / 收藏 / 字幕
+                        when (key) {
+                            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                                vodButtonFocusIndex = ((vodButtonFocusIndex!! - 1) + btnCount) % btnCount
+                                vodControlsAutoHideKey++
+                                true
+                            }
+                            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                                vodButtonFocusIndex = (vodButtonFocusIndex!! + 1) % btnCount
+                                vodControlsAutoHideKey++
+                                true
+                            }
+                            KeyEvent.KEYCODE_DPAD_UP -> {
+                                vodButtonFocusIndex = null
+                                vodControlsAutoHideKey++
+                                true
+                            }
+                            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                                when (vodButtonFocusIndex) {
+                                    0 -> engine.seekBy(-10_000)
+                                    1 -> engine.togglePause()
+                                    2 -> engine.seekBy(10_000)
+                                    3 -> {
+                                        vodControlsVisible = false
+                                        vodButtonFocusIndex = null
+                                        val cur = engine.run { getCurrentPlaylist().getOrNull(getCurrentIndex()) }
+                                        vm.toggleSidePanel(cur)
+                                    }
+                                    4 -> engine.toggleFavorite()
+                                    5 -> openSubtitleChooser()
+                                }
+                                vodControlsVisible = true
+                                vodControlsAutoHideKey++
+                                true
+                            }
+                            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                                // 下键在按钮已聚焦时不做导航（保持在当前按钮），但重置自动隐藏
+                                vodControlsAutoHideKey++
+                                true
+                            }
+                            KeyEvent.KEYCODE_BACK -> {
+                                vodButtonFocusIndex = null
+                                vodControlsAutoHideKey++
+                                true
+                            }
+                            else -> false
+                        }
+                    }
+                    !uiState.sidePanelVisible && !uiState.settingsVisible &&
                     isVod && event.type == KeyEventType.KeyDown && event.key.nativeKeyCode in VOD_SEEK_KEYS -> {
                         engine.seekBy(
                             if (event.key.nativeKeyCode == KeyEvent.KEYCODE_DPAD_LEFT
@@ -442,14 +504,43 @@ fun PlayerScreen(
                             ) -10_000 else 10_000
                         )
                         vodControlsVisible = true
+                        vodControlsAutoHideKey++
                         true
                     }
-                    isVod && event.type == KeyEventType.KeyDown && event.key.nativeKeyCode in VOD_PLAY_PAUSE_KEYS -> {
-                        engine.togglePause()
+                    !uiState.sidePanelVisible && !uiState.settingsVisible &&
+                    isVod && event.type == KeyEventType.KeyDown && event.key.nativeKeyCode in VOD_SIDE_PANEL_KEYS -> {
+                        // OK/Enter：打开节目栏，暂停/恢复由 sidePanelVisible 的 LaunchedEffect 处理
                         vodControlsVisible = true
+                        vodControlsAutoHideKey++
                         val cur = engine.run { getCurrentPlaylist().getOrNull(getCurrentIndex()) }
                         vm.toggleSidePanel(cur)
                         true
+                    }
+                    // VOD 空格/媒体播放暂停键：仅切换暂停，不打开侧边栏
+                    !uiState.sidePanelVisible && !uiState.settingsVisible &&
+                    isVod && event.type == KeyEventType.KeyDown && event.key.nativeKeyCode in VOD_TOGGLE_PAUSE_KEYS -> {
+                        engine.togglePause()
+                        vodControlsVisible = true
+                        vodControlsAutoHideKey++
+                        true
+                    }
+                    // VOD 控制条可见但无按钮聚焦时：下键进入控制条、上键不做切台
+                    // 仅当侧边栏和设置抽屉都关闭时才拦截
+                    !uiState.sidePanelVisible && !uiState.settingsVisible &&
+                    isVod && vodControlsVisible && event.type == KeyEventType.KeyDown -> {
+                        when (event.key.nativeKeyCode) {
+                            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                                vodButtonFocusIndex = 0
+                                vodControlsAutoHideKey++
+                                true
+                            }
+                            KeyEvent.KEYCODE_DPAD_UP -> {
+                                // 上键不切台，仅重置自动隐藏计时
+                                vodControlsAutoHideKey++
+                                true
+                            }
+                            else -> false
+                        }
                     }
                     else -> handlePlayerKeyEvent(
                         event = event,
@@ -505,6 +596,8 @@ fun PlayerScreen(
                         if (isVod) {
                             // 点播：点击画面切换控制条显隐
                             vodControlsVisible = !vodControlsVisible
+                            if (vodControlsVisible) vodControlsAutoHideKey++
+                            else vodButtonFocusIndex = null
                         } else if (isRightSide) {
                             // 右半屏 tap：弹出设置抽屉
                             vm.toggleSettingsDrawer()
@@ -524,6 +617,7 @@ fun PlayerScreen(
                                 .toFloat().coerceAtLeast(1f)
                             engine.seekBy((dx * (vodDuration / screenW)).toLong())
                             vodControlsVisible = true
+                            vodControlsAutoHideKey++
                         }
                     }
                 )
@@ -801,14 +895,18 @@ fun PlayerScreen(
                 positionMs = vodPosition,
                 durationMs = vodDuration,
                 isPlaying = playerState.isPlaying,
-                onSeekDelta = { engine.seekBy(it); vodControlsVisible = true },
-                onSeekTo = { engine.seekTo(it); vodControlsVisible = true },
-                onPlayPause = { engine.togglePause(); vodControlsVisible = true },
+                isFavorite = playerState.isFavorite,
+                focusedIndex = vodButtonFocusIndex,
+                onSeekDelta = { engine.seekBy(it); vodControlsVisible = true; vodControlsAutoHideKey++ },
+                onSeekTo = { engine.seekTo(it); vodControlsVisible = true; vodControlsAutoHideKey++ },
+                onPlayPause = { engine.togglePause(); vodControlsVisible = true; vodControlsAutoHideKey++ },
                 onOpenPlaylist = {
                     vodControlsVisible = false
+                    vodButtonFocusIndex = null
                     val cur = engine.run { getCurrentPlaylist().getOrNull(getCurrentIndex()) }
                     vm.toggleSidePanel(cur)
                 },
+                onFavorite = { engine.toggleFavorite(); vodControlsAutoHideKey++ },
                 onSubtitle = { openSubtitleChooser() },
                 modifier = Modifier.align(Alignment.BottomCenter)
             )
@@ -1131,10 +1229,13 @@ private fun VodControlBar(
     positionMs: Long,
     durationMs: Long,
     isPlaying: Boolean,
+    isFavorite: Boolean,
+    focusedIndex: Int?,
     onSeekDelta: (Long) -> Unit,
     onSeekTo: (Long) -> Unit,
     onPlayPause: () -> Unit,
     onOpenPlaylist: () -> Unit,
+    onFavorite: () -> Unit,
     onSubtitle: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1172,24 +1273,24 @@ private fun VodControlBar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            CtlFocusButton("«10s") { onSeekDelta(-10_000) }
-            CtlFocusButton(if (isPlaying) "⏸" else "▶") { onPlayPause() }
-            CtlFocusButton("10s»") { onSeekDelta(10_000) }
-            CtlFocusButton("列表") { onOpenPlaylist() }
+            CtlFocusButton("«10s", isFocused = focusedIndex == 0) { onSeekDelta(-10_000) }
+            CtlFocusButton(if (isPlaying) "⏸" else "▶", isFocused = focusedIndex == 1) { onPlayPause() }
+            CtlFocusButton("10s»", isFocused = focusedIndex == 2) { onSeekDelta(10_000) }
+            CtlFocusButton("列表", isFocused = focusedIndex == 3) { onOpenPlaylist() }
+            CtlFocusButton(if (isFavorite) "★" else "☆", isFocused = focusedIndex == 4) { onFavorite() }
             Spacer(Modifier.width(8.dp))
             Text(formatTime(positionMs), color = Color(0xCCFFFFFF), fontSize = 12.sp)
             Text("/", color = Color(0x66FFFFFF), fontSize = 12.sp)
             Text(formatTime(durationMs), color = Color(0xCCFFFFFF), fontSize = 12.sp)
-            CtlFocusButton("字幕") { onSubtitle() }
+            CtlFocusButton("字幕", isFocused = focusedIndex == 5) { onSubtitle() }
             Spacer(Modifier.fillMaxWidth())
         }
     }
 }
 
 @Composable
-private fun CtlFocusButton(text: String, onClick: () -> Unit) {
+private fun CtlFocusButton(text: String, isFocused: Boolean = false, onClick: () -> Unit) {
     val interactionSource = remember { MutableInteractionSource() }
-    val isFocused by interactionSource.collectIsFocusedAsState()
     val isPressed by interactionSource.collectIsPressedAsState()
 
     Box(
