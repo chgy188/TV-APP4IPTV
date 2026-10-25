@@ -233,16 +233,12 @@ fun PlayerScreen(
     // 另：通过其他 App 以 ACTION_VIEW 打开的本地/网络文件（externalUri != null）必然可 seek，
     // 故直接判定为点播，避免首帧误判为直播（如 .ts 录制文件）导致控制条/进度/字幕不可用。
     val isVod = externalUri != null || !playerState.isLive
-    val vodId = externalUri?.toString() ?: ""
     var vodControlsVisible by remember { mutableStateOf(true) }
     var vodControlsAutoHideKey by remember { mutableStateOf(0) }
     /** 控制条按钮焦点索引：null=无按钮聚焦，0..5 对应 «10s / ⏸ / 10s» / 列表 / 收藏 / 字幕 */
     var vodButtonFocusIndex by remember { mutableStateOf<Int?>(null) }
     var vodPosition by remember { mutableStateOf(0L) }
     var vodDuration by remember { mutableStateOf(0L) }
-    var vodResumeDone by remember { mutableStateOf(false) }
-    val vodSavedPos = remember(vodId) { if (vodId.isNotBlank()) VodProgressStore.load(context, vodId) else 0L }
-
     // 把 VOD 模式同步给 ViewModel，供 MainActivity 在 dispatchKeyEvent 中决定是否拦截左右/确定键
     LaunchedEffect(isVod) { vm.setIsVod(isVod) }
 
@@ -320,26 +316,13 @@ fun PlayerScreen(
         }
     }
 
-    // VOD：轮询进度，并做断点续播 + 周期保存播放位置
+    // VOD：轮询进度供控制条显示（断点续播 / 周期保存 / 播完清除已移至 PlayerEngine，
+    // 以 currentPlayingUrl 为稳定 id，覆盖外部文件与应用内点播）
     LaunchedEffect(isVod) {
         if (!isVod) return@LaunchedEffect
-        var saveCounter = 0
         while (true) {
             vodPosition = engine.getCurrentPosition()
             vodDuration = engine.getDuration()
-            // 续播：拿到时长后跳到上次位置（仅一次）
-            if (!vodResumeDone && vodDuration > 0 && vodSavedPos > 0) {
-                engine.seekTo(vodSavedPos)
-                vodResumeDone = true
-                Log.d("PlayerScreen", "VOD 续播：跳至 ${vodSavedPos}ms")
-            }
-            // 播放到末尾：清除记录，下次从头开始；否则每 ~5s 保存一次
-            if (vodDuration > 0 && vodPosition >= vodDuration - 1500) {
-                VodProgressStore.clear(context, vodId)
-            } else if (++saveCounter >= 10) {
-                VodProgressStore.save(context, vodId, vodPosition)
-                saveCounter = 0
-            }
             delay(500)
         }
     }
@@ -754,16 +737,35 @@ fun PlayerScreen(
                         color = Color.White,
                         fontSize = 15.sp
                     )
-                    if (playerState.loadSpeedKbps > 0) {
-                        val speedText = if (playerState.loadSpeedKbps >= 1000) {
-                            String.format("%.1f Mb/s", playerState.loadSpeedKbps / 1000f)
+                    // 真实下载速率（按真实字节测量）：停滞时为 0 并标红告警；同时展示估算值供参考
+                    val realKbps = playerState.loadSpeedRealKbps
+                    val estKbps = playerState.loadSpeedKbps
+                    if (realKbps > 0 || estKbps > 0) {
+                        val speedText = if (realKbps > 0) {
+                            if (realKbps >= 1000) String.format("%.1f Mb/s", realKbps / 1000f)
+                            else "$realKbps Kb/s"
                         } else {
-                            "${playerState.loadSpeedKbps} Kb/s"
+                            "停滞 估算 ${if (estKbps >= 1000) String.format("%.1f Mb/s", estKbps / 1000f) else "$estKbps Kb/s"}"
                         }
                         Text(
-                            text = speedText,
-                            color = Color(0xFF4FC3F7),
+                            text = "实际速率 $speedText",
+                            color = if (realKbps > 0) Color(0xFF4FC3F7) else Color(0xFFFF5252),
                             fontSize = 13.sp
+                        )
+                    }
+                    if (playerState.totalBytesLoadedMB > 0f) {
+                        Text(
+                            text = "已下载 ${"%.1f".format(playerState.totalBytesLoadedMB)} MB",
+                            color = Color.Gray,
+                            fontSize = 12.sp
+                        )
+                    }
+                    if (playerState.currentLoadUrl.isNotBlank()) {
+                        Text(
+                            text = playerState.currentLoadUrl,
+                            color = Color.Gray,
+                            fontSize = 10.sp,
+                            maxLines = 3
                         )
                     }
                     if (playerState.loadRemainMs > 0) {

@@ -90,7 +90,12 @@ data class DiagSnapshot(
     val lastError: String = "-",
 
     // ===== 日志 =====
-    val logLines: Int = 0
+    val logLines: Int = 0,
+
+    // ===== 连接真实信息（真实下载速率 / 累计字节 / 实际请求 URL） =====
+    val realSpeedKbps: Int = 0,
+    val totalMB: Float = 0f,
+    val loadUrl: String = ""
 )
 
 object DebugDiagnostics {
@@ -123,6 +128,17 @@ object DebugDiagnostics {
 
     @Volatile
     private var usingProxy: Boolean = false
+
+    @Volatile private var realSpeedKbps: Int = 0
+    @Volatile private var totalMB: Float = 0f
+    @Volatile private var loadUrl: String = ""
+
+    /** 由 PlayerEngine 真实速率采样协程写入：真实下载速率(Kbps) / 已下载 MB / 实际请求 URL */
+    fun setConnInfo(realKbps: Int, totalMB: Float, url: String) {
+        this.realSpeedKbps = realKbps
+        this.totalMB = totalMB
+        this.loadUrl = url
+    }
 
     fun init(context: Context) {
         appContext = context.applicationContext
@@ -365,7 +381,10 @@ object DebugDiagnostics {
             lastReloadReason = lastReloadReason,
             errorCount = cError.get(),
             lastError = lastError,
-            logLines = logSize()
+            logLines = logSize(),
+            realSpeedKbps = realSpeedKbps,
+            totalMB = totalMB,
+            loadUrl = loadUrl
         )
     }
 

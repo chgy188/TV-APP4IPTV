@@ -75,6 +75,13 @@ fun DebugHud(s: DiagSnapshot, modifier: Modifier = Modifier) {
         HudLine("编码", "${s.codecs} ${s.mime}", false)
         HudLine("状态", "${s.state} loading=${s.isLoading} buf=${s.bufferedMs / 1000}s", s.isLoading)
         HudLine(
+            "真实速率",
+            "${if (s.realSpeedKbps >= 1000) String.format(Locale.US, "%.1f Mb/s", s.realSpeedKbps / 1000f) else s.realSpeedKbps.toString() + " Kb/s"}${if (s.isLoading && s.realSpeedKbps == 0) " ⚠停滞" else ""}",
+            s.isLoading && s.realSpeedKbps == 0
+        )
+        HudLine("已下载", String.format(Locale.US, "%.1f MB", s.totalMB), false)
+        if (s.loadUrl.isNotBlank()) HudLine("加载URL", s.loadUrl, false)
+        HudLine(
             "出帧",
             String.format(
                 Locale.US,

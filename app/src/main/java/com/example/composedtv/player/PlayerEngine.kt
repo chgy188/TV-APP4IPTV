@@ -16,11 +16,15 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.source.LoadEventInfo
+import androidx.media3.exoplayer.source.MediaLoadData
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
 import androidx.media3.common.C
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import com.example.composedtv.data.remote.ApiClient
+import com.example.composedtv.data.VodProgressStore
 import com.example.composedtv.debug.DebugDiagnostics
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancel
@@ -30,7 +34,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.ConnectionPool
+import okhttp3.ConnectionSpec
 import okhttp3.OkHttpClient
+import okhttp3.TlsVersion
 import java.util.concurrent.TimeUnit
 
 /** 播放列表项 */
@@ -70,7 +76,13 @@ data class PlayerState(
     /** 当前播放是否为直播（false 表示点播，可 seek / 显示控制条） */
     val isLive: Boolean = true,
     /** 当前加载速度估算（Kbps），0 表示暂无数据；加载中/播放中都可用 */
-    val loadSpeedKbps: Int = 0
+    val loadSpeedKbps: Int = 0,
+    /** 真实下载速度（Kbps，按真实字节数测量）：停滞时为 0，用于区分"假速率"与真实传输 */
+    val loadSpeedRealKbps: Int = 0,
+    /** 当前尝试已下载总字节（MB，真实测量） */
+    val totalBytesLoadedMB: Float = 0f,
+    /** 当前尝试实际请求的 URL（直连为源地址；代理为 /api/hls?url= 包裹地址），供排查 */
+    val currentLoadUrl: String = ""
 )
 
 /**
@@ -104,11 +116,21 @@ class PlayerEngine(private val context: Context) {
          * 进程内单例共享以复用连接池：HLS 每几秒请求一个分片，连接复用可显著减少 TCP/TLS 重连开销。
          */
         private val playHttpClient: OkHttpClient by lazy {
+            // 强制 TLS 1.2 / 1.3：老 Android 盒子（API≤22）平台默认禁用 TLS1.2，
+            // 导致直连 https 流握手失败/挂起 → 表现为"一直缓冲"。OkHttp 的 ConnectionSpec
+            // 会显式 setEnabledProtocols，覆盖平台默认，使 TLS1.2 在老设备也能启用；
+            // TLS1.3 在 API<29 无平台实现，此处列出仅当设备支持时才协商，不影响回退到 1.2。
+            val tlsSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
+                .tlsVersions(TlsVersion.TLS_1_3, TlsVersion.TLS_1_2)
+                .build()
             OkHttpClient.Builder()
+                .connectionSpecs(listOf(tlsSpec, ConnectionSpec.CLEARTEXT))
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(45, TimeUnit.SECONDS)   // 切片下载半路卡住时给更长的续传窗口，抗抖动
                 .connectionPool(ConnectionPool(8, 30, TimeUnit.SECONDS))
-                .retryOnConnectionFailure(true)
+                // 快速失败：关闭 OkHttp 自动重连，死连接 / 握手失败立即抛错（分段重试交给 Media3
+                // 的 LenientLoadErrorHandlingPolicy），避免"永久缓冲"掩盖真实错误让用户以为在加载。
+                .retryOnConnectionFailure(false)
                 .build()
         }
 
@@ -279,8 +301,8 @@ class PlayerEngine(private val context: Context) {
     private var currentChannelHeaders: Map<String, String> = emptyMap()
     private var consecutiveErrors = 0
 
-    /** 重载前保存的播放位置（毫秒），用于点播内容恢复进度 */
-    private var pendingResumePositionMs: Long = 0
+    /** 点播进度周期保存协程（每 5s 写入 VodProgressStore，直到切台/重载/播完） */
+    private var vodProgressJob: Job? = null
     /** 当前播放是否为直播流（默认按直播处理，避免电视直播误显示点播控制条） */
     private var isLiveStream = true
 
@@ -302,6 +324,16 @@ class PlayerEngine(private val context: Context) {
     private var currentAttemptIndex = -1
     /** 单个尝试的起播超时协程：超时未 READY 即切下一个尝试 */
     private var attemptTimeoutJob: Job? = null
+    /** 真实速率/已下载采样协程 */
+    private var connStatsJob: Job? = null
+    /** 真实已下载总字节（由 AnalyticsListener 的 PlaybackStats 写入），用于计算真实速率 */
+    @Volatile private var lastTotalBytes = 0L
+    /** 当前尝试开始时间(ms)，用于停滞看门狗宽限期 */
+    private var attemptStartedAt = 0L
+    /** 连续"实际速率为 0 且仍在加载"的秒数，超阈值判停滞并切下一候选 */
+    private var stallSeconds = 0
+    /** 停滞看门狗阈值(秒)：加载中且真实速率持续为 0 超过该值即切下一候选（解决点播直连无限卡住） */
+    private val STALL_FAIL_SEC = 12
     /** 直连候选的起播超时：超时即切换下一个（连接类错误会立即切换，不走这里）。
      *  默认 20s（设置里的最长可选项）：弱网 / 慢源也能稳定起播，不被过早切走；
      *  点播场景直连不设时限（见 [startAttemptTimeout]），此处仅用于直播直连。
@@ -536,7 +568,19 @@ class PlayerEngine(private val context: Context) {
         if (finalLive != isLiveStream) {
             isLiveStream = finalLive
             updateState(isLive = finalLive)
-            if (!finalLive) setPreferredTextLanguages(listOf("zh", "en"))
+            if (!finalLive) {
+                // 校正为点播：补做断点续播 + 周期保存。
+                // （HLS 点播型在 onRaceWin 时 isLiveStream 仍为 true，只能在此处识别为点播）
+                setPreferredTextLanguages(listOf("zh", "en"))
+                val resume = VodProgressStore.load(context, currentPlayingUrl)
+                if (resume > 0) {
+                    Log.d(TAG, "恢复点播播放位置(HLS校正): ${resume}ms")
+                    exo.seekTo(resume)
+                }
+                startVodProgressSaver(exo)
+            } else {
+                stopVodProgressSaver()
+            }
             Log.d(TAG, "refineLiveFromPlayer: $rawUrl -> isLive=$finalLive (exoLive=$exoLive)")
         }
     }
@@ -911,13 +955,26 @@ class PlayerEngine(private val context: Context) {
         val attempt = currentAttempts[nextIndex]
         Log.d(TAG, "串行尝试[$nextIndex/${currentAttempts.size}]: $attempt")
         // 简洁展示：UI 加载区显示当前正在尝试的模式（直连/代理）与超时阈值
-        // 点播直连不设时限：VOD 采用无限等待，直至出画或连接类错误（不会因超时被切走）
+        // 点播直连不设时限：VOD 采用无限等待，直至出画或连接类错误（不会因超时被切走）；
+        // 但为防"连接停滞（无数据）无限卡住"，由 startConnStatsSampler 的停滞看门狗兜底。
         val loadTimeout = when {
             attempt == "proxy" -> proxyTimeoutMs
             isLiveStream -> directTimeoutMs
             else -> 0L
         }
-        updateState(loadMode = attempt, loadTimeoutMs = loadTimeout, loadRemainMs = loadTimeout)
+        // 记录本次尝试实际请求的 URL（代理为 /api/hls?url= 包裹地址），供前端展示与排查
+        val finalUrl = if (attempt == "proxy") ApiClient.hlsProxyUrl(url) else url
+        updateState(
+            loadMode = attempt,
+            loadTimeoutMs = loadTimeout,
+            loadRemainMs = loadTimeout,
+            currentLoadUrl = finalUrl
+        )
+        // 重置真实字节统计并启动采样（含停滞看门狗）
+        lastTotalBytes = 0L
+        attemptStartedAt = System.currentTimeMillis()
+        stallSeconds = 0
+        startConnStatsSampler()
 
         // 先释放上一个尝试的 player，确保同一时刻只有 1 个 ExoPlayer（内存恒定单路）
         for (c in raceCandidates) safeRelease(c.exo)
@@ -957,6 +1014,44 @@ class PlayerEngine(private val context: Context) {
         }
     }
 
+    /**
+     * 真实速率/已下载采样：每秒采样一次，把真实下载速率与累计字节写入状态供 UI 展示；
+     * 并内置停滞看门狗——加载中且真实速率持续为 0（排除前 4s 连接建立宽限期）超过阈值，
+     * 判定连接已停滞（无数据），自动切到下一个候选（点播直连无超时，靠它避免无限卡住）。
+     */
+    private fun startConnStatsSampler() {
+        connStatsJob?.cancel()
+        lastTotalBytes = 0L
+        var prevBytes = 0L
+        attemptStartedAt = System.currentTimeMillis()
+        stallSeconds = 0
+        connStatsJob = scope.launch {
+            while (true) {
+                delay(1_000)
+                if (raceDecided) break
+                val total = lastTotalBytes
+                // 真实速率(Kbps) = 1s 窗口内字节增量 × 8 / 1000
+                val kbps = ((total - prevBytes) * 8 / 1000).toInt()
+                prevBytes = total
+                DebugDiagnostics.setConnInfo(kbps, total / 1_000_000f, _state.value.currentLoadUrl)
+                val loadingNow = _state.value.isLoading
+                val elapsed = System.currentTimeMillis() - attemptStartedAt
+                if (loadingNow && kbps <= 0 && elapsed > 4_000L) {
+                    stallSeconds++
+                    if (stallSeconds >= STALL_FAIL_SEC) {
+                        Log.w(TAG, "连接停滞看门狗：加载中长时间无数据传输，切下一候选 url=${_state.value.currentLoadUrl}")
+                        stallSeconds = 0
+                        tryNextAttempt(currentPlayingUrl)
+                        break
+                    }
+                } else {
+                    stallSeconds = 0
+                }
+                updateState(loadSpeedRealKbps = kbps, totalBytesLoadedMB = total / 1_000_000f)
+            }
+        }
+    }
+
     private fun stopAttemptTimeout() {
         attemptTimeoutJob?.cancel()
         attemptTimeoutJob = null
@@ -964,6 +1059,17 @@ class PlayerEngine(private val context: Context) {
 
     private fun attachCandidateListener(cand: RaceCandidate, url: String, token: Int) {
         val exo = cand.exo ?: return
+        // 真实下载字节统计：每次分片/区间加载完成累加 bytesLoaded，供真实速率与停滞看门狗使用
+        // 真实下载字节统计：每次分片/区间加载完成累加 bytesLoaded，供真实速率计算与停滞看门狗使用
+        exo.addAnalyticsListener(object : AnalyticsListener {
+            override fun onLoadCompleted(
+                eventTime: AnalyticsListener.EventTime,
+                loadEventInfo: LoadEventInfo,
+                mediaLoadData: MediaLoadData
+            ) {
+                lastTotalBytes += loadEventInfo.bytesLoaded
+            }
+        })
         exo.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
                 if (token != racePlayToken || raceDecided) return
@@ -1030,14 +1136,23 @@ class PlayerEngine(private val context: Context) {
                 winner.attempt == "proxy"
             )
             winExo.playWhenReady = true
-            // 点播内容：恢复到重载前的播放位置
-            if (!isLiveStream && pendingResumePositionMs > 0) {
-                Log.d(TAG, "恢复点播播放位置: ${pendingResumePositionMs}ms")
-                winExo.seekTo(pendingResumePositionMs)
-                pendingResumePositionMs = 0
+            // 点播内容：断点续播（HLS 点播型在 refineLiveFromPlayer 校正后才识别，那里补做）。
+            // 此处处理初始即判定为点播（mp4 / 外部文件 / 容器格式）的情况；直播则停止保存协程。
+            if (!isLiveStream) {
+                val resume = VodProgressStore.load(context, currentPlayingUrl)
+                if (resume > 0) {
+                    Log.d(TAG, "恢复点播播放位置: ${resume}ms")
+                    winExo.seekTo(resume)
+                }
+                startVodProgressSaver(winExo)
+            } else {
+                stopVodProgressSaver()
             }
             attachPlaybackWatcher(winExo, winner.attempt)
             startAvSyncWatcher(winExo)
+            // 显式触发一次直播/点播二次校正：候选在 READY 后才 onRaceWin，新监听器不会重放
+            // STATE_READY，故 HLS 点播型必须在此主动校正，否则断点续播/保存会被漏掉。
+            refineLiveFromPlayer(winExo, currentPlayingUrl)
         }
         raceCandidates = emptyList()
         updateState(isLoading = false, isPlaying = true, error = null, usingProxy = winner.attempt == "proxy", loadMode = null, loadTimeoutMs = 0, loadRemainMs = 0)
@@ -1220,6 +1335,85 @@ class PlayerEngine(private val context: Context) {
      * - STATE_ENDED / onPlayerError：仅记录日志（直播滑窗仍自动 seek 恢复），不再自动重载/跳台。
      *   用户如需恢复，请按右键手动重载，或交由音画同步自动恢复处理。
      */
+    /**
+     * 把 Media3 的 PlaybackException 错误码映射为中文可读含义，供前端错误提示展示。
+     * 未知码回退到「未知错误（码=xxx）」，避免只显示一串英文常量名。
+     */
+    private fun playbackErrorMeaning(error: PlaybackException): String {
+        // DNS 解析失败：当前 Media3 版本未暴露 ERROR_CODE_IO_DNS_FAILED 常量，
+        // 改为检查 cause（跨版本通用）——DNS 失败时 cause 为 UnknownHostException。
+        if (error.cause is java.net.UnknownHostException) {
+            return "DNS 解析失败：域名无法解析，检查网络 / DNS 或换源。"
+        }
+        return when (val code = error.errorCode) {
+            PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ->
+                "HTTP 返回错误状态码（多为 403 鉴权失败 / 404 源失效）。点播播放中突然出现，通常是分片或字节区间被重新请求时源站拒绝 / 地址失效（常见 Token 过期）；重试通常无效，需修正频道请求头或换源。"
+            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ->
+                "网络连接失败（多为 5xx / 服务器无响应），可能是瞬时故障，可手动重载或切代理。"
+            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ->
+                "网络连接超时：弱网或源站响应慢，可手动重载或切代理。"
+            PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND ->
+                "地址不存在（404 类）：源地址失效，需换源。"
+            PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE ->
+                "HTTP Content-Type 异常：返回的不是音视频流（可能是错误页）。"
+            PlaybackException.ERROR_CODE_IO_NO_PERMISSION ->
+                "无 INTERNET 网络权限，请检查权限。"
+            PlaybackException.ERROR_CODE_IO_CLEARTEXT_NOT_PERMITTED ->
+                "明文 HTTP 被禁止（高版本 Android 默认不允许 http），需源站支持 https 或放开配置。"
+            PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE ->
+                "读取位置越界（点播 seek 超出范围）。"
+            PlaybackException.ERROR_CODE_TIMEOUT ->
+                "操作超时。"
+            PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW ->
+                "直播滑窗落后：已自动恢复（一般不会看到此提示）。"
+            PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED,
+            PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED ->
+                "媒体索引 / 容器解析失败：源格式损坏或不是预期格式。"
+            PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ->
+                "不支持的媒体容器格式。"
+            PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ->
+                "解码器初始化失败：设备不支持该编码，可尝试降码率 / 换源。"
+            PlaybackException.ERROR_CODE_DECODING_FAILED ->
+                "解码失败：片源损坏或设备解码异常，可降码率重试。"
+            PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES ->
+                "视频规格超出设备解码能力（分辨率 / 码率过高），建议降码率。"
+            PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ->
+                "设备不支持该视频编码格式。"
+            PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED,
+            PlaybackException.ERROR_CODE_AUDIO_TRACK_WRITE_FAILED ->
+                "音频输出失败：音频轨道异常，可重试或检查音频设置。"
+            PlaybackException.ERROR_CODE_DRM_LICENSE_EXPIRED ->
+                "DRM 许可证过期。"
+            PlaybackException.ERROR_CODE_DRM_LICENSE_ACQUISITION_FAILED ->
+                "DRM 许可证获取失败。"
+            PlaybackException.ERROR_CODE_DRM_SCHEME_UNSUPPORTED ->
+                "设备不支持该 DRM 方案。"
+            else -> "未知错误（码=$code），详见 logcat。"
+        }
+    }
+
+    /** 停止点播进度周期保存协程 */
+    private fun stopVodProgressSaver() {
+        vodProgressJob?.cancel()
+        vodProgressJob = null
+    }
+
+    /**
+     * 启动点播进度周期保存：每 5s 将当前位置写入 VodProgressStore（key=currentPlayingUrl，
+     * 外部文件与应用内点播通用）。player 被替换（切台/重载）或播放结束时自动退出。
+     */
+    private fun startVodProgressSaver(exo: ExoPlayer) {
+        stopVodProgressSaver()
+        vodProgressJob = scope.launch {
+            while (true) {
+                delay(5_000)
+                if (_playerRef.value !== exo) break   // 已切台/重载，退出
+                val pos = exo.currentPosition
+                if (pos > 0) VodProgressStore.save(context, currentPlayingUrl, pos)
+            }
+        }
+    }
+
     private fun attachPlaybackWatcher(exo: ExoPlayer, attempt: String) {
         exo.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
@@ -1230,7 +1424,13 @@ class PlayerEngine(private val context: Context) {
                         updateState(isLoading = false, isPlaying = true, error = null)
                     }
                     Player.STATE_ENDED ->
-                        Log.w(TAG, "播放期 STATE_ENDED: $currentPlayingUrl")
+                        if (!isLiveStream) {
+                            Log.i(TAG, "点播播放完成，清除续播记录: $currentPlayingUrl")
+                            VodProgressStore.clear(context, currentPlayingUrl)
+                            stopVodProgressSaver()
+                        } else {
+                            Log.w(TAG, "播放期 STATE_ENDED: $currentPlayingUrl")
+                        }
                     Player.STATE_IDLE -> { /* no-op */ }
                 }
             }
@@ -1245,8 +1445,11 @@ class PlayerEngine(private val context: Context) {
                 }
                 Log.e(TAG, "播放期 onPlayerError: ${error.errorCodeName} url=$currentPlayingUrl", error)
                 DebugDiagnostics.onError("playback/$attempt", error)
-                // 不再自动重载/跳台：显示错误，交由用户手动处理
-                updateState(isLoading = false, error = "播放出错：${error.errorCodeName}")
+                // 不再自动重载/跳台：显示「错误码 + 中文含义」，交由用户手动处理
+                updateState(
+                    isLoading = false,
+                    error = "播放出错：${error.errorCodeName}\n${playbackErrorMeaning(error)}"
+                )
             }
         })
     }
@@ -1267,11 +1470,11 @@ class PlayerEngine(private val context: Context) {
         isReloading = true
         // 立即终止旧的起播层监测，避免旧 player 在其延迟/超时窗口内再次触发 reload
         stopAttemptTimeout()
-        // 点播内容：保存当前播放位置以便重载后恢复
+        // 点播内容：保存当前播放位置到持久化 Store，重载后由 Store 断点续播
         if (!isLiveStream) {
             val pos = player?.currentPosition ?: 0
             if (pos > 0) {
-                pendingResumePositionMs = pos
+                VodProgressStore.save(context, currentPlayingUrl, pos)
                 Log.d(TAG, "reloadCurrentChannel: 保存点播播放位置 ${pos}ms")
             }
         }
@@ -1285,6 +1488,9 @@ class PlayerEngine(private val context: Context) {
         raceDecided = false
         stopAttemptTimeout()
         stopAvSyncWatcher()
+        stopVodProgressSaver()
+        connStatsJob?.cancel()
+        connStatsJob = null
         for (c in raceCandidates) safeRelease(c.exo)
         raceCandidates = emptyList()
         // 兜底释放可能仅存于 _playerRef 的上一频道 player（胜出但未进入 raceCandidates）
@@ -1299,7 +1505,14 @@ class PlayerEngine(private val context: Context) {
             updateState(error = "无法播放", isLoading = false)
             return
         }
-        // 所有候选（直连/代理）串行用尽即切下一台；FLV 重试与 legacy 代理补试已并入串行链路，
+        // 点播（VOD）不自动切台：直播源常抖动/缺失，候选用尽后切下一台是合理的容错；
+        // 但点播是具体节目，自动切到列表下一个会"偷偷换片"，应直接报错交用户手动处理（换源/重载）。
+        if (!isLiveStream) {
+            Log.w(TAG, "点播播放失败，不自动切台: $currentPlayingUrl")
+            updateState(error = "点播播放失败：${currentPlayingUrl}", isLoading = false, isPlaying = false)
+            return
+        }
+        // 直播：所有候选（直连/代理）串行用尽即切下一台；FLV 重试与 legacy 代理补试已并入串行链路，
         // 不再单独处理。
         consecutiveErrors++
         if (consecutiveErrors >= playlist.size) {
@@ -1326,7 +1539,10 @@ class PlayerEngine(private val context: Context) {
         loadTimeoutMs: Long = _state.value.loadTimeoutMs,
         loadRemainMs: Long = _state.value.loadRemainMs,
         isLive: Boolean = isLiveStream,
-        loadSpeedKbps: Int = _state.value.loadSpeedKbps
+        loadSpeedKbps: Int = _state.value.loadSpeedKbps,
+        loadSpeedRealKbps: Int = _state.value.loadSpeedRealKbps,
+        totalBytesLoadedMB: Float = _state.value.totalBytesLoadedMB,
+        currentLoadUrl: String = _state.value.currentLoadUrl
     ) {
         _state.value = PlayerState(
             currentIndex = currentIndex,
@@ -1343,7 +1559,10 @@ class PlayerEngine(private val context: Context) {
             loadTimeoutMs = loadTimeoutMs,
             loadRemainMs = loadRemainMs,
             isLive = isLive,
-            loadSpeedKbps = loadSpeedKbps
+            loadSpeedKbps = loadSpeedKbps,
+            loadSpeedRealKbps = loadSpeedRealKbps,
+            totalBytesLoadedMB = totalBytesLoadedMB,
+            currentLoadUrl = currentLoadUrl
         )
     }
 
@@ -1383,6 +1602,8 @@ class PlayerEngine(private val context: Context) {
     }
 
     fun onPause() {
+        // 点播：进入后台前持久化进度，确保被系统回收也能断点续播
+        if (!isLiveStream) player?.let { if (it.currentPosition > 0) VodProgressStore.save(context, currentPlayingUrl, it.currentPosition) }
         player?.playWhenReady = false
     }
 
@@ -1408,8 +1629,13 @@ class PlayerEngine(private val context: Context) {
         stopAttemptTimeout()
         resetRace()
         stopAvSyncWatcher()
+        stopVodProgressSaver()
+        connStatsJob?.cancel()
+        connStatsJob = null
         infoHideJob?.cancel()
         hintHideJob?.cancel()
+        // 点播：释放前持久化进度，确保离开 / 被系统回收也能断点续播
+        if (!isLiveStream) player?.let { if (it.currentPosition > 0) VodProgressStore.save(context, currentPlayingUrl, it.currentPosition) }
         safeRelease(player)
         setPlayerRef(null)
         sharedSurface = null
