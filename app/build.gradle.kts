@@ -2,7 +2,8 @@ import java.util.Properties
 
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android") version "1.9.22"
+    id("org.jetbrains.kotlin.android") version "2.0.21"
+    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21"
 }
 
 // 从项目根目录读取 keystore.properties（不存在时跳过，仍能构建 unsigned release）
@@ -86,10 +87,10 @@ android {
         isCoreLibraryDesugaringEnabled = true
     }
 
-    kotlinOptions {
-        jvmTarget = "11"
-        // 注：media3 1.2.1 的 UnstableApi 未声明为 requiresOptIn（不是 opt-in 标记），
-        // 因此既不需要 @OptIn 也不需要 -opt-in 编译器参数，加上反而会触发「不是 opt-in 标记」警告。
+    kotlin {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
+        }
     }
 
     buildFeatures {
@@ -97,10 +98,8 @@ android {
         buildConfig = true
     }
 
-    // Kotlin 1.9.x 通过 compiler extension 接入 Compose（与 Compose BOM 2024.02 / Compose 1.6 配套）
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.10"
-    }
+    // Kotlin 2.0+ 使用 org.jetbrains.kotlin.plugin.compose 插件提供 Compose 编译器，
+    // 无需再通过 composeOptions.kotlinCompilerExtensionVersion 指定版本。
 
     packaging {
         resources {
