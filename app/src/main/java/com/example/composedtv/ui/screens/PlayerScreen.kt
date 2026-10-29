@@ -13,6 +13,7 @@ import android.view.TextureView
 import android.content.ClipData
 import android.content.ClipboardManager
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -29,6 +30,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.draw.scale
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -49,6 +51,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.State
 import kotlinx.coroutines.launch
@@ -60,8 +63,15 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.focus.focusTarget
 import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -325,7 +335,7 @@ fun PlayerScreen(
             val name = externalChosenName ?: resolveDisplayName(context, externalUri)
             engine.setPreferredTextLanguages(listOf("zh", "en"))
             engine.setPlaylist(
-                listOf(PlaylistItem(name = name, url = externalUri.toString(), country = "")),
+                listOf(PlaylistItem(name = name, url = externalUri.toString(), country = "", forceDirect = true)),
                 0
             )
         }
@@ -384,8 +394,10 @@ fun PlayerScreen(
         }
     }
 
-    // 外部面板关闭后（开始播放），将焦点归还播放器容器，恢复遥控器导航
+    // 外部面板关闭后（开始播放），将焦点归还播放器容器，恢复遥控器导航；
+    // 同时把面板显隐同步到 ViewModel，供 MainActivity 停止拦截遥控器按键（否则焦点/输入法失效）
     LaunchedEffect(showExternalPanel) {
+        vm.setExternalAddPanelVisible(showExternalPanel)
         if (!showExternalPanel && externalUri != null) {
             kotlinx.coroutines.delay(100)
             runCatching { focusRequester.requestFocus() }
@@ -440,12 +452,17 @@ fun PlayerScreen(
             .focusRequester(focusRequester)
             .focusTarget()
             .focusProperties {
-                canFocus = !uiState.settingsVisible && !uiState.sidePanelVisible
+                // 外部面板显示期间，根容器也不可作为焦点目标，确保焦点只能落在面板内的输入框/按钮上
+                canFocus = !uiState.settingsVisible && !uiState.sidePanelVisible && !showExternalPanel
             }
             // 双重按键监听：onPreviewKeyEvent（事件下沉阶段）+ onKeyEvent（事件上浮阶段）
             // 某些 Android TV 设备/PlayerView 可能在下沉阶段消费掉事件，此时上浮阶段仍能捕获
             .onPreviewKeyEvent { event ->
+                Log.d("PlayerScreen", "root onPreviewKeyEvent: key=${event.key} showExternalPanel=$showExternalPanel sidePanel=${uiState.sidePanelVisible} settings=${uiState.settingsVisible}")
                 when {
+                    // 外部「保存到收藏」面板显示时：所有按键都交给面板内的输入框 / 系统输入法 / 按钮，
+                    // 根布局不得拦截（否则确认键会弹节目单、方向键无法移动光标与焦点）
+                    showExternalPanel -> false
                     subtitleChooserVisible -> handleSubtitleChooserKey(event)
                     event.key.nativeKeyCode == KeyEvent.KEYCODE_CAPTIONS && event.type == KeyEventType.KeyDown -> {
                         openSubtitleChooser()
@@ -571,7 +588,9 @@ fun PlayerScreen(
                 }
             }
             .onKeyEvent { event ->
-                handlePlayerKeyEvent(
+                // 外部面板显示时根布局不消费任何按键，交由面板内的输入框 / 按钮处理
+                if (showExternalPanel) false
+                else handlePlayerKeyEvent(
                     event = event,
                     _playerState = playerState,
                     sidePanelVisible = uiState.sidePanelVisible,
@@ -597,8 +616,8 @@ fun PlayerScreen(
             // 表现为「点了分类、还没选右排选项就退出」。
             // 注意：本手势用 awaitFirstDown(requireUnconsumed = false)，指针事件即使
             // 已被抽屉内部消费，这里仍会收到，因此必须在抽屉打开时主动 return。
-            .pointerInput(uiState.sidePanelVisible, uiState.settingsVisible, isVod) {
-                if (uiState.sidePanelVisible || uiState.settingsVisible) return@pointerInput
+            .pointerInput(uiState.sidePanelVisible, uiState.settingsVisible, isVod, showExternalPanel) {
+                if (uiState.sidePanelVisible || uiState.settingsVisible || showExternalPanel) return@pointerInput
                 detectTapAndVerticalDragGestures(
                     onTap = { isRightSide ->
                         if (isVod) {
@@ -917,7 +936,9 @@ fun PlayerScreen(
         }
 
         // VOD 控制条（外部本地文件播放时显示：进度/快退快进/字幕/暂停）
-        if (isVod && vodControlsVisible) {
+        // 外部「保存到收藏」面板显示期间不渲染控制条：否则其按钮仍可被聚焦，
+        // 导致遥控器方向键"逃"出面板、作用在底层控制条上。面板是模态的，期间只接受面板内输入。
+        if (isVod && vodControlsVisible && !showExternalPanel) {
             VodControlBar(
                 positionMs = vodPosition,
                 durationMs = vodDuration,
@@ -1526,16 +1547,21 @@ private fun RemoteHint(
 /** 面板内的动作按钮：可聚焦（遥控器 D-pad 导航）+ 点击/确定键触发 */
 @Composable
 private fun PanelActionButton(text: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
-    var focused by remember { mutableStateOf(false) }
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
     Box(
         modifier = modifier
+            .scale(if (isFocused) 1.06f else 1.0f)
             .background(
-                if (focused) Color(0xFF29B6F6) else Color(0xFF4FC3F7),
+                if (isFocused) Color(0xFF29B6F6) else Color(0xFF4FC3F7),
                 RoundedCornerShape(6.dp)
             )
-            .focusable()
-            .onFocusChanged { focused = it.isFocused }
-            .clickable { onClick() }
+            .focusable(interactionSource = interactionSource)
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = onClick
+            )
             .padding(horizontal = 16.dp, vertical = 8.dp)
     ) {
         Text(text, color = Color.Black, fontSize = 14.sp, fontWeight = FontWeight.Bold)
@@ -1557,21 +1583,42 @@ private fun ExternalAddPanel(
     onCancel: () -> Unit
 ) {
     val context = LocalContext.current
-    var name by remember { mutableStateOf(defaultName) }
+    var fieldValue by remember { mutableStateOf(defaultName) }
+    var fieldFocused by remember { mutableStateOf(false) }
+    val fieldFocusedRef by rememberUpdatedState(fieldFocused)
+    var imeVisible by remember { mutableStateOf(false) }
     val focusRequester = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     var copied by remember { mutableStateOf(false) }
 
+    // 进入即聚焦输入框：requestFocus() 返回 Success 不代表焦点真的到达 BasicTextField
+    // 内部 focusable 节点，必须用 onFocusChanged 确认；未确认则重试（参考 SidePanel 搜索框）。
     LaunchedEffect(Unit) {
-        focusRequester.requestFocus()
-        keyboard?.show()
+        for (i in 0 until 15) {
+            kotlinx.coroutines.delay(if (i == 0) 150 else 100)
+            if (fieldFocusedRef) break
+            runCatching { focusRequester.requestFocus() }
+        }
+        if (fieldFocusedRef) keyboard?.show()
     }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.6f)),
+            .background(Color.Black.copy(alpha = 0.6f))
+            // 用 onKeyEvent（上浮阶段）而非 onPreviewKeyEvent 处理返回键：
+            // 让输入框先有机会消费返回键来收起输入法，输入法已收起时才关闭面板。
+            .onKeyEvent { event ->
+                if (event.type == KeyEventType.KeyDown &&
+                    (event.key == Key.Back || event.key == Key.Escape)
+                ) {
+                    keyboard?.hide()
+                    onCancel()
+                    true
+                } else false
+            },
         contentAlignment = Alignment.Center
     ) {
         Surface(
@@ -1603,27 +1650,70 @@ private fun ExternalAddPanel(
                     }
                 }
 
-                // 频道名称输入
+                // 频道名称输入：用 String + 不拦截按键，完全交给系统 IME 处理输入。
+                // 参考 SidePanel 搜索框：focusRequester + focusable 必须放在 BasicTextField 自身上，
+                // 否则 requestFocus() 返回 Success 但焦点无法到达 BasicTextField 内部 focusable 节点。
                 Text("频道名称", color = Color(0xFFB0B0B0), fontSize = 13.sp)
                 BasicTextField(
-                    value = name,
-                    onValueChange = { name = it },
+                    value = fieldValue,
+                    onValueChange = { fieldValue = it },
                     singleLine = true,
                     modifier = Modifier
                         .fillMaxWidth()
+                        .height(44.dp)
                         .focusRequester(focusRequester)
+                        .focusable()
                         .background(Color(0xFF2A2A2A), RoundedCornerShape(6.dp))
+                        .border(
+                            width = if (fieldFocused) 2.dp else 1.dp,
+                            color = if (fieldFocused) Color(0xFF4C9AFF) else Color(0xFF3A3A3A),
+                            shape = RoundedCornerShape(6.dp)
+                        )
                         .padding(10.dp)
-                        .onKeyEvent { ev ->
-                            // 输入框内按确定/回车 → 直接确认收藏并播放（适配遥控器与外接键盘）
-                            if (ev.type == KeyEventType.KeyDown &&
-                                (ev.key == Key.Enter || ev.key.nativeKeyCode == KeyEvent.KEYCODE_DPAD_CENTER)
-                            ) {
-                                onOk(name)
-                                true
-                            } else false
+                        .onFocusChanged {
+                            fieldFocused = it.isFocused
+                            if (it.isFocused) {
+                                keyboard?.show()
+                                imeVisible = true
+                            } else {
+                                keyboard?.hide()
+                                imeVisible = false
+                            }
+                        }
+                        .onPreviewKeyEvent { event ->
+                            if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                            // 返回键：输入法可见时先收起输入法（不关闭面板），否则交给面板处理取消
+                            if (event.key == Key.Back || event.key == Key.Escape) {
+                                if (imeVisible) {
+                                    keyboard?.hide()
+                                    imeVisible = false
+                                    return@onPreviewKeyEvent true
+                                }
+                                return@onPreviewKeyEvent false
+                            }
+                            // 方向键：上下移动焦点到按钮（用 onPreviewKeyEvent 在 BasicTextField 内部
+                            // 消费方向键之前拦截，显式调用 focusManager.moveFocus 确保焦点导航生效）
+                            when (event.key) {
+                                Key.DirectionUp -> {
+                                    focusManager.moveFocus(FocusDirection.Up)
+                                    return@onPreviewKeyEvent true
+                                }
+                                Key.DirectionDown -> {
+                                    focusManager.moveFocus(FocusDirection.Down)
+                                    return@onPreviewKeyEvent true
+                                }
+                                else -> return@onPreviewKeyEvent false
+                            }
                         },
-                    textStyle = TextStyle(color = Color.White, fontSize = 14.sp)
+                    textStyle = TextStyle(color = Color.White, fontSize = 14.sp),
+                    cursorBrush = SolidColor(Color(0xFF4C9AFF)),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Text,
+                        imeAction = ImeAction.Done
+                    ),
+                    keyboardActions = KeyboardActions(
+                        onDone = { onOk(fieldValue) }
+                    )
                 )
 
                 Row(
@@ -1632,7 +1722,7 @@ private fun ExternalAddPanel(
                 ) {
                     PanelActionButton("取消") { onCancel() }
                     Spacer(Modifier.width(12.dp))
-                    PanelActionButton("OK 收藏") { onOk(name) }
+                    PanelActionButton("OK 收藏") { onOk(fieldValue) }
                 }
             }
         }

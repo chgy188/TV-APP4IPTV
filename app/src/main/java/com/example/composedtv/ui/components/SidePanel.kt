@@ -1071,7 +1071,7 @@ private fun SearchColumn(
  *
  * @return 是否消费该按键事件
  */
-private fun handleHardwareKey(
+internal fun handleHardwareKey(
     event: androidx.compose.ui.input.key.KeyEvent,
     value: TextFieldValue,
     onValueChange: (TextFieldValue) -> Unit

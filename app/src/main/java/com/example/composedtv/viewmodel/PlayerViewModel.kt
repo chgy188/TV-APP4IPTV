@@ -319,6 +319,10 @@ data class PlayerUiState(
     val pendingLoginMessage: String? = null,
     /** 设置抽屉是否可见（MENU 键切换） */
     val settingsVisible: Boolean = false,
+    /** 外部媒体源「保存到收藏」面板是否可见（外部 App 以 ACTION_VIEW 唤起时弹出）。
+     *  该面板含可编辑文本框与按钮，需把遥控器按键交还给 Compose 焦点系统 / 系统输入法，
+     *  故 Activity 层 dispatchKeyEvent 必须在此标记为真时停止拦截左右/确定/菜单键。 */
+    val externalAddPanelVisible: Boolean = false,
     /** 播放参数设置（由 MENU 设置抽屉调整，持久化保存） */
     val playbackSettings: PlaybackSettings = PlaybackSettings()
 )
@@ -662,6 +666,11 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
     fun toggleSidePanelFromActivity() {
         val current = currentPlaylist.getOrNull(currentPlayIndex)
         toggleSidePanel(current)
+    }
+
+    /** 外部媒体源「保存到收藏」面板显隐：true 时 Activity 停止拦截按键，交还焦点/输入法 */
+    fun setExternalAddPanelVisible(visible: Boolean) {
+        _uiState.value = _uiState.value.copy(externalAddPanelVisible = visible)
     }
 
     /** 收藏信号：Activity/Compose 按键触发，PlayerScreen 收集后调用 engine 执行 */

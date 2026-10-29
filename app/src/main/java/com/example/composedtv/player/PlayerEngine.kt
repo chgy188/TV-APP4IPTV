@@ -52,7 +52,10 @@ data class PlaylistItem(
     /** 源站要求的自定义请求头：User-Agent（防盗链常用） */
     val ua: String = "",
     /** 源站要求的自定义请求头：Referer（服务端字段名 rf，防盗链常用） */
-    val rf: String = ""
+    val rf: String = "",
+    /** 强制直连（不走代理）：外部 App 以 ACTION_VIEW 唤起播放的本地/网络文件属于用户自有内容，
+     *  不应走 IPTV 代理（代理仅用于解锁 geo 受限的供应方源），故强制直连优先。 */
+    val forceDirect: Boolean = false
 )
 
 /** 播放器 UI 状态 */
@@ -447,6 +450,7 @@ class PlayerEngine(private val context: Context) {
     private fun playCurrent(ignoreLastMode: Boolean = false, proxyFirst: Boolean = false) {
         if (playlist.isEmpty()) return
         val item = playlist[currentIndex.coerceIn(0, playlist.lastIndex)]
+        // 外部媒体：强制直连，跳过 IPTV 代理（见 PlaylistItem.forceDirect）
         // 进入新一轮起播：清除重载荷载锁，允许后续（若仍卡死）再次兜底重载
         isReloading = false
         resetRace()
@@ -486,7 +490,8 @@ class PlayerEngine(private val context: Context) {
             // 重载同一频道：只更新加载态，不动信息条显隐
             updateState(isLoading = true, error = null)
         }
-        playUrl(item.url, item.country, ignoreLastMode = ignoreLastMode, proxyFirst = proxyFirst)
+        playUrl(item.url, item.country, forceDirect = item.forceDirect,
+            ignoreLastMode = ignoreLastMode, proxyFirst = proxyFirst)
     }
 
     fun playNext() {
@@ -643,8 +648,10 @@ class PlayerEngine(private val context: Context) {
         }
         // 每次右键重载 toggle 直连/代理优先顺序，方便排查"哪条路径能播"。
         // 首次按为直连优先（与默认一致），再次按切到代理优先，如此交替。
-        val proxyFirst = manualReloadProxyFirst
-        manualReloadProxyFirst = !manualReloadProxyFirst
+        // 外部媒体（forceDirect）始终直连，不进入代理优先分支。
+        val forceDirectItem = playlist[currentIndex].forceDirect
+        val proxyFirst = if (forceDirectItem) false else manualReloadProxyFirst
+        if (!forceDirectItem) manualReloadProxyFirst = !manualReloadProxyFirst
         Log.d(TAG, "手动重载当前频道(代理优先=$proxyFirst): $currentPlayingUrl")
         showHint(
             "正在重载：${playlist[currentIndex].name}（${if (proxyFirst) "代理优先" else "直连优先"}）"
@@ -785,16 +792,18 @@ class PlayerEngine(private val context: Context) {
         country: String = "",
         forceProxy: Boolean = false,
         ignoreLastMode: Boolean = false,
-        proxyFirst: Boolean = false
+        proxyFirst: Boolean = false,
+        forceDirect: Boolean = false
     ) {
         if (url.isBlank()) {
             handlePlayFailure()
             return
         }
         currentPlayingUrl = url
-        // 手动重载时若指定代理优先：把 proxy 提到队首（国内频道仍完全不走代理，保持直连）；
-        // 否则按原逻辑（直连→代理，或记忆上次成功模式）。
-        val attempts = if (forceProxy) {
+        // 外部媒体（forceDirect）：用户自有内容，强制直连、完全不走代理
+        val attempts = if (forceDirect) {
+            listOf("direct")
+        } else if (forceProxy) {
             listOf("proxy")
         } else if (proxyFirst) {
             val base = planPlay(url, country)

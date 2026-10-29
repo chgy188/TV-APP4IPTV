@@ -141,3 +141,41 @@ app/src/main/java/com/example/composedtv/
 
 - 播放器界面 `dispatchKeyEvent` 兜底捕获遥控器按键（确定/左右），避免 Compose 焦点丢失。
 - 双击返回键退出（2 秒内）。
+
+## 故障排查与修复记录
+
+### 外部输入播放「保存到收藏」面板（ExternalAddPanel）焦点/输入/导航修复
+
+**问题现象**：外部 App 唤起播放弹出的「保存到收藏」面板存在：
+- 无焦点框显示
+- 焦点仅停留在取消按钮
+- D-pad 方向键无法移动焦点到其它按钮
+- 无法修改频道名称（输入框无法输入）
+
+**修复要点**（`app/src/main/java/com/example/composedtv/ui/screens/PlayerScreen.kt` 的 `ExternalAddPanel`）：
+
+1. **输入框无法获得焦点（核心根因）**
+   - 必须将 `.focusRequester(focusRequester)` + `.focusable()` **直接放在 `BasicTextField` 自身**上，而非父容器。
+   - 原因：`requestFocus()` 返回 `Success` 不代表焦点真正到达 `BasicTextField` 内部的 focusable 节点。参考 `SidePanel` 搜索框的实现。
+
+2. **输入法与返回键冲突**
+   - 面板根 `Box` 用 `onKeyEvent`（上浮阶段）而非 `onPreviewKeyEvent` 处理返回键，让输入框优先消费返回键。
+   - 输入框上用 `onPreviewKeyEvent` 处理返回键：输入法可见时先收起输入法（不关闭面板），输入法已收起时才交给面板关闭。
+
+3. **D-pad 方向键无法导航**
+   - 输入框的 `onPreviewKeyEvent` 中显式调用 `focusManager.moveFocus(FocusDirection.Up/Down)`。
+   - 原因：`BasicTextField` 内部会消费方向键用于光标移动，必须在下沉阶段（`onPreviewKeyEvent`）拦截并交给 Compose 焦点系统处理导航。
+
+4. **焦点请求时序**
+   - `LaunchedEffect` 中添加重试循环（最多 15 次），通过 `onFocusChanged` 确认焦点真正到达输入框后才停止重试。
+   - 直接 `requestFocus()` 可能在布局完成前执行失败。
+
+5. **根布局手势与按键拦截**
+   - 根 `Box` 的 `pointerInput` 手势在面板打开时需早退（`showExternalPanel` 加入 key），否则会消费输入框点击事件。
+   - 根 `Box` 的 `onPreviewKeyEvent` 在面板打开时放行所有按键。
+
+6. **视觉反馈**
+   - 输入框聚焦时蓝色边框（2dp），未聚焦时灰色边框（1dp）。
+   - 按钮聚焦时放大（scale 1.06）+ 背景色变深，提供清晰焦点指示。
+
+**参考实现**：`LoginScreen` 的输入框（String 值 + 无 onKeyEvent 拦截）、`SidePanel` 搜索框（focusRequester + focusable 直接加在 BasicTextField 上）。

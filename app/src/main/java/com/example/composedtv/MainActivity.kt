@@ -96,8 +96,10 @@ class MainActivity : ComponentActivity() {
             val current = currentScreenRef
             if (current is Screen.Player) {
                 val uiState = vm.uiState.value
-                // 侧边栏关闭时，拦截左右键的 DOWN 和 UP（防止系统焦点导航抢键）
-                if (!uiState.sidePanelVisible) {
+                // 侧边栏 / 外部「保存到收藏」面板关闭时，拦截左右键的 DOWN 和 UP（防止系统焦点导航抢键）。
+                // 外部面板打开时必须放行：否则 Compose 焦点系统收不到 D-pad，
+                // 既无法把焦点移到「复制/取消/OK」按钮，也会把遥控器确定键吃掉导致系统输入法失效。
+                if (!uiState.sidePanelVisible && !uiState.externalAddPanelVisible) {
                     when (event.keyCode) {
                         KeyEvent.KEYCODE_DPAD_LEFT -> {
                             // 点播(VOD)模式：左右键交给 Compose 处理（快退/快进），不在此拦截
