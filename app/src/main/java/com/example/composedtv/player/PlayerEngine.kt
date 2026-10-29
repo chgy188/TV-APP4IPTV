@@ -24,6 +24,8 @@ import androidx.media3.common.C
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import com.example.composedtv.data.remote.ApiClient
+import com.example.composedtv.data.local.LocalFavoritesStore
+import com.example.composedtv.data.local.LocalFavorite
 import com.example.composedtv.data.VodProgressStore
 import com.example.composedtv.debug.DebugDiagnostics
 import kotlinx.coroutines.CoroutineScope
@@ -664,17 +666,16 @@ class PlayerEngine(private val context: Context) {
             return
         }
         val item = playlist[currentIndex]
-        if (!ApiClient.isLoggedIn) {
-            Log.w(TAG, "toggleFavorite: 未登录，无法收藏")
-            showHint("请先登录后再收藏")
-            return
-        }
         scope.launch {
             try {
                 if (item.isFavorite) {
-                    // 取消收藏：hls4iptv 后端按 url 删除，favId 实际存的就是 url
+                    // 取消收藏：本地收藏用 local:// 前缀，否则走后端（按 url 删除）
                     val idToRemove = item.favId?.takeIf { it.isNotEmpty() } ?: item.url
-                    ApiClient.removeFavorite(idToRemove)
+                    if (idToRemove.startsWith("local://")) {
+                        LocalFavoritesStore.remove(context, item.url)
+                    } else {
+                        ApiClient.removeFavorite(idToRemove)
+                    }
                     playlist = playlist.toMutableList().apply {
                         this[currentIndex] = item.copy(isFavorite = false, favId = null)
                     }
@@ -682,14 +683,32 @@ class PlayerEngine(private val context: Context) {
                     // 通知 UI 层刷新收藏列表（侧边栏「收藏」分类），即时移除该频道
                     _favoritesChanged.tryEmit(Unit)
                 } else {
-                    // 添加收藏：后端用 url 去重，返回 url 作为标识
-                    ApiClient.addFavorite(item.url, item.name, null, item.sourceId ?: "")
-                    playlist = playlist.toMutableList().apply {
-                        this[currentIndex] = item.copy(isFavorite = true, favId = item.url)
+                    if (!ApiClient.isLoggedIn) {
+                        // 未登录（如外部 App 唤起播放）回退到本地收藏，无需后端鉴权
+                        LocalFavoritesStore.add(
+                            context,
+                            LocalFavorite(
+                                name = item.name,
+                                url = item.url,
+                                country = item.country,
+                                ua = item.ua,
+                                rf = item.rf
+                            )
+                        )
+                        playlist = playlist.toMutableList().apply {
+                            this[currentIndex] = item.copy(isFavorite = true, favId = "local://${item.url}")
+                        }
+                        showHint("已收藏(本地)：${item.name}")
+                    } else {
+                        // 添加收藏：后端用 url 去重，返回 url 作为标识
+                        ApiClient.addFavorite(item.url, item.name, null, item.sourceId ?: "")
+                        playlist = playlist.toMutableList().apply {
+                            this[currentIndex] = item.copy(isFavorite = true, favId = item.url)
+                        }
+                        showHint("已收藏：${item.name}")
                     }
                     // 通知 UI 层刷新收藏列表（侧边栏「收藏」分类），即时加入该频道
                     _favoritesChanged.tryEmit(Unit)
-                    showHint("已收藏：${item.name}")
                 }
                 updateState(isFavorite = playlist[currentIndex].isFavorite, showInfo = true)
                 scheduleInfoHide()

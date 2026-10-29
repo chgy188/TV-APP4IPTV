@@ -9,6 +9,8 @@ import androidx.lifecycle.viewModelScope
 import com.example.composedtv.data.remote.ApiChannel
 import com.example.composedtv.data.remote.ApiClient
 import com.example.composedtv.data.remote.ApiFavorite
+import com.example.composedtv.data.local.LocalFavoritesStore
+import com.example.composedtv.data.local.LocalFavorite
 import com.example.composedtv.data.remote.ApiSource
 import com.example.composedtv.data.remote.StoredUser
 import com.example.composedtv.player.PlaylistItem
@@ -793,7 +795,7 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                 val groups = channels.map { it.group.ifEmpty { "未分类" } }.distinct()
                 val categories = mutableListOf<CategoryEntry>()
                 categories.add(CategoryEntry(name = "搜索", isSearch = true))
-                if (ApiClient.isLoggedIn) {
+                if (ApiClient.isLoggedIn || LocalFavoritesStore.hasAny(app)) {
                     categories.add(CategoryEntry(name = "收藏", isFavorites = true))
                 }
                 groups.forEach { g -> categories.add(CategoryEntry(name = g, isFavorites = false)) }
@@ -918,8 +920,14 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                 )
                 val channels: List<ChannelEntry>
                 if (category.isFavorites) {
-                    val favs = ApiClient.getFavorites()
-                    channels = favs.map { fav ->
+                    // 后端收藏（需登录）+ 本地收藏合并展示；未登录时后端部分为空
+                    val backendFavs = if (ApiClient.isLoggedIn) {
+                        runCatching { ApiClient.getFavorites() }.getOrDefault(emptyList())
+                    } else {
+                        emptyList()
+                    }
+                    val localFavs = LocalFavoritesStore.getAll(app)
+                    channels = backendFavs.map { fav ->
                         ChannelEntry(
                             id = fav.id,
                             name = fav.name,
@@ -931,6 +939,19 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                             category = "收藏",
                             ua = fav.ua,
                             rf = fav.rf
+                        )
+                    } + localFavs.map { f ->
+                        ChannelEntry(
+                            id = "local://${f.url}",
+                            name = f.name,
+                            url = f.url,
+                            logo = "",
+                            sourceId = null,
+                            favId = "local://${f.url}",
+                            isFavorite = true,
+                            category = "收藏",
+                            ua = f.ua,
+                            rf = f.rf
                         )
                     }
                 } else {

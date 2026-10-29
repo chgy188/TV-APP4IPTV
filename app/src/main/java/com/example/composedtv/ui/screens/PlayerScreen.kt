@@ -10,6 +10,8 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.TextureView
+import android.content.ClipData
+import android.content.ClipboardManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -46,16 +48,20 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.State
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.focus.focusTarget
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -73,6 +79,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import kotlin.math.abs
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -86,11 +94,14 @@ import com.example.composedtv.debug.DebugHudHost
 import com.example.composedtv.player.PlayerEngine
 import com.example.composedtv.player.PlayerState
 import com.example.composedtv.data.VodProgressStore
+import com.example.composedtv.data.remote.ApiClient
 import com.example.composedtv.player.PlaylistItem
 import com.example.composedtv.ui.components.SettingsDrawer
 import com.example.composedtv.ui.components.SidePanel
 import com.example.composedtv.viewmodel.ChannelEntry
 import com.example.composedtv.viewmodel.PlayerViewModel
+import com.example.composedtv.data.local.LocalFavorite
+import com.example.composedtv.data.local.LocalFavoritesStore
 import android.net.Uri
 import android.os.Build
 import android.provider.OpenableColumns
@@ -303,11 +314,15 @@ fun PlayerScreen(
         }
     }
 
-    // 外部视频文件播放（来自其他 App 的 ACTION_VIEW）：绕过登录/频道列表，直接单文件播放，
-    // 并设置字幕默认偏好顺序为中文→英文（无中文字幕时回退英文，均无则关闭）。
-    LaunchedEffect(externalUri) {
-        if (externalUri != null) {
-            val name = resolveDisplayName(context, externalUri)
+    // 外部视频文件播放（来自其他 App 的 ACTION_VIEW）：先弹「保存到收藏」面板，
+    // 用户确认（OK 收藏 / 取消不收藏）后才开始播放；字幕默认中文→英文。
+    var showExternalPanel by remember { mutableStateOf(externalUri != null) }
+    var externalStarted by remember { mutableStateOf(false) }
+    var externalChosenName by remember { mutableStateOf<String?>(null) }
+    val externalScope = rememberCoroutineScope()
+    LaunchedEffect(externalStarted) {
+        if (externalUri != null && externalStarted) {
+            val name = externalChosenName ?: resolveDisplayName(context, externalUri)
             engine.setPreferredTextLanguages(listOf("zh", "en"))
             engine.setPlaylist(
                 listOf(PlaylistItem(name = name, url = externalUri.toString(), country = "")),
@@ -354,15 +369,25 @@ fun PlayerScreen(
     }
 
     // 请求焦点：确保进入播放器界面后，容器持有焦点以接收遥控器按键
+    // （外部唤起面板显示期间不抢焦点，避免输入框/按钮丢失焦点）
     LaunchedEffect(Unit) {
         kotlinx.coroutines.delay(200)
-        runCatching { focusRequester.requestFocus() }
+        if (!showExternalPanel) runCatching { focusRequester.requestFocus() }
     }
 
     // 侧边栏 / 设置抽屉关闭时重新请求焦点（内部列表项会抢焦点，关闭后需归还播放器容器）
+    // （外部唤起面板显示期间跳过，面板关闭后由下方 LaunchedEffect 归还焦点）
     LaunchedEffect(uiState.sidePanelVisible, uiState.settingsVisible) {
-        if (!uiState.sidePanelVisible && !uiState.settingsVisible) {
+        if (!uiState.sidePanelVisible && !uiState.settingsVisible && !showExternalPanel) {
             kotlinx.coroutines.delay(150)
+            runCatching { focusRequester.requestFocus() }
+        }
+    }
+
+    // 外部面板关闭后（开始播放），将焦点归还播放器容器，恢复遥控器导航
+    LaunchedEffect(showExternalPanel) {
+        if (!showExternalPanel && externalUri != null) {
+            kotlinx.coroutines.delay(100)
             runCatching { focusRequester.requestFocus() }
         }
     }
@@ -973,6 +998,35 @@ fun PlayerScreen(
                 }
             }
         }
+        // 外部唤起播放前的「保存到收藏」面板（覆盖层），置于根 Box 内最后，绘制在最上层
+        if (showExternalPanel && externalUri != null) {
+            val defName = resolveDisplayName(context, externalUri)
+            ExternalAddPanel(
+                url = externalUri.toString(),
+                defaultName = defName,
+                onOk = { chosen ->
+                    externalScope.launch {
+                        val desired = chosen.ifBlank { defName }
+                        // 冲突检测：与「已收藏频道名」（后端 + 本地）比较，重名自动加数字后缀
+                        val existing = runCatching { ApiClient.getFavorites() }
+                            .getOrDefault(emptyList()).map { it.name } +
+                            LocalFavoritesStore.getAll(context).map { it.name }
+                        val finalName = uniqueName(desired, existing)
+                        LocalFavoritesStore.add(
+                            context,
+                            LocalFavorite(name = finalName, url = externalUri.toString())
+                        )
+                        externalChosenName = finalName
+                        showExternalPanel = false
+                        externalStarted = true
+                    }
+                },
+                onCancel = {
+                    showExternalPanel = false
+                    externalStarted = true
+                }
+            )
+        }
     }
 }
 
@@ -1467,4 +1521,128 @@ private fun RemoteHint(
             }
         }
     }
+}
+
+/** 面板内的动作按钮：可聚焦（遥控器 D-pad 导航）+ 点击/确定键触发 */
+@Composable
+private fun PanelActionButton(text: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    var focused by remember { mutableStateOf(false) }
+    Box(
+        modifier = modifier
+            .background(
+                if (focused) Color(0xFF29B6F6) else Color(0xFF4FC3F7),
+                RoundedCornerShape(6.dp)
+            )
+            .focusable()
+            .onFocusChanged { focused = it.isFocused }
+            .clickable { onClick() }
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+    ) {
+        Text(text, color = Color.Black, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+/**
+ * 外部 App 唤起播放前的「保存到收藏」面板：
+ * - 展示流媒体 URL（带复制按钮）
+ * - 频道名称可编辑输入（默认取文件名/路径段）
+ * - OK：保存到收藏（重名自动加数字后缀）；Cancel：不保存
+ * - 两者都会关闭面板并开始播放
+ */
+@Composable
+private fun ExternalAddPanel(
+    url: String,
+    defaultName: String,
+    onOk: (String) -> Unit,
+    onCancel: () -> Unit
+) {
+    val context = LocalContext.current
+    var name by remember { mutableStateOf(defaultName) }
+    val focusRequester = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    var copied by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+        keyboard?.show()
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.6f)),
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            color = Color(0xFF1E1E1E),
+            shape = RoundedCornerShape(12.dp),
+            tonalElevation = 4.dp
+        ) {
+            Column(
+                modifier = Modifier
+                    .widthIn(min = 320.dp, max = 560.dp)
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text("外部媒体源", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+
+                // URL + 复制
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        url,
+                        color = Color(0xFFB0B0B0),
+                        fontSize = 12.sp,
+                        maxLines = 2,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    PanelActionButton(if (copied) "已复制" else "复制") {
+                        clipboard.setPrimaryClip(ClipData.newPlainText("url", url))
+                        copied = true
+                    }
+                }
+
+                // 频道名称输入
+                Text("频道名称", color = Color(0xFFB0B0B0), fontSize = 13.sp)
+                BasicTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focusRequester)
+                        .background(Color(0xFF2A2A2A), RoundedCornerShape(6.dp))
+                        .padding(10.dp)
+                        .onKeyEvent { ev ->
+                            // 输入框内按确定/回车 → 直接确认收藏并播放（适配遥控器与外接键盘）
+                            if (ev.type == KeyEventType.KeyDown &&
+                                (ev.key == Key.Enter || ev.key.nativeKeyCode == KeyEvent.KEYCODE_DPAD_CENTER)
+                            ) {
+                                onOk(name)
+                                true
+                            } else false
+                        },
+                    textStyle = TextStyle(color = Color.White, fontSize = 14.sp)
+                )
+
+                Row(
+                    horizontalArrangement = Arrangement.End,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    PanelActionButton("取消") { onCancel() }
+                    Spacer(Modifier.width(12.dp))
+                    PanelActionButton("OK 收藏") { onOk(name) }
+                }
+            }
+        }
+    }
+}
+
+/** 在已存在名称集合中生成唯一名称：重名时追加 " 2" / " 3" … */
+private fun uniqueName(desired: String, existing: List<String>): String {
+    if (desired !in existing) return desired
+    var i = 2
+    while ("$desired $i" in existing) i++
+    return "$desired $i"
 }
