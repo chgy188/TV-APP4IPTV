@@ -108,6 +108,7 @@ import com.example.composedtv.data.remote.ApiClient
 import com.example.composedtv.player.PlaylistItem
 import com.example.composedtv.ui.components.SettingsDrawer
 import com.example.composedtv.ui.components.SidePanel
+import com.example.composedtv.ui.components.ambientGradientBackdrop
 import com.example.composedtv.viewmodel.ChannelEntry
 import com.example.composedtv.viewmodel.PlayerViewModel
 import com.example.composedtv.data.local.LocalFavorite
@@ -189,6 +190,8 @@ fun PlayerScreen(
     // 创建 PlayerEngine（随 Composable 生命周期管理）
     val engine = remember { PlayerEngine(context) }
     val playerState by engine.stateFlow.collectAsState()
+    // 首帧是否已出画：决定是否显示渐变占位蒙版（取代起播黑屏）
+    val firstFrameRendered by engine.firstFrameFlow.collectAsState()
 
     // ===== 诊断 HUD =====
     // 遥控器数字键 0：开关 HUD（无 ADB 时在画面上直接看解码器/丢帧/Surface 指标）
@@ -445,7 +448,7 @@ fun PlayerScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .ambientGradientBackdrop()
             // 焦点管理：容器持有焦点；但面板/抽屉打开时禁止自己作为焦点目标(canFocus=false)，
             // 让焦点留在面板/抽屉内部列表项上。注意不能用 focusable()，它会拦截 D-pad 做焦点导航，
             // 导致 onPreviewKeyEvent 收不到上下键、切台失效。focusProperties 只控制焦点归属，不影响按键派发。
@@ -668,7 +671,8 @@ fun PlayerScreen(
                 }
                 view.apply {
                     useController = false
-                    setShutterBackgroundColor(android.graphics.Color.BLACK)
+                    // 透明快门：首帧前不铺黑底，露出底层渐变蒙版（避免起播黑屏）
+                    setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
                     layoutParams = android.view.ViewGroup.LayoutParams(
                         android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                         android.view.ViewGroup.LayoutParams.MATCH_PARENT
@@ -756,7 +760,17 @@ fun PlayerScreen(
                 .focusable(enabled = !uiState.settingsVisible)
         )
 
-        // 加载中 spinner + 当前加载模式 / 超时（简洁展示）
+        // 首帧渲染前：用渐变蒙版盖住视频层，避免起播 / 切台瞬间露出黑屏。
+        // 首帧一到立即撤掉（不加淡出动画），尽快切到真实画面。
+        if (!firstFrameRendered) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .ambientGradientBackdrop()
+            )
+        }
+
+        // 加载中：仅保留极简提示，不展示链接 / 速率 / 下载量等技术信息
         if (playerState.isLoading) {
             Box(
                 modifier = Modifier.fillMaxSize(),
@@ -771,56 +785,10 @@ fun PlayerScreen(
                         strokeWidth = 3.dp
                     )
                     Text(
-                        text = when {
-                            playerState.loadMode == "proxy" -> "代理加载中…"
-                            playerState.loadMode == "direct" -> "直连加载中…"
-                            // 起播完成后 loadMode 置空，按实际代理状态区分播放期重新缓冲
-                            playerState.usingProxy -> "代理缓冲中…"
-                            else -> "直连缓冲中…"
-                        },
+                        text = "加载中…",
                         color = Color.White,
                         fontSize = 15.sp
                     )
-                    // 真实下载速率（按真实字节测量）：停滞时为 0 并标红告警；同时展示估算值供参考
-                    val realKbps = playerState.loadSpeedRealKbps
-                    val estKbps = playerState.loadSpeedKbps
-                    if (realKbps > 0 || estKbps > 0) {
-                        val speedText = if (realKbps > 0) {
-                            if (realKbps >= 1000) String.format("%.1f Mb/s", realKbps / 1000f)
-                            else "$realKbps Kb/s"
-                        } else {
-                            "停滞 估算 ${if (estKbps >= 1000) String.format("%.1f Mb/s", estKbps / 1000f) else "$estKbps Kb/s"}"
-                        }
-                        Text(
-                            text = "实际速率 $speedText",
-                            color = if (realKbps > 0) Color(0xFF4FC3F7) else Color(0xFFFF5252),
-                            fontSize = 13.sp
-                        )
-                    }
-                    if (playerState.totalBytesLoadedMB > 0f) {
-                        Text(
-                            text = "已下载 ${"%.1f".format(playerState.totalBytesLoadedMB)} MB",
-                            color = Color.Gray,
-                            fontSize = 12.sp
-                        )
-                    }
-                    if (playerState.currentLoadUrl.isNotBlank()) {
-                        Text(
-                            text = playerState.currentLoadUrl,
-                            color = Color.Gray,
-                            fontSize = 10.sp,
-                            maxLines = 3
-                        )
-                    }
-                    if (playerState.loadRemainMs > 0) {
-                        // 向上取整，避免最后一秒显示 0
-                        val remainSec = (playerState.loadRemainMs + 999) / 1000
-                        Text(
-                            text = "${remainSec}s 后自动切换",
-                            color = Color.Gray,
-                            fontSize = 12.sp
-                        )
-                    }
                 }
             }
         }

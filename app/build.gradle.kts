@@ -148,6 +148,9 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
 
+    // 二维码生成（官网二维码，纯 Java 核心库，体积小、无 Android 依赖）
+    implementation("com.google.zxing:core:3.5.3")
+
     // Java 8 核心库脱糖：minSdk=21 的设备（API<24）缺少 Map.putIfAbsent 等
     // Java 8 默认方法，运行时直接 NoSuchMethodError 闪退。需开启脱糖才能在
     // Android 6.0(API23) 等老系统上运行。

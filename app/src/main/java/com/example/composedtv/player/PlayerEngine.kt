@@ -273,6 +273,13 @@ class PlayerEngine(private val context: Context) {
     val playerFlow: kotlinx.coroutines.flow.StateFlow<ExoPlayer?> = _playerRef
     val player: ExoPlayer? get() = _playerRef.value
 
+    /**
+     * 首帧是否已渲染：UI 据此撤下「渐变占位蒙版」，避免起播/切台时的黑屏。
+     * 每次新一轮起播置 false，播放器回调 onRenderedFirstFrame 时置 true。
+     */
+    private val _firstFrameRendered = kotlinx.coroutines.flow.MutableStateFlow(false)
+    val firstFrameFlow: kotlinx.coroutines.flow.StateFlow<Boolean> = _firstFrameRendered
+
     /** 统一设置主 player 引用：同步给诊断中心，便于 HUD 读取 DecoderCounters */
     private fun setPlayerRef(exo: ExoPlayer?) {
         if (_playerRef.value === exo) return
@@ -451,6 +458,8 @@ class PlayerEngine(private val context: Context) {
         if (playlist.isEmpty()) return
         val item = playlist[currentIndex.coerceIn(0, playlist.lastIndex)]
         // 外部媒体：强制直连，跳过 IPTV 代理（见 PlaylistItem.forceDirect）
+        // 新一轮起播：重新显示渐变占位蒙版，避免切台瞬间露出黑屏
+        _firstFrameRendered.value = false
         // 进入新一轮起播：清除重载荷载锁，允许后续（若仍卡死）再次兜底重载
         isReloading = false
         resetRace()
@@ -924,6 +933,13 @@ class PlayerEngine(private val context: Context) {
             )
         }
         p.setMediaItem(builder.build())
+        // 首帧渲染信号：一旦真正出画，UI 立即撤下渐变占位蒙版（切台/起播不再有黑屏）。
+        // 仅当前绑定的主 player 的首帧有效，避免竞速中被淘汰候选的回调误触发。
+        p.addListener(object : Player.Listener {
+            override fun onRenderedFirstFrame() {
+                if (player === p) _firstFrameRendered.value = true
+            }
+        })
         // 诊断：挂 AnalyticsListener 采集解码器名称/初始化耗时/视频格式/丢帧
         p.addAnalyticsListener(DebugDiagnostics.newAnalyticsListener())
         DebugDiagnostics.onPlayerCreated()
@@ -979,6 +995,8 @@ class PlayerEngine(private val context: Context) {
         }
         // 递增 token：使上一个尝试的 listener 立即失效，避免已释放 player 的回调串扰
         val myToken = ++racePlayToken
+        // 换候选期间重新显示渐变占位蒙版，直到新候选真正出画
+        _firstFrameRendered.value = false
         currentAttemptIndex = nextIndex
         val attempt = currentAttempts[nextIndex]
         Log.d(TAG, "串行尝试[$nextIndex/${currentAttempts.size}]: $attempt")
@@ -1184,6 +1202,15 @@ class PlayerEngine(private val context: Context) {
         }
         raceCandidates = emptyList()
         updateState(isLoading = false, isPlaying = true, error = null, usingProxy = winner.attempt == "proxy", loadMode = null, loadTimeoutMs = 0, loadRemainMs = 0)
+        // 兜底：纯音频流 / 个别设备不回调 onRenderedFirstFrame 时，延时强制撤下渐变占位蒙版，
+        // 避免真实画面被永久遮挡。校验 URL 防止旧任务的延时回调串到新一轮起播。
+        val fallbackUrl = currentPlayingUrl
+        scope.launch {
+            delay(1500)
+            if (currentPlayingUrl == fallbackUrl && !_firstFrameRendered.value) {
+                _firstFrameRendered.value = true
+            }
+        }
         Log.d(TAG, "起播成功: ${winner.attempt}")
         // 记忆本次成功模式：下次起播直接优先该模式，省去先试错一次
         saveLastMode(currentPlayingUrl, winner.attempt)

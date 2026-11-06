@@ -89,6 +89,9 @@ import kotlinx.coroutines.delay
 /** 侧边栏自动隐藏超时（毫秒）：无操作 15 秒后自动收起（选台需要足够时间浏览） */
 private const val SIDE_PANEL_TIMEOUT_MS = 15_000L
 
+/** 节目单列表项字号（TV 十尺视距可读性：不小于 18sp） */
+private const val PANEL_ITEM_FONT_SP = 18
+
 /** 节目栏单列表模式下的当前层级：源 / 分类 / 频道 */
 private enum class PanelLevel { SOURCE, CATEGORY, CHANNEL }
 
@@ -129,8 +132,8 @@ fun SidePanel(
     // 并夹在 [220dp, 480dp] 之间，避免切层时宽度跳动。
     val density = LocalDensity.current
     val panelWidth = remember(data.sources, data.categories, data.channels) {
-        // 列表项文字字号 13.sp → px（sp 需额外乘 fontScale）
-        val textSizePx = 13f * density.density * density.fontScale
+        // 列表项文字字号 → px（sp 需额外乘 fontScale），与 PanelItem 字号保持一致
+        val textSizePx = PANEL_ITEM_FONT_SP.toFloat() * density.density * density.fontScale
         val paint = android.graphics.Paint().apply { textSize = textSizePx }
         val names = data.sources.map { it.name } +
             data.categories.map { it.name } +
@@ -365,7 +368,7 @@ fun SidePanel(
                                 } else {
                                     LazyColumn(
                                         state = sourceListState,
-                                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp),
                                         contentPadding = PaddingValues(vertical = 4.dp)
                                     ) {
                                         items(data.sources) { source ->
@@ -403,7 +406,7 @@ fun SidePanel(
                                 } else {
                                     LazyColumn(
                                         state = categoryListState,
-                                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp),
                                         contentPadding = PaddingValues(vertical = 4.dp),
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
@@ -456,7 +459,7 @@ fun SidePanel(
                                 } else {
                                     LazyColumn(
                                         state = channelListState,
-                                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp),
                                         contentPadding = PaddingValues(vertical = 4.dp)
                                     ) {
                                         itemsIndexed(data.channels) { index, channel ->
@@ -511,12 +514,12 @@ private fun PanelColumn(
             Icon(
                 imageVector = icon,
                 contentDescription = null,
-                modifier = Modifier.width(16.dp).height(16.dp),
+                modifier = Modifier.width(18.dp).height(18.dp),
                 tint = MaterialTheme.colorScheme.primary
             )
             Text(
                 text = title,
-                fontSize = 14.sp,
+                fontSize = 16.sp,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.primary
             )
@@ -568,7 +571,7 @@ private fun BreadcrumbChip(
     ) {
         Text(
             text = text,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
         )
@@ -597,7 +600,7 @@ private fun EmptyHint(text: String) {
     ) {
         Text(
             text = text,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
         )
     }
@@ -646,8 +649,8 @@ private fun PanelItem(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 6.dp),
-            verticalArrangement = Arrangement.spacedBy(3.dp)
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -658,13 +661,13 @@ private fun PanelItem(
                     Icon(
                         imageVector = icon,
                         contentDescription = null,
-                        modifier = Modifier.width(14.dp).height(14.dp),
+                        modifier = Modifier.width(16.dp).height(16.dp),
                         tint = iconTint
                     )
                 }
                 Text(
                     text = text,
-                    fontSize = 13.sp,
+                    fontSize = PANEL_ITEM_FONT_SP.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     color = if (isSelected && !focused) MaterialTheme.colorScheme.primary
@@ -681,28 +684,28 @@ private fun PanelItem(
                     if (countryText.isNotEmpty()) {
                         Text(
                             text = countryText,
-                            fontSize = 10.sp,
+                            fontSize = 12.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             color = Color.White,
                             modifier = Modifier
                                 .background(Color(0xFF111827), RoundedCornerShape(3.dp))
-                                .padding(horizontal = 5.dp, vertical = 1.dp)
-                                .widthIn(max = 90.dp)
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                                .widthIn(max = 110.dp)
                         )
                     }
                     if (langText.isNotEmpty()) {
                         Text(
                             text = langText,
-                            fontSize = 10.sp,
+                            fontSize = 12.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             color = Color(0xFF1D4ED8),
                             modifier = Modifier
                                 .background(Color(0xFFEFF6FF), RoundedCornerShape(3.dp))
                                 .border(0.5.dp, Color(0xFFBFDBFE), RoundedCornerShape(3.dp))
-                                .padding(horizontal = 5.dp, vertical = 1.dp)
-                                .widthIn(max = 140.dp)
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                                .widthIn(max = 170.dp)
                         )
                     }
                 }
@@ -821,7 +824,7 @@ private fun SearchColumn(
             )
             Text(
                 text = if (results.isNotEmpty()) "搜索 (${results.size})" else "搜索",
-                fontSize = 14.sp,
+                fontSize = 16.sp,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.primary
             )
@@ -860,7 +863,7 @@ private fun SearchColumn(
                     if (fieldValue.text.isEmpty()) {
                         Text(
                             text = "输入频道名…",
-                            fontSize = 13.sp,
+                            fontSize = 14.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
                             modifier = Modifier.align(Alignment.CenterStart)
                         )
@@ -937,7 +940,7 @@ private fun SearchColumn(
                             },
                         singleLine = true,
                         textStyle = androidx.compose.ui.text.TextStyle(
-                            fontSize = 14.sp,
+                            fontSize = 16.sp,
                             color = MaterialTheme.colorScheme.onSurface
                         ),
                         cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
@@ -967,7 +970,7 @@ private fun SearchColumn(
                 ) {
                     Text(
                         text = "输入频道名以搜索\n（跨当前源所有分类）",
-                        fontSize = 13.sp,
+                        fontSize = 14.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center
                     )
@@ -980,14 +983,14 @@ private fun SearchColumn(
                 ) {
                     Text(
                         text = "无匹配频道",
-                        fontSize = 13.sp,
+                        fontSize = 14.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
                     )
                 }
             } else {
                 LazyColumn(
                     state = listState,
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
                     contentPadding = PaddingValues(vertical = 4.dp),
                     modifier = Modifier.focusRequester(focusRequester)
                 ) {

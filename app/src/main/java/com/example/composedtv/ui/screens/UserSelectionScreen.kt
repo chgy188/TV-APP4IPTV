@@ -40,8 +40,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import com.example.composedtv.ui.components.ambientGradientBackdrop
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -86,11 +86,7 @@ fun UserSelectionScreen(
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(Color(0xFF0F1117), Color(0xFF1A1D27))
-                )
-            )
+            .ambientGradientBackdrop()
     ) {
         // 屏幕较矮（手机横屏）时启用紧凑布局，尽量一屏显示
         val compact = maxHeight < 520.dp

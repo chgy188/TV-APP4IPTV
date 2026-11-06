@@ -21,9 +21,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -50,8 +49,8 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import com.example.composedtv.ui.components.ambientGradientBackdrop
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -65,6 +64,17 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.composedtv.viewmodel.PlayerViewModel
+import android.graphics.Bitmap
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalDensity
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
+import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
+
+/** 登录界面展示的官网地址（扫码访问） */
+private const val WEBSITE_URL = "http://tvplayer.run4u.dpdns.org/"
 
 /**
  * 登录/注册界面
@@ -98,26 +108,15 @@ fun LoginScreen(
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(Color(0xFF0F1117), Color(0xFF1A1D27))
-                )
-            )
+            .ambientGradientBackdrop()
     ) {
-        // 屏幕较矮（手机横屏）时启用紧凑布局，尽量一屏显示
+        // 屏幕较矮（手机横屏）时启用紧凑布局；宽屏（TV）改为表单 + 二维码左右分栏，整屏不滚动
         val compact = maxHeight < 520.dp
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .imePadding()
-                .padding(
-                    horizontal = if (compact) 20.dp else 24.dp,
-                    vertical = if (compact) 16.dp else 32.dp
-                ),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(if (compact) 10.dp else 16.dp)
-        ) {
+        val wide = maxWidth >= 600.dp
+
+        // 登录表单（左栏内容）：捕获外部状态，供宽/窄两种布局复用，避免重复
+        @Composable
+        fun LoginForm() {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.Start
@@ -289,7 +288,7 @@ fun LoginScreen(
 
             // 遥控器操作说明（手机上隐藏，节省空间）
             if (!compact) {
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(12.dp))
 
                 RemoteHint(
                     items = listOf(
@@ -305,6 +304,120 @@ fun LoginScreen(
                     modifier = Modifier.padding(top = 8.dp)
                 )
             }
+        }
+
+        // 宽屏（TV）：左表单 + 右二维码（两端对齐），整屏直接显示；窄屏：上下排列仍不滚动
+        if (wide) {
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(
+                        horizontal = if (compact) 20.dp else 32.dp,
+                        vertical = if (compact) 16.dp else 24.dp
+                    ),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(
+                    modifier = Modifier.widthIn(max = 520.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 12.dp)
+                ) {
+                    LoginForm()
+                }
+                QrCard(compact = compact)
+            }
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .imePadding()
+                    .padding(
+                        horizontal = if (compact) 20.dp else 24.dp,
+                        vertical = if (compact) 12.dp else 20.dp
+                    ),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 12.dp)
+            ) {
+                LoginForm()
+                QrCard(compact = compact)
+            }
+        }
+    }
+}
+
+/**
+ * 二维码图片：用 ZXing 生成指定 URL 的二维码位图并渲染。
+ * 失败时静默返回（不阻塞登录流程），保证复杂环境下界面仍可用。
+ */
+@Composable
+private fun QrCodeImage(url: String, sizeDp: Int, modifier: Modifier = Modifier) {
+    val density = LocalDensity.current
+    val imageBitmap = remember(url, sizeDp) {
+        try {
+            val sizePx = with(density) { sizeDp.dp.toPx() }.toInt().coerceAtLeast(1)
+            val matrix = QRCodeWriter().encode(
+                url,
+                BarcodeFormat.QR_CODE,
+                sizePx,
+                sizePx,
+                mapOf(
+                    EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M,
+                    EncodeHintType.CHARACTER_SET to "UTF-8",
+                    EncodeHintType.MARGIN to 2
+                )
+            )
+            val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+            for (x in 0 until sizePx) {
+                for (y in 0 until sizePx) {
+                    bmp.setPixel(
+                        x, y,
+                        if (matrix[x, y]) android.graphics.Color.BLACK
+                        else android.graphics.Color.WHITE
+                    )
+                }
+            }
+            bmp.asImageBitmap()
+        } catch (e: Exception) {
+            null
+        }
+    }
+    if (imageBitmap != null) {
+        Image(bitmap = imageBitmap, contentDescription = "官网二维码：$url", modifier = modifier)
+    }
+}
+
+/**
+ * 官网二维码卡片：白底以保证可扫描，内含二维码 + 文案，供宽/窄两种布局复用。
+ */
+@Composable
+private fun QrCard(compact: Boolean, modifier: Modifier = Modifier) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = Color.White,
+        modifier = modifier
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            QrCodeImage(
+                url = WEBSITE_URL,
+                sizeDp = if (compact) 130 else 180,
+                modifier = Modifier.size(if (compact) 130.dp else 180.dp)
+            )
+            Text(
+                text = "扫码访问官网",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.Black
+            )
+            Text(
+                text = WEBSITE_URL,
+                fontSize = 11.sp,
+                color = Color.DarkGray
+            )
         }
     }
 }
@@ -399,14 +512,14 @@ private fun InputField(
     Column(modifier = modifier.fillMaxWidth()) {
         Text(
             text = label,
-            fontSize = if (compact) 13.sp else 14.sp,
+            fontSize = if (compact) 12.sp else 13.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(bottom = 4.dp)
         )
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(if (compact) 46.dp else 52.dp)
+                .height(if (compact) 40.dp else 46.dp)
                 .background(
                     if (focused) MaterialTheme.colorScheme.primaryContainer
                     else MaterialTheme.colorScheme.surface,
