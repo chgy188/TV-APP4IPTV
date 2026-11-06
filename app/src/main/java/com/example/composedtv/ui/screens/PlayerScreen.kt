@@ -108,7 +108,12 @@ import com.example.composedtv.data.remote.ApiClient
 import com.example.composedtv.player.PlaylistItem
 import com.example.composedtv.ui.components.SettingsDrawer
 import com.example.composedtv.ui.components.SidePanel
+import com.example.composedtv.ui.components.WaterGlassLoader
 import com.example.composedtv.ui.components.ambientGradientBackdrop
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.tween
 import com.example.composedtv.viewmodel.ChannelEntry
 import com.example.composedtv.viewmodel.PlayerViewModel
 import com.example.composedtv.data.local.LocalFavorite
@@ -192,6 +197,8 @@ fun PlayerScreen(
     val playerState by engine.stateFlow.collectAsState()
     // 首帧是否已出画：决定是否显示渐变占位蒙版（取代起播黑屏）
     val firstFrameRendered by engine.firstFrameFlow.collectAsState()
+    // 真实缓冲水位：驱动水杯注水动画
+    val bufferProgress by engine.bufferProgressFlow.collectAsState()
 
     // ===== 诊断 HUD =====
     // 遥控器数字键 0：开关 HUD（无 ADB 时在画面上直接看解码器/丢帧/Surface 指标）
@@ -770,26 +777,42 @@ fun PlayerScreen(
             )
         }
 
-        // 加载中：仅保留极简提示，不展示链接 / 速率 / 下载量等技术信息
-        if (playerState.isLoading) {
+        // 起播 / 切台缓冲：水杯注水动画，水位随真实缓冲量增长。
+        // 渐变蒙版仍由 firstFrameRendered 立即撤除（不延迟出画），水杯仅短暂淡出。
+        AnimatedVisibility(
+            visible = !firstFrameRendered,
+            enter = fadeIn(animationSpec = tween(180)),
+            exit = fadeOut(animationSpec = tween(200))
+        ) {
             Box(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
             ) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    CircularProgressIndicator(
-                        color = MaterialTheme.colorScheme.primary,
-                        strokeWidth = 3.dp
-                    )
+                    WaterGlassLoader(progress = bufferProgress)
                     Text(
-                        text = "加载中…",
-                        color = Color.White,
-                        fontSize = 15.sp
+                        text = "缓冲中…",
+                        color = Color.White.copy(alpha = 0.88f),
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Medium
                     )
                 }
+            }
+        }
+
+        // 播放期重新缓冲：画面已在，只保留极简 spinner，不用水杯遮挡视频
+        if (playerState.isLoading && firstFrameRendered) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(
+                    color = MaterialTheme.colorScheme.primary,
+                    strokeWidth = 3.dp
+                )
             }
         }
 

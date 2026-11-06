@@ -280,6 +280,50 @@ class PlayerEngine(private val context: Context) {
     private val _firstFrameRendered = kotlinx.coroutines.flow.MutableStateFlow(false)
     val firstFrameFlow: kotlinx.coroutines.flow.StateFlow<Boolean> = _firstFrameRendered
 
+    /** 缓冲水位 0..1：供「水杯注水」动画展示；起播归零、起播成功补满 */
+    private val _bufferProgress = kotlinx.coroutines.flow.MutableStateFlow(0f)
+    val bufferProgressFlow: kotlinx.coroutines.flow.StateFlow<Float> = _bufferProgress
+    private var bufferSamplerJob: Job? = null
+    /** 视为「满杯」的可播放缓冲量（毫秒），略高于起播阈值 500ms */
+    private val bufferFullMs = 2_000L
+
+    /**
+     * 起播缓冲采样：以 bufferedPosition - currentPosition（还能播多久）作为真实水位。
+     * 建连/无数据阶段用极缓时间底水位兜底；单调不回退 + 平滑步进，形成缓缓注水的观感。
+     */
+    private fun startBufferSampling() {
+        bufferSamplerJob?.cancel()
+        _bufferProgress.value = 0f
+        val startedAt = android.os.SystemClock.elapsedRealtime()
+        bufferSamplerJob = scope.launch {
+            while (true) {
+                val p = player
+                val aheadMs = if (p != null) {
+                    val bp = p.bufferedPosition
+                    val cp = p.currentPosition
+                    if (bp == C.TIME_UNSET || cp == C.TIME_UNSET) 0L
+                    else (bp - cp).coerceAtLeast(0L)
+                } else 0L
+                val fromData = (aheadMs.toFloat() / bufferFullMs).coerceIn(0f, 1f)
+                val elapsed = android.os.SystemClock.elapsedRealtime() - startedAt
+                val fromTime = (elapsed / 9000f).coerceIn(0f, 0.22f)
+                val target = maxOf(fromData, fromTime)
+                val cur = _bufferProgress.value
+                if (target > cur) {
+                    _bufferProgress.value = (cur + (target - cur) * 0.22f).coerceAtMost(1f)
+                }
+                delay(120)
+            }
+        }
+    }
+
+    /** 起播成功 / 首帧到达：补满水杯并停止采样 */
+    private fun finishBufferSampling() {
+        bufferSamplerJob?.cancel()
+        bufferSamplerJob = null
+        _bufferProgress.value = 1f
+    }
+
     /** 统一设置主 player 引用：同步给诊断中心，便于 HUD 读取 DecoderCounters */
     private fun setPlayerRef(exo: ExoPlayer?) {
         if (_playerRef.value === exo) return
@@ -460,6 +504,8 @@ class PlayerEngine(private val context: Context) {
         // 外部媒体：强制直连，跳过 IPTV 代理（见 PlaylistItem.forceDirect）
         // 新一轮起播：重新显示渐变占位蒙版，避免切台瞬间露出黑屏
         _firstFrameRendered.value = false
+        // 水杯注水动画从空杯重新开始
+        startBufferSampling()
         // 进入新一轮起播：清除重载荷载锁，允许后续（若仍卡死）再次兜底重载
         isReloading = false
         resetRace()
@@ -937,7 +983,10 @@ class PlayerEngine(private val context: Context) {
         // 仅当前绑定的主 player 的首帧有效，避免竞速中被淘汰候选的回调误触发。
         p.addListener(object : Player.Listener {
             override fun onRenderedFirstFrame() {
-                if (player === p) _firstFrameRendered.value = true
+                if (player === p) {
+                    _firstFrameRendered.value = true
+                    finishBufferSampling()
+                }
             }
         })
         // 诊断：挂 AnalyticsListener 采集解码器名称/初始化耗时/视频格式/丢帧
@@ -1202,6 +1251,8 @@ class PlayerEngine(private val context: Context) {
         }
         raceCandidates = emptyList()
         updateState(isLoading = false, isPlaying = true, error = null, usingProxy = winner.attempt == "proxy", loadMode = null, loadTimeoutMs = 0, loadRemainMs = 0)
+        // 起播成功即补满水杯（水位以 tween 平滑注满后随首帧淡出）
+        finishBufferSampling()
         // 兜底：纯音频流 / 个别设备不回调 onRenderedFirstFrame 时，延时强制撤下渐变占位蒙版，
         // 避免真实画面被永久遮挡。校验 URL 防止旧任务的延时回调串到新一轮起播。
         val fallbackUrl = currentPlayingUrl
@@ -1209,6 +1260,7 @@ class PlayerEngine(private val context: Context) {
             delay(1500)
             if (currentPlayingUrl == fallbackUrl && !_firstFrameRendered.value) {
                 _firstFrameRendered.value = true
+                finishBufferSampling()
             }
         }
         Log.d(TAG, "起播成功: ${winner.attempt}")
@@ -1664,6 +1716,8 @@ class PlayerEngine(private val context: Context) {
 
     /** 停播：停止当前播放并释放解码器/渲染资源，保留播放列表，停留在当前界面（不退出 APP）。 */
     fun stopPlayback() {
+        bufferSamplerJob?.cancel()
+        bufferSamplerJob = null
         stopAttemptTimeout()
         resetRace()
         stopAvSyncWatcher()
