@@ -73,6 +73,14 @@ fun DebugHud(s: DiagSnapshot, modifier: Modifier = Modifier) {
         )
         HudLine("视频", "${s.resolution} @${s.frameRate}fps ${s.bitrate}", false)
         HudLine("编码", "${s.codecs} ${s.mime}", false)
+        val audioBad = s.audioState == "UNSUPPORTED" || s.audioState == "NO_AUDIO_TRACK" ||
+            s.audioState == "NOT_SELECTED" || s.audioError != "-"
+        HudLine("音频", "${s.audioState} ${s.audioFormat}", audioBad)
+        HudLine("音轨", s.audioTracks.take(100), audioBad)
+        if (s.audioDecoder != "-" || s.audioError != "-" || s.audioFallback != "-" || s.audioTrackCfg != "-") {
+            HudLine("音频解码", "${s.audioDecoder} err=${s.audioError} fb=${s.audioFallback} out=${s.audioTrackCfg}",
+                s.audioError != "-")
+        }
         HudLine("状态", "${s.state} loading=${s.isLoading} buf=${s.bufferedMs / 1000}s", s.isLoading)
         HudLine(
             "真实速率",

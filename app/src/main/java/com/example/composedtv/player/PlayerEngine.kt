@@ -10,11 +10,15 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
+import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.LoadEventInfo
@@ -361,6 +365,106 @@ class PlayerEngine(private val context: Context) {
     private var vodProgressJob: Job? = null
     /** 当前播放是否为直播流（默认按直播处理，避免电视直播误显示点播控制条） */
     private var isLiveStream = true
+    /** 当前点播已播放完毕：禁止再把片尾位置写回，否则下次进入会直接跳到结尾 */
+    private var vodFinished = false
+    /** 本轮起播已展示过续播提示的 URL，避免 STATE_READY 重入导致提示重复 */
+    private var resumeHintShownUrl: String? = null
+    /** 本轮起播的续播目标位置（ms）：prepare 前注入 MediaItem，并由兜底协程持续补 seek */
+    private var pendingResumeMs = 0L
+    /** 续播是否已真正落到播放位置上；只有为 true 才提示「已为您续播」并允许覆盖进度记录 */
+    private var resumeSettled = false
+
+    /** 开启本轮续播守护：有目标时，定位成功前不写更小的进度、不显示续播提示 */
+    private fun armResumeGuard() {
+        resumeSettled = pendingResumeMs <= 0
+    }
+
+    /** 续播是否「尚未生效」：目标未落地且当前位置明显落后于目标。
+     *  不设时间窗口——只要位置还没追上原记录，就不能用更小的位置覆盖它，
+     *  否则一次续播失败会把 27s 的记录改写成 3s，续播永久失效。 */
+    private fun resumeNotSettled(pos: Long): Boolean =
+        pendingResumeMs > 0 && !resumeSettled && pos < pendingResumeMs - 3_000
+
+    /** 续播位置确认生效：清掉守护状态，并在此刻才提示用户，避免「提示已续播、实际从头播」 */
+    private fun onResumeSettled(targetMs: Long, pos: Long) {
+        if (resumeSettled) return
+        resumeSettled = true
+        pendingResumeMs = 0L
+        Log.d(TAG, "续播已生效: pos=${pos}ms target=${targetMs}ms")
+        showResumeHint(targetMs)
+    }
+
+    /**
+     * prepare 前注入的起始位置在少数容器（SeekMap/Cues 位于文件尾的 MKV over HTTP）会被
+     * clamp 回 0。此时 duration 长期为 C.TIME_UNSET、isCurrentMediaItemSeekable() 为 false，
+     * 若把它们当作 seek 前置条件，兜底协程会一次 seekTo 都不发（旧实现即如此）。
+     *
+     * ExoPlayer 在 SeekMap 未就绪时会把 seek 记为 pending，待 Timeline/SeekMap 就绪后应用，
+     * 因此这里首轮即无条件 seekTo，并在窗口内持续复查 / 重试，直到位置真正达到目标。
+     */
+    private fun scheduleResumeFallback(exo: ExoPlayer, targetMs: Long) {
+        if (targetMs <= 0) return
+        scope.launch {
+            repeat(20) { round ->
+                delay(if (round == 0) 500L else 1_500L)
+                if (_playerRef.value !== exo || isLiveStream || vodFinished) return@launch
+                if (resumeSettled || pendingResumeMs <= 0) return@launch
+                val pos = exo.currentPosition
+                if (pos >= targetMs - 3_000) {
+                    onResumeSettled(targetMs, pos)
+                    return@launch
+                }
+                val duration = exo.duration
+                val seekable = exo.isCurrentMediaItemSeekable()
+                if (round == 0 || round % 3 == 2) {
+                    Log.w(
+                        TAG,
+                        "续播兜底: 第${round + 1}轮 pos=${pos}ms target=${targetMs}ms " +
+                            "duration=${duration}ms seekable=$seekable state=${exo.playbackState}"
+                    )
+                }
+                // 前 8 轮每轮补一次，之后降频，避免 SeekMap 长期未就绪时反复打断缓冲。
+                if (round < 8 || round % 3 == 2) {
+                    exo.seekTo(targetMs)
+                    Log.d(TAG, "续播兜底: 发出 seekTo(${targetMs}ms)")
+                }
+            }
+            if (_playerRef.value !== exo || isLiveStream || vodFinished || resumeSettled) return@launch
+            val pos = exo.currentPosition
+            if (pos >= targetMs - 3_000) {
+                onResumeSettled(targetMs, pos)
+            } else {
+                Log.w(TAG, "续播兜底窗口结束(未定位成功): pos=${pos}ms target=${targetMs}ms，保留原进度记录")
+            }
+        }
+    }
+
+    init {
+        // 每次播放器创建时清理隔天的点播进度记录，落实「当天有效」语义
+        VodProgressStore.pruneStale(context)
+    }
+
+    /** 续播提示：同一轮起播只提示一次，让用户明确感知已从当天记录的位置继续播放 */
+    private fun showResumeHint(resumeMs: Long) {
+        if (resumeHintShownUrl == currentPlayingUrl) return
+        resumeHintShownUrl = currentPlayingUrl
+        showHint("已为您续播 ${VodProgressStore.formatPosition(resumeMs)}")
+    }
+
+    /** 立即持久化当前点播进度（切台 / 重载 / 进入后台 / 释放前调用）。直播与已播完的内容不记录。 */
+    private fun saveVodProgressNow() {
+        if (isLiveStream || vodFinished) return
+        val p = player ?: return
+        val pos = p.currentPosition
+        if (resumeNotSettled(pos)) {
+            Log.w(TAG, "跳过保存(续播未生效): pos=${pos}ms < 目标=${pendingResumeMs}ms，保留原记录")
+            return
+        }
+        if (pos > 0) {
+            VodProgressStore.save(context, currentPlayingUrl, pos)
+            Log.d(TAG, "保存点播进度: ${pos}ms key=$currentPlayingUrl")
+        }
+    }
 
     // 竞速状态
     private data class RaceCandidate(
@@ -500,6 +604,11 @@ class PlayerEngine(private val context: Context) {
 
     private fun playCurrent(ignoreLastMode: Boolean = false, proxyFirst: Boolean = false) {
         if (playlist.isEmpty()) return
+        // 切台/重载前先保存上一个点播源进度：仅靠 5s 周期最多会丢 5 秒；
+        // 此处 currentPlayingUrl 尚未被新频道覆盖，保存的正是旧内容。
+        saveVodProgressNow()
+        vodFinished = false
+        resumeHintShownUrl = null
         val item = playlist[currentIndex.coerceIn(0, playlist.lastIndex)]
         // 外部媒体：强制直连，跳过 IPTV 代理（见 PlaylistItem.forceDirect）
         // 新一轮起播：重新显示渐变占位蒙版，避免切台瞬间露出黑屏
@@ -519,6 +628,10 @@ class PlayerEngine(private val context: Context) {
         // 本地文件 / 点播容器扩展名 → 点播；直播协议 / .m3u/.m3u8/.ts/.flv / 直播平台关键字 → 直播。
         // .m3u8 含 #EXT-X-ENDLIST 的「点播型」与 FLV 直播由播放器解析后校正。详见 isLiveStreamUrl。
         isLiveStream = isLiveStreamUrl(item.url)
+        // 本轮续播目标：初始即判定为点播时，在 createCandidatePlayer 里通过
+        // setMediaItem(item, startPositionMs) 于 prepare 前注入，避开 SeekMap 未就绪导致的 seek 失败。
+        pendingResumeMs = if (!isLiveStream) VodProgressStore.load(context, currentPlayingUrl) else 0L
+        armResumeGuard()
         // 点播内容：默认优先中文字幕（zh→en 回退），用户手动选择后以用户选择为准
         if (!isLiveStream && preferredTextLanguages == null) {
             setPreferredTextLanguages(listOf("zh", "en"))
@@ -635,9 +748,13 @@ class PlayerEngine(private val context: Context) {
                 // （HLS 点播型在 onRaceWin 时 isLiveStream 仍为 true，只能在此处识别为点播）
                 setPreferredTextLanguages(listOf("zh", "en"))
                 val resume = VodProgressStore.load(context, currentPlayingUrl)
+                pendingResumeMs = resume
+                armResumeGuard()
                 if (resume > 0) {
-                    Log.d(TAG, "恢复点播播放位置(HLS校正): ${resume}ms")
-                    exo.seekTo(resume)
+                    Log.d(TAG, "恢复点播播放位置(HLS校正): ${resume}ms，等待定位生效后提示")
+                    // 不在此立即 seekTo：STATE_READY 时 Timeline 可能未就绪，seek 会被 clamp 回 0；
+                    // 由兜底协程首轮开始持续补 seekTo，并在真正生效后才提示。
+                    scheduleResumeFallback(exo, resume)
                 }
                 startVodProgressSaver(exo)
             } else {
@@ -906,7 +1023,24 @@ class PlayerEngine(private val context: Context) {
             // 直连源站才携带频道自定义请求头；代理走自有 worker，无需转发 UA/Referer
             httpFactory.setDefaultRequestProperties(currentChannelHeaders)
         }
-        val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
+        val baseDataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
+        // 直连 MKV 点播：修补头部 SeekHead 的 Cues 条目，让 MatroskaExtractor 能建立可 seek 的
+        // SeekMap。这类源把 Cues 位置只写在文件尾 SeekHead，ExoPlayer 取不到就恒为
+        // seekable=false，断点续播的 startPositionMs / seekTo 都会被 clamp 回 0。
+        // 直播、HLS、代理地址与其它容器一律走原始数据源；探测失败时补丁数据源自动透传。
+        val isDirectMkv = !useProxy && !isHls &&
+            finalUrl.substringBefore('?').endsWith(".mkv", ignoreCase = true)
+        val dataSourceFactory: DataSource.Factory = if (isDirectMkv) {
+            DataSource.Factory {
+                MkvCuesPatchDataSource(
+                    baseDataSourceFactory.createDataSource(),
+                    finalUrl,
+                    currentChannelHeaders,
+                    BROWSER_UA,
+                    playHttpClient
+                )
+            }
+        } else baseDataSourceFactory
 
         // 不强制单一 Extractor：DefaultMediaSourceFactory 默认会从流首字节嗅探容器
         // （FLV 的 "FLV" magic、MP4 的 ftyp、TS 的 0x47…），按实际协议选择解析器，
@@ -914,11 +1048,36 @@ class PlayerEngine(private val context: Context) {
         val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
             .setLoadErrorHandlingPolicy(LenientLoadErrorHandlingPolicy())
 
+        // 本项目已引入 FFmpeg 软解扩展（build.gradle.kts: media3-ffmpeg-decoder），
+        // ON = 系统 MediaCodec 优先、FFmpeg 扩展兜底；PREFER = 扩展软解优先（老设备易卡）。
+        // 保持 ON，只让「系统解码器不支持/不可用」的格式落到 FFmpeg，避免全局软解增加 CPU 负担。
+        //
+        // 老设备闪退防护：Android 5/6 的 ACodec 在配置 MP3 解码器时会执行
+        // CHECK_EQ(mOMX->getParameter(..., OMX_IndexParamAudioMp3, ...), OK)；部分厂商 OMX 组件
+        // 不支持该参数，返回 -1010 后直接触发 __android_log_assert -> native SIGABRT
+        // （MediaCodec_loop 线程），Java 层 try/catch 完全挡不住。切台遇到 MP3 音轨（或异常流
+        // 被嗅探为 MP3）时表现为「播放失败后整个 App 闪退」，见 logcat 的 Fatal signal 6。
+        // 规避：老设备上让 MediaCodecSelector 对 MP3 家族返回空列表，MediaCodecAudioRenderer
+        // 便不会创建该解码器，TrackSelector 会改选已打包的 FfmpegAudioRenderer 软解；
+        // 即便扩展加载失败也只是跳过音频轨（无声），不会再拖垮进程。
+        val mediaCodecSelector = if (legacy) {
+            MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
+                if (mimeType.startsWith("audio/mpeg")) {
+                    emptyList()
+                } else {
+                    MediaCodecSelector.DEFAULT.getDecoderInfos(
+                        mimeType, requiresSecureDecoder, requiresTunnelingDecoder
+                    )
+                }
+            }
+        } else MediaCodecSelector.DEFAULT
+
         val renderersFactory = DefaultRenderersFactory(context)
-            // PREFER：优先硬件 MediaCodec 解码（省内存/CPU），仅当硬件不支持时才回退到扩展(ffmpeg)软解。
-            // 原 ON 会强制优先软解，在电视盒子上极易因解码帧缓冲堆积触发 OOM。
-            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+            .setMediaCodecSelector(mediaCodecSelector)
+            // 首选解码器初始化失败时，继续尝试设备上其它 MediaCodec 实现（老设备常有多个）
             .setEnableDecoderFallback(true)
+            // API 21/22 的 AudioTrack 对 ENCODING_PCM_FLOAT 支持不完整，强制 16-bit PCM 输出
             .setEnableAudioFloatOutput(false)
 
         val p = ExoPlayer.Builder(context, renderersFactory)
@@ -978,14 +1137,35 @@ class PlayerEngine(private val context: Context) {
                     .build()
             )
         }
-        p.setMediaItem(builder.build())
+        // 续播：prepare 前把起始位置注入 MediaItem。MKV/MP4 等容器在 STATE_READY 瞬间
+        // SeekMap(Cues) 可能尚未解析完，此时 seekTo 会被 clamp 回 0（表现为"续播不生效"）；
+        // 由 ExoPlayer 在 prepare 过程中应用 startPositionMs 则不受该时序影响。
+        val resumeMs = pendingResumeMs
+        if (resumeMs > 0) {
+            p.setMediaItem(builder.build(), resumeMs)
+            Log.d(TAG, "prepare 前注入续播位置: ${resumeMs}ms url=$finalUrl")
+        } else {
+            p.setMediaItem(builder.build())
+        }
         // 首帧渲染信号：一旦真正出画，UI 立即撤下渐变占位蒙版（切台/起播不再有黑屏）。
         // 仅当前绑定的主 player 的首帧有效，避免竞速中被淘汰候选的回调误触发。
         p.addListener(object : Player.Listener {
+            // 每个 player 只兜底改选一次，避免 trackSelectionParameters 变更再次触发
+            // onTracksChanged 形成回调循环
+            private var audioFallbackDone = false
+
             override fun onRenderedFirstFrame() {
                 if (player === p) {
                     _firstFrameRendered.value = true
                     finishBufferSampling()
+                }
+            }
+
+            override fun onTracksChanged(tracks: Tracks) {
+                // 记录音轨 codec / 声道 / 采样率 / 是否被系统解码器支持，用于定位「有画面无声音」
+                DebugDiagnostics.onAudioTracks(tracks)
+                if (!audioFallbackDone && ensureSupportedAudioTrack(p, tracks)) {
+                    audioFallbackDone = true
                 }
             }
         })
@@ -995,12 +1175,56 @@ class PlayerEngine(private val context: Context) {
         DebugDiagnostics.log(
             "Engine",
             "createCandidate attempt=${if (useProxy) "proxy" else "direct"} winner=$winner " +
-                "hls=$isHls legacy=$legacy url=$finalUrl"
+                "hls=$isHls legacy=$legacy mp3Guard=$legacy url=$finalUrl"
         )
         p.prepare()
         p.playWhenReady = true
         p.repeatMode = Player.REPEAT_MODE_OFF
         return p
+    }
+
+    /**
+     * 音轨兜底：若当前没有「已选中且受系统解码器支持」的音频轨，显式改选一条受支持的轨。
+     *
+     * 背景：MKV 常带多音轨（如 AC-3 5.1 主轨 + AAC 2.0 备用轨）。DefaultTrackSelector 可能按
+     * 语言/默认标记选中了老设备无法解码的那条，ExoPlayer 会直接跳过该轨继续播视频，
+     * 表现为「有画面无声音」。此兜底把选择切到设备真正能解的轨。
+     *
+     * 若所有音频轨都不受支持（系统 MediaCodec 被屏蔽/缺失且 FFmpeg 扩展也解不了），
+     * 则不做任何改动：ExoPlayer 会跳过音频轨，画面照常播放，只是无声。
+     *
+     * @return 是否实际应用了一次改选
+     */
+    private fun ensureSupportedAudioTrack(exo: ExoPlayer, tracks: Tracks): Boolean {
+        for (group in tracks.groups) {
+            if (group.type != C.TRACK_TYPE_AUDIO) continue
+            for (i in 0 until group.length) {
+                if (group.isTrackSelected(i) && group.isTrackSupported(i)) return false
+            }
+        }
+        for (group in tracks.groups) {
+            if (group.type != C.TRACK_TYPE_AUDIO) continue
+            for (i in 0 until group.length) {
+                if (!group.isTrackSupported(i)) continue
+                val fmt = group.getTrackFormat(i)
+                exo.trackSelectionParameters = exo.trackSelectionParameters.buildUpon()
+                    .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+                    .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+                    .addOverride(TrackSelectionOverride(group.mediaTrackGroup, i))
+                    .build()
+                Log.i(TAG, "音轨兜底：改选受支持音轨 ${fmt.sampleMimeType}/${fmt.codecs} " +
+                    "ch=${fmt.channelCount} hz=${fmt.sampleRate}")
+                DebugDiagnostics.onAudioFallback(
+                    "${fmt.sampleMimeType}/${fmt.codecs} ch=${fmt.channelCount} hz=${fmt.sampleRate}"
+                )
+                return true
+            }
+        }
+        // 没有任何受支持的音轨：记录明确结论，供 HUD / logcat 判断
+        if (tracks.containsType(C.TRACK_TYPE_AUDIO)) {
+            Log.w(TAG, "所有音频轨都不受本设备 MediaCodec 支持：视频可播但将无声音（需软解扩展或换源）")
+        }
+        return false
     }
 
     /**
@@ -1231,13 +1455,15 @@ class PlayerEngine(private val context: Context) {
                 winner.attempt == "proxy"
             )
             winExo.playWhenReady = true
-            // 点播内容：断点续播（HLS 点播型在 refineLiveFromPlayer 校正后才识别，那里补做）。
-            // 此处处理初始即判定为点播（mp4 / 外部文件 / 容器格式）的情况；直播则停止保存协程。
+            // 点播内容：续播位置已在 createCandidatePlayer 通过 setMediaItem(item, startPositionMs)
+            // 于 prepare 前注入。MKV over HTTP 可能在 prepare 时把该位置 clamp 回 0，
+            // 由 scheduleResumeFallback 持续补 seekTo，并在位置真正落地后才提示用户。
+            // HLS 点播型在 refineLiveFromPlayer 校正后才识别为点播，那里补做。
             if (!isLiveStream) {
-                val resume = VodProgressStore.load(context, currentPlayingUrl)
+                val resume = pendingResumeMs
                 if (resume > 0) {
-                    Log.d(TAG, "恢复点播播放位置: ${resume}ms")
-                    winExo.seekTo(resume)
+                    Log.d(TAG, "续播位置已注入: ${resume}ms，等待定位生效后提示")
+                    scheduleResumeFallback(winExo, resume)
                 }
                 startVodProgressSaver(winExo)
             } else {
@@ -1515,7 +1741,10 @@ class PlayerEngine(private val context: Context) {
             while (true) {
                 delay(5_000)
                 if (_playerRef.value !== exo) break   // 已切台/重载，退出
+                if (vodFinished) break                 // 已播完，禁止把片尾位置写回
                 val pos = exo.currentPosition
+                // 续播尚未生效时不写入，避免把旧记录覆盖成片头位置
+                if (resumeNotSettled(pos)) continue
                 if (pos > 0) VodProgressStore.save(context, currentPlayingUrl, pos)
             }
         }
@@ -1532,6 +1761,7 @@ class PlayerEngine(private val context: Context) {
                     }
                     Player.STATE_ENDED ->
                         if (!isLiveStream) {
+                            vodFinished = true
                             Log.i(TAG, "点播播放完成，清除续播记录: $currentPlayingUrl")
                             VodProgressStore.clear(context, currentPlayingUrl)
                             stopVodProgressSaver()
@@ -1578,13 +1808,8 @@ class PlayerEngine(private val context: Context) {
         // 立即终止旧的起播层监测，避免旧 player 在其延迟/超时窗口内再次触发 reload
         stopAttemptTimeout()
         // 点播内容：保存当前播放位置到持久化 Store，重载后由 Store 断点续播
-        if (!isLiveStream) {
-            val pos = player?.currentPosition ?: 0
-            if (pos > 0) {
-                VodProgressStore.save(context, currentPlayingUrl, pos)
-                Log.d(TAG, "reloadCurrentChannel: 保存点播播放位置 ${pos}ms")
-            }
-        }
+        // （playCurrent 开头也会兜底保存一次，同一 key 写入幂等）
+        saveVodProgressNow()
         Log.d(TAG, "reloadCurrentChannel(reason=$reason) idx=$currentIndex url=$currentPlayingUrl isLive=$isLiveStream")
         DebugDiagnostics.onReload(reason)
         playCurrent(ignoreLastMode = ignoreLastMode, proxyFirst = proxyFirst)
@@ -1703,19 +1928,30 @@ class PlayerEngine(private val context: Context) {
     }
 
     // ===== 生命周期 =====
+    /** 是否因进入后台而暂停：避免用户主动暂停后，回到前台被强制恢复播放 */
+    private var pausedByLifecycle = false
+
     fun onResume() {
-        val p = player ?: return
-        p.playWhenReady = true
+        // 只恢复「由 onPause 主动暂停」的播放，尊重用户手动暂停状态
+        if (pausedByLifecycle) {
+            player?.playWhenReady = true
+            pausedByLifecycle = false
+        }
     }
 
     fun onPause() {
         // 点播：进入后台前持久化进度，确保被系统回收也能断点续播
-        if (!isLiveStream) player?.let { if (it.currentPosition > 0) VodProgressStore.save(context, currentPlayingUrl, it.currentPosition) }
-        player?.playWhenReady = false
+        saveVodProgressNow()
+        if (player?.playWhenReady == true) {
+            player?.playWhenReady = false
+            pausedByLifecycle = true
+        }
     }
 
     /** 停播：停止当前播放并释放解码器/渲染资源，保留播放列表，停留在当前界面（不退出 APP）。 */
     fun stopPlayback() {
+        // 同 release()：resetRace() 会清空 player，保存必须在此之前
+        saveVodProgressNow()
         bufferSamplerJob?.cancel()
         bufferSamplerJob = null
         stopAttemptTimeout()
@@ -1735,6 +1971,9 @@ class PlayerEngine(private val context: Context) {
     }
 
     fun release() {
+        // 必须在 resetRace() 之前保存：resetRace() 内的 releaseCurrentPlayer() 会清空
+        // _playerRef，之后再读 currentPosition 恒为 0（旧实现即因此从未保存成功）。
+        saveVodProgressNow()
         stopAttemptTimeout()
         resetRace()
         stopAvSyncWatcher()
@@ -1743,8 +1982,6 @@ class PlayerEngine(private val context: Context) {
         connStatsJob = null
         infoHideJob?.cancel()
         hintHideJob?.cancel()
-        // 点播：释放前持久化进度，确保离开 / 被系统回收也能断点续播
-        if (!isLiveStream) player?.let { if (it.currentPosition > 0) VodProgressStore.save(context, currentPlayingUrl, it.currentPosition) }
         safeRelease(player)
         setPlayerRef(null)
         sharedSurface = null

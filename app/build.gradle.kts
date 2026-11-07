@@ -18,9 +18,27 @@ val keystoreProperties = Properties().apply {
 val appVersionName: String = System.getenv("APP_VERSION_NAME") ?: "1.0.0"
 // 注：已不按 ABI 分包，统一产出单一 APK（详见下方 splits 说明）
 
+// 强制锁定 media3 到 1.6.1：项目内某依赖（androidx.tv:tv-material 一系）会经版本一致性解析
+// 把 media3 全家族拉高到 1.7.1，而 1.7.1 要求 compileSdk 35。1.6.1 同样要求 compileSdk 35，
+// 故上方已同步将 app compileSdk 升到 35；其 minSdk=21 仍兼容 Android 5 老设备（极米），
+// 且与 Jellyfin ffmpeg 解码器（1.6.1+2）编译版本严格对齐。
+configurations.all {
+    resolutionStrategy {
+        force(
+            "androidx.media3:media3-exoplayer:1.6.1",
+            "androidx.media3:media3-exoplayer-hls:1.6.1",
+            "androidx.media3:media3-ui:1.6.1",
+            "androidx.media3:media3-common:1.6.1",
+            "androidx.media3:media3-extractor:1.6.1",
+            "androidx.media3:media3-datasource-okhttp:1.6.1",
+            "androidx.media3:media3-decoder:1.6.1",
+        )
+    }
+}
+
 android {
     namespace = "com.example.composedtv"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.example.composedtv"
@@ -135,14 +153,20 @@ dependencies {
     implementation("androidx.tv:tv-foundation:1.0.0-alpha10")
     implementation("androidx.tv:tv-material:1.0.0-alpha10")
 
-    // Media3 ExoPlayer
-    implementation("androidx.media3:media3-exoplayer:1.2.1")
-    implementation("androidx.media3:media3-exoplayer-hls:1.2.1")
-    implementation("androidx.media3:media3-ui:1.2.1")
-    implementation("androidx.media3:media3-common:1.2.1")
-    implementation("androidx.media3:media3-extractor:1.2.1")
+    // Media3 ExoPlayer（1.6.1：包含 1.4.1 起累积的 MatroskaExtractor/MKV 音轨解析修复，
+    // minSdk=21 兼容 Android 5 老设备。因 media3 1.5+ 要求 compileSdk 35，app 已同步升 35。
+    // 版本需与下方 Jellyfin ffmpeg 解码器严格对齐）
+    implementation("androidx.media3:media3-exoplayer:1.6.1")
+    implementation("androidx.media3:media3-exoplayer-hls:1.6.1")
+    implementation("androidx.media3:media3-ui:1.6.1")
+    implementation("androidx.media3:media3-common:1.6.1")
+    implementation("androidx.media3:media3-extractor:1.6.1")
     // OkHttp 数据源（连接复用、HTTP/2），版本需与 media3 主版本严格一致
-    implementation("androidx.media3:media3-datasource-okhttp:1.2.1")
+    implementation("androidx.media3:media3-datasource-okhttp:1.6.1")
+    // FFmpeg 软解扩展（Jellyfin 维护的预编译 media3 ffmpeg 解码器，GPL-3.0）：
+    // 为系统缺少 E-AC3/AC3/DTS 解码器的老设备（如极米 Android 5）提供软件音频解码。
+    // 内含 libffmpegJNI.so（armeabi-v7a/arm64-v8a/x86/x86_64），配合 EXTENSION_RENDERER_MODE_ON 自动启用。
+    implementation("org.jellyfin.media3:media3-ffmpeg-decoder:1.6.1+2")
 
     // OkHttp
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

@@ -1,12 +1,17 @@
 package com.example.composedtv.debug
 
 import android.content.Context
+import android.media.AudioFormat
+import android.media.MediaCodecList
 import android.os.Build
 import android.util.Log
+import androidx.media3.common.C
 import androidx.media3.common.Format
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
+import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.DecoderCounters
 import androidx.media3.exoplayer.DecoderReuseEvaluation
 import androidx.media3.exoplayer.ExoPlayer
@@ -64,6 +69,24 @@ data class DiagSnapshot(
     val bitrate: String = "-",
     val codecs: String = "-",
     val mime: String = "-",
+
+    // ===== 音频（定位老设备「有画面无声音」）=====
+    /** 音轨状态：SELECTED / UNSUPPORTED / NOT_SELECTED / NO_AUDIO_TRACK / - */
+    val audioState: String = "-",
+    /** 当前音轨 mime/codecs/声道/采样率 */
+    val audioFormat: String = "-",
+    /** 实际启用的音频解码器名 */
+    val audioDecoder: String = "-",
+    /** 全部音频轨摘要（含各轨 supported/selected 标记） */
+    val audioTracks: String = "-",
+    /** 最近一次音频解码/AudioTrack 错误 */
+    val audioError: String = "-",
+    /** 音轨兜底改选记录 */
+    val audioFallback: String = "-",
+    /** 设备支持的音频 MediaCodec 解码器列表 */
+    val audioDecoders: String = "-",
+    /** AudioTrack 实际输出配置（编码/采样率/声道掩码），用于确认是否真的在出声 */
+    val audioTrackCfg: String = "-",
 
     // ===== 播放 =====
     val state: String = "-",
@@ -140,9 +163,99 @@ object DebugDiagnostics {
         this.loadUrl = url
     }
 
+    // ===== 音频诊断（定位 Android 5 等老设备「有画面无声音」）=====
+    @Volatile private var audioState = "-"
+    @Volatile private var audioFormat = "-"
+    @Volatile private var audioDecoder = "-"
+    @Volatile private var audioTracks = "-"
+    @Volatile private var audioError = "-"
+    @Volatile private var audioFallback = "-"
+    @Volatile private var audioDecoders = "-"
+    @Volatile private var audioTrackCfg = "-"
+
+    /** 设备实际提供的音频 MediaCodec 解码器：两台设备对比即可看出极米缺哪一种 codec */
+    private fun logAudioDecoders() {
+        val list = try {
+            MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
+                .filter { !it.isEncoder }
+                .flatMap { info ->
+                    info.supportedTypes
+                        .filter { it.startsWith("audio/", ignoreCase = true) }
+                        .map { "${info.name}($it)" }
+                }
+        } catch (t: Throwable) {
+            listOf("MediaCodecList unavailable: ${t.message}")
+        }
+        audioDecoders = list.joinToString(" ")
+        log(TAG, "audio-decoders sdk=${Build.VERSION.SDK_INT} $audioDecoders")
+    }
+
+    /** 由 PlayerEngine.onTracksChanged 调用：记录每条音轨的 codec / 声道 / 是否被设备支持 */
+    fun onAudioTracks(tracks: Tracks) {
+        var total = 0
+        var supported = 0
+        var selectedFormat: Format? = null
+        val sb = StringBuilder()
+        for (group in tracks.groups) {
+            if (group.type != C.TRACK_TYPE_AUDIO) continue
+            for (i in 0 until group.length) {
+                total++
+                val f = group.getTrackFormat(i)
+                val sup = group.isTrackSupported(i)
+                val sel = group.isTrackSelected(i)
+                if (sup) supported++
+                if (sel) selectedFormat = f
+                sb.append("[${f.sampleMimeType ?: "?"}/${f.codecs ?: "?"} " +
+                    "ch=${f.channelCount} hz=${f.sampleRate} sup=$sup sel=$sel]")
+            }
+        }
+        audioTracks = sb.toString().ifEmpty { "-" }
+        audioState = when {
+            total == 0 -> "NO_AUDIO_TRACK"
+            // 选中了某条轨，但该轨 isTrackSupported=false：最常见于老设备缺该格式解码器
+            // （如 Android 5 无 E-AC3），即使 DefaultTrackSelector 已回退到 AAC 备用轨，
+            // 若 AAC 轨也因 CodecPrivate 不完整被判 unsupported，就会落到这里 → 视频正常但静音
+            selectedFormat != null && supported == 0 -> "SELECTED_UNSUPPORTED"
+            selectedFormat != null -> "SELECTED"
+            supported > 0 -> "NOT_SELECTED"
+            else -> "UNSUPPORTED"
+        }
+        selectedFormat?.let {
+            audioFormat = "${it.sampleMimeType ?: "?"}/${it.codecs ?: "?"} " +
+                "ch=${it.channelCount} hz=${it.sampleRate}"
+        }
+        log(TAG, "audio-tracks state=$audioState $audioTracks")
+        if (audioState == "UNSUPPORTED" || audioState == "SELECTED_UNSUPPORTED") {
+            log(TAG, "audio $audioState: 选中/可用音轨不被本设备 MediaCodec 支持 → 视频正常但静音" +
+                "（需引入软解扩展或换带 AAC-LC 2.0 音轨的片源）")
+        }
+    }
+
+    fun onAudioTrackInitialized(config: AudioSink.AudioTrackConfig) {
+        audioTrackCfg = "${encName(config.encoding)} ${config.sampleRate}Hz " +
+            "chCfg=0x${config.channelConfig.toString(16)} buf=${config.bufferSize} offload=${config.offload}"
+        log(TAG, "audio-track-init $audioTrackCfg")
+    }
+
+    private fun encName(enc: Int): String = when (enc) {
+        AudioFormat.ENCODING_PCM_16BIT -> "PCM16"
+        AudioFormat.ENCODING_PCM_FLOAT -> "FLOAT"
+        AudioFormat.ENCODING_AC3 -> "AC3"
+        AudioFormat.ENCODING_E_AC3 -> "EAC3"
+        AudioFormat.ENCODING_DTS -> "DTS"
+        AudioFormat.ENCODING_DTS_HD -> "DTS_HD"
+        else -> "enc$enc"
+    }
+
+    fun onAudioFallback(desc: String) {
+        audioFallback = desc
+        log(TAG, "audio-fallback $desc")
+    }
+
     fun init(context: Context) {
         appContext = context.applicationContext
         log(TAG, "init enabled=$enabled device=${Build.MANUFACTURER}/${Build.MODEL} sdk=${Build.VERSION.SDK_INT}")
+        logAudioDecoders()
     }
 
     fun setEnv(isLegacy: Boolean, renderer: String) {
@@ -271,6 +384,51 @@ object DebugDiagnostics {
             log(TAG, "video-size ${videoSize.width}x${videoSize.height}")
         }
 
+        // ===== 音频链路诊断：老设备常因系统缺该音轨 MediaCodec 而「有画面无声音」=====
+
+        override fun onAudioInputFormatChanged(
+            eventTime: AnalyticsListener.EventTime,
+            format: Format,
+            decoderReuseEvaluation: DecoderReuseEvaluation?
+        ) {
+            audioFormat = "${format.sampleMimeType ?: "?"}/${format.codecs ?: "?"} " +
+                "ch=${format.channelCount} hz=${format.sampleRate}"
+            log(TAG, "audio-format $audioFormat")
+        }
+
+        override fun onAudioDecoderInitialized(
+            eventTime: AnalyticsListener.EventTime,
+            decoderName: String,
+            initializedTimestampMs: Long,
+            initializationDurationMs: Long
+        ) {
+            audioDecoder = decoderName
+            log(TAG, "audio-decoder-init name=$decoderName cost=${initializationDurationMs}ms")
+        }
+
+        override fun onAudioCodecError(
+            eventTime: AnalyticsListener.EventTime,
+            error: Exception
+        ) {
+            audioError = "codec: ${error.message}"
+            log(TAG, "audio-codec-error ${error.message}")
+        }
+
+        override fun onAudioSinkError(
+            eventTime: AnalyticsListener.EventTime,
+            error: Exception
+        ) {
+            audioError = "sink: ${error.message}"
+            log(TAG, "audio-sink-error ${error.message}")
+        }
+
+        override fun onAudioTrackInitialized(
+            eventTime: AnalyticsListener.EventTime,
+            audioTrackConfig: AudioSink.AudioTrackConfig
+        ) {
+            onAudioTrackInitialized(audioTrackConfig)
+        }
+
         // 原名 onDroppedFrames 是 ExoPlayer 2 的写法，media3 已改名 onDroppedVideoFrames，
         // 且多出 elapsedMs 参数；此前没有 override 也不会报错，导致丢帧事件一直没被采集
         override fun onDroppedVideoFrames(
@@ -362,6 +520,14 @@ object DebugDiagnostics {
             bitrate = fmt?.takeIf { it.bitrate > 0 }?.let { "${it.bitrate / 1000}kbps" } ?: "-",
             codecs = fmt?.codecs ?: "-",
             mime = fmt?.sampleMimeType ?: "-",
+            audioState = audioState,
+            audioFormat = audioFormat,
+            audioDecoder = audioDecoder,
+            audioTracks = audioTracks,
+            audioError = audioError,
+            audioFallback = audioFallback,
+            audioDecoders = audioDecoders,
+            audioTrackCfg = audioTrackCfg,
             state = p?.let { stateName(it.playbackState) } ?: "-",
             isLoading = p?.isLoading ?: false,
             positionMs = p?.currentPosition ?: 0,
@@ -408,6 +574,14 @@ object DebugDiagnostics {
         put("bitrate", s.bitrate)
         put("codecs", s.codecs)
         put("mime", s.mime)
+        put("audioState", s.audioState)
+        put("audioFormat", s.audioFormat)
+        put("audioDecoder", s.audioDecoder)
+        put("audioTracks", s.audioTracks)
+        put("audioError", s.audioError)
+        put("audioFallback", s.audioFallback)
+        put("audioDecoders", s.audioDecoders)
+        put("audioTrackCfg", s.audioTrackCfg)
         put("state", s.state)
         put("isLoading", s.isLoading)
         put("positionMs", s.positionMs)

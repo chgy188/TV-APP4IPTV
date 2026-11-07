@@ -65,6 +65,9 @@ import androidx.compose.ui.focus.focusTarget
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -103,7 +106,6 @@ import com.example.composedtv.debug.DebugDiagnostics
 import com.example.composedtv.debug.DebugHudHost
 import com.example.composedtv.player.PlayerEngine
 import com.example.composedtv.player.PlayerState
-import com.example.composedtv.data.VodProgressStore
 import com.example.composedtv.data.remote.ApiClient
 import com.example.composedtv.player.PlaylistItem
 import com.example.composedtv.ui.components.SettingsDrawer
@@ -422,11 +424,22 @@ fun PlayerScreen(
     }
 
     // 生命周期：onResume / onPause / onDestroy
-    DisposableEffect(engine) {
-        onDispose {
-            if (externalUri != null) {
-                VodProgressStore.save(context, externalUri.toString(), engine.getCurrentPosition())
+    // 接入 onPause 后，进入后台/按 Home 会立即持久化点播进度（原先 onPause 是死代码，
+    // 只靠 5s 周期保存，进程被回收时会丢进度，表现为下次进入从头开始）。
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(engine, lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> engine.onResume()
+                Lifecycle.Event.ON_PAUSE -> engine.onPause()
+                else -> Unit
             }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            // 进度统一由 engine.release() 内的 saveVodProgressNow() 持久化：
+            // 它会跳过直播与已播完的内容，避免把片尾位置重新写回导致下次直接跳到结尾。
             engine.release()
         }
     }
