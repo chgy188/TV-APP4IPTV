@@ -899,6 +899,18 @@ class PlayerEngine(private val context: Context) {
     }
 
     // ===== 播放策略规划 =====
+
+    /**
+     * 是否为 DASH 源（.mpd）。项目只依赖 media3-exoplayer-hls，未打包 DASH 模块：
+     * DefaultMediaSourceFactory 对 .mpd 会反射加载 DashMediaSource$Factory，
+     * 类缺失时把 IllegalStateException 抛到主线程导致闪退，故需在起播前识别并跳过。
+     */
+    private fun isDashStreamUrl(rawUrl: String): Boolean {
+        val lower = rawUrl.lowercase()
+        val path = lower.substringBefore('?').substringBefore('#')
+        return path.endsWith(".mpd") || lower.contains("application/dash+xml")
+    }
+
     private fun planPlay(url: String, country: String): List<String> {
         // 国内频道：完全不走代理，仅直连
         if (isDomestic(country)) {
@@ -972,6 +984,15 @@ class PlayerEngine(private val context: Context) {
             return
         }
         currentPlayingUrl = url
+        // DASH(.mpd) 源：项目未打包 media3-exoplayer-dash，DefaultMediaSourceFactory 会反射
+        // DashMediaSource$Factory 失败并抛 IllegalStateException 到主线程直接闪退。
+        // 在起播前按普通失败处理（直播自动切台 / 点播提示），根本不创建播放器。
+        if (isDashStreamUrl(url)) {
+            Log.w(TAG, "跳过不支持的 DASH(.mpd) 源: $url")
+            showHint("该频道为 DASH 格式，暂不支持，已跳过")
+            handlePlayFailure()
+            return
+        }
         // 外部媒体（forceDirect）：用户自有内容，强制直连、完全不走代理
         val attempts = if (forceDirect) {
             listOf("direct")
@@ -1141,11 +1162,20 @@ class PlayerEngine(private val context: Context) {
         // SeekMap(Cues) 可能尚未解析完，此时 seekTo 会被 clamp 回 0（表现为"续播不生效"）；
         // 由 ExoPlayer 在 prepare 过程中应用 startPositionMs 则不受该时序影响。
         val resumeMs = pendingResumeMs
-        if (resumeMs > 0) {
-            p.setMediaItem(builder.build(), resumeMs)
-            Log.d(TAG, "prepare 前注入续播位置: ${resumeMs}ms url=$finalUrl")
-        } else {
-            p.setMediaItem(builder.build())
+        try {
+            if (resumeMs > 0) {
+                p.setMediaItem(builder.build(), resumeMs)
+                Log.d(TAG, "prepare 前注入续播位置: ${resumeMs}ms url=$finalUrl")
+            } else {
+                p.setMediaItem(builder.build())
+            }
+        } catch (t: Throwable) {
+            // setMediaItem 是主线程同步调用，会在内部 createMediaSource：
+            // 不支持/缺失的容器工厂（如 DASH）会在这里抛异常。先释放已创建的 player，
+            // 再把异常交给 tryNextAttempt 统一兜底，避免泄漏与整个进程闪退。
+            Log.e(TAG, "设置媒体源失败（格式不支持?）: $finalUrl", t)
+            safeRelease(p)
+            throw t
         }
         // 首帧渲染信号：一旦真正出画，UI 立即撤下渐变占位蒙版（切台/起播不再有黑屏）。
         // 仅当前绑定的主 player 的首帧有效，避免竞速中被淘汰候选的回调误触发。
@@ -1299,7 +1329,22 @@ class PlayerEngine(private val context: Context) {
         for (c in raceCandidates) safeRelease(c.exo)
 
         val cand = RaceCandidate(attempt, null, false)
-        cand.exo = createCandidatePlayer(url, attempt == "proxy", winner = true)
+        cand.exo = try {
+            createCandidatePlayer(url, attempt == "proxy", winner = true)
+        } catch (t: Throwable) {
+            // 播放器构造 / 媒体源创建阶段的任何异常都要兜住：这类异常来自主线程同步链路，
+            // 不捕获会直接闪退（例如未打包的 DASH 工厂反射失败）。player 可能已在
+            // createCandidatePlayer 内释放，这里只负责清理引用并按串行策略尝试下一个。
+            Log.e(TAG, "创建播放器失败，跳过该尝试: attempt=$attempt url=$url", t)
+            DebugDiagnostics.log(
+                "Engine",
+                "createCandidate failed attempt=$attempt err=${t.javaClass.simpleName}: ${t.message}"
+            )
+            raceCandidates = emptyList()
+            setPlayerRef(null)
+            tryNextAttempt(url)
+            return
+        }
         setPlayerRef(cand.exo)
         raceCandidates = listOf(cand)
         attachCandidateListener(cand, url, myToken)

@@ -56,7 +56,7 @@ app/src/main/java/com/example/composedtv/
 
 - **直连/代理串行兜底起播**：`planPlay()` 决定尝试顺序（国内仅直连；海外 HLS 为 `direct → proxy`），同一时刻仅 1 个 `ExoPlayer`，避免老设备双路解码 OOM。仅代理候选使用 `ApiClient.hlsProxyUrl()` 包裹地址，直连走原 URL 并携带频道 UA/Referer。
 - **起播超时看门狗**：每个尝试按 `directTimeoutMs` / `proxyTimeoutMs`（设置抽屉可调）计时；超时未 READY、连接停滞或出错即切换下一个，全部失败才走 `handlePlayFailure()`（直播自动跳下一台，点播直接提示）。
-- **容器嗅探**：由 `DefaultMediaSourceFactory` 按流首字节识别 HLS / FLV / MP4 / TS / MKV，不依赖 URL 关键字。
+- **容器嗅探**：由 `DefaultMediaSourceFactory` 按流首字节识别 HLS / FLV / MP4 / TS / MKV，不依赖 URL 关键字；未打包 DASH 模块的 `.mpd` 源在起播前拦截跳过，避免反射加载失败导致闪退。
 - **直播补偿**：`BehindLiveWindowException` 自动滑窗补偿重载；直播不写续播进度。
 - **音轨兜底**：`onTracksChanged` 中若无「已选中且受支持」的音轨，显式改选受支持的轨（`ensureSupportedAudioTrack`），缓解多音轨点播在老设备上「有画面无声音」。
 - **老设备解码保护**：`EXTENSION_RENDERER_MODE_ON`（系统 MediaCodec 优先、FFmpeg 扩展兜底）+ `setEnableDecoderFallback(true)`；API ≤ 23 设备上用自定义 `MediaCodecSelector` 屏蔽会触发系统 `ACodec` native abort 的 MP3 家族解码器，改由 FFmpeg 软解（详见「故障排查」）。
@@ -196,6 +196,16 @@ CI 使用 JDK 17，`setup-android` 安装 Android 34 平台与 build-tools 34.0.
 - 双击返回键退出（2 秒内）；`PlayerScreen` 通过 `LifecycleEventObserver` 把前后台事件转发给 `PlayerEngine`。
 
 ## 故障排查与修复记录
+
+### 2026-11-07：自动切台到 DASH(.mpd) 源后 Java 层闪退（已修复）
+
+**现象**：连续几个频道播放失败后自动切台，跳到 `.mpd` 频道时 App 立即闪退。
+
+**日志**：`FATAL EXCEPTION: main` — `java.lang.IllegalStateException: java.lang.ClassNotFoundException: androidx.media3.exoplayer.dash.DashMediaSource$Factory`，栈顶 `DefaultMediaSourceFactory.createMediaSource → ExoPlayerImpl.setMediaItems`。
+
+**根因**：项目只依赖 `media3-exoplayer-hls`，未打包 DASH 模块；`DefaultMediaSourceFactory` 遇到 `.mpd` 会反射加载 `DashMediaSource$Factory`，类缺失时同步抛到主线程，原链路没有 try-catch。`proguard-rules.pro` 已 keep `androidx.media3.**`，与 R8 混淆无关，debug 包同样会崩。
+
+**修复**：`PlayerEngine` 起播前用 `isDashStreamUrl()` 识别 `.mpd` 并按普通失败处理（直播切台、点播提示）；`createCandidatePlayer` 在 `setMediaItem` 失败时释放 ExoPlayer 后上抛；`tryNextAttempt` 兜底捕获创建播放器阶段的异常，切到下一个尝试，全部失败才走 `handlePlayFailure()`。将来若要支持 DASH，需加 `androidx.media3:media3-exoplayer-dash:1.6.1` 并同步加入 `resolutionStrategy.force`。
 
 ### 2026-11-07：切到直播频道播放失败后 native 闪退（已修复并实机验证）
 
