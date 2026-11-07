@@ -168,6 +168,15 @@ adb logcat -d -v threadtime -T '11-07 20:00:00.000' |
 
 Actions 页面 → 对应 run → **Artifacts** 下载 `apks-<版本号>`（含签名 release 单包，或 PR 场景的 debug）；打 tag 时也可在 **Releases** 页面直接下载签名 APK。
 
+CI 在构建完成后、上传前会执行 `Rename APK` 步骤，把 Gradle 默认产物改名：
+
+| 场景 | APK 文件名 |
+|------|-----------|
+| release（tag 构建） | `影直播-<版本号>.apk` |
+| debug（PR 校验） | `影直播-<版本号>-debug.apk` |
+
+本地 `assembleRelease` / `assembleDebug` 仍输出 Gradle 默认的 `app-release.apk` / `app-debug.apk`；若希望本地与 CI 完全一致，可改为在 `app/build.gradle.kts` 里直接设置 `outputFileName`（与 CI 重命名步骤二选一，不要同时启用）。
+
 CI 使用 JDK 17，`setup-android` 安装 Android 34 平台与 build-tools 34.0.0；Gradle 依赖仓库顺序按 `CI=true` 自动切换为官方源优先、阿里云镜像兜底（见 `settings.gradle.kts`）。
 
 ## 安全与忽略项
@@ -230,7 +239,7 @@ Abort message: ACodec.cpp:3850 CHECK_EQ(mOMX->getParameter(..., OMX_IndexParamAu
 
 ## 变更记录
 
-### 2026-11-07（工作区改动，尚未提交，基于 `fa91713`）
+### 2026-11-07（已提交 `f376fee`，基于 `fa91713`）
 
 | 模块 | 内容 |
 |------|------|

@@ -96,6 +96,23 @@ jobs:
         if: github.event_name == 'pull_request'
         run: ./gradlew assembleDebug --no-daemon
 
+      # ---- 统一产物名：Gradle 默认 app-release.apk / app-debug.apk → 影直播-<版本>.apk ----
+      # 上传/发布用的 *.apk glob 不变，重命名后 Actions 产物与 Release 资产都显示中文名
+      - name: Rename APK
+        shell: bash
+        env:
+          VERSION_NAME: ${{ steps.version.outputs.versionName }}
+        run: |
+          set -euo pipefail
+          for apk in app/build/outputs/apk/release/*.apk app/build/outputs/apk/debug/*.apk; do
+            [ -e "$apk" ] || continue
+            if [[ "$apk" == */debug/* ]]; then suffix="-debug"; else suffix=""; fi
+            target="$(dirname "$apk")/影直播-${VERSION_NAME}${suffix}.apk"
+            mv -f "$apk" "$target"
+            echo "renamed: $apk -> $target"
+          done
+          find app/build/outputs/apk -name '*.apk' -print
+
       # ---- 上传产物 ----
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
