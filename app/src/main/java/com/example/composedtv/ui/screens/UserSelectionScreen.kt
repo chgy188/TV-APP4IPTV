@@ -2,7 +2,9 @@
 
 package com.example.composedtv.ui.screens
 
+import android.graphics.Bitmap
 import android.util.Log
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
@@ -48,6 +50,8 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalDensity
 import com.example.composedtv.ui.components.ambientGradientBackdrop
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.TextStyle
@@ -58,6 +62,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.composedtv.data.remote.ApiClient
 import com.example.composedtv.data.remote.StoredUser
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
+import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 
 /**
  * 用户选择界面：显示已登录用户、游客、登录入口，以及用户卡下方的服务器配置入口
@@ -130,7 +138,8 @@ fun UserSelectionScreen(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .align(Alignment.Center),
+                .align(Alignment.Center)
+                .padding(end = if (compact) 160.dp else 220.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             LazyRow(
@@ -176,6 +185,14 @@ fun UserSelectionScreen(
             ServerConfigSection(compact = compact, onServerChanged = onServerChanged)
         }
 
+        // 右侧：官网/后台二维码，内容随服务器地址变化，整屏直接显示
+        QrCard(
+            compact = compact,
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = if (compact) 16.dp else 32.dp)
+        )
+
         // 底部遥控器/键盘操作说明，固定贴底
         RemoteHint(
             modifier = Modifier
@@ -197,14 +214,95 @@ fun UserSelectionScreen(
 }
 
 /**
+ * 首页二维码：用 ZXing 生成当前后台服务器地址的二维码位图。
+ * 生成失败时只隐藏二维码并记日志，不影响首页其它操作。
+ */
+@Composable
+private fun QrCodeImage(url: String, sizeDp: Int, modifier: Modifier = Modifier) {
+    val density = LocalDensity.current
+    val imageBitmap = remember(url, sizeDp) {
+        try {
+            val sizePx = with(density) { sizeDp.dp.toPx() }.toInt().coerceAtLeast(1)
+            val matrix = QRCodeWriter().encode(
+                url,
+                BarcodeFormat.QR_CODE,
+                sizePx,
+                sizePx,
+                mapOf(
+                    EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M,
+                    EncodeHintType.CHARACTER_SET to "UTF-8",
+                    EncodeHintType.MARGIN to 2
+                )
+            )
+            val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+            for (x in 0 until sizePx) {
+                for (y in 0 until sizePx) {
+                    bmp.setPixel(
+                        x, y,
+                        if (matrix[x, y]) android.graphics.Color.BLACK
+                        else android.graphics.Color.WHITE
+                    )
+                }
+            }
+            bmp.asImageBitmap()
+        } catch (e: Exception) {
+            Log.w("UserSelection", "二维码生成失败: $url", e)
+            null
+        }
+    }
+    if (imageBitmap != null) {
+        Image(bitmap = imageBitmap, contentDescription = "服务器二维码：$url", modifier = modifier)
+    }
+}
+
+/** 首页右侧二维码卡片：白底保证可扫描，内容随后台服务器地址变化 */
+@Composable
+private fun QrCard(compact: Boolean, modifier: Modifier = Modifier) {
+    val qrUrl = ApiClient.effectiveBaseUrl.trimEnd('/') + "/"
+    val qrSize = if (compact) 110 else 160
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = Color.White,
+        modifier = modifier
+    ) {
+        Column(
+            modifier = Modifier
+                .width((qrSize + 28).dp)
+                .padding(14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            QrCodeImage(
+                url = qrUrl,
+                sizeDp = qrSize,
+                modifier = Modifier.size(qrSize.dp)
+            )
+            Text(
+                text = "扫码访问官网",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.Black
+            )
+            Text(
+                text = qrUrl,
+                fontSize = if (compact) 10.sp else 11.sp,
+                color = Color.DarkGray,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+/**
  * 服务器配置入口：点击展开文本栏，输入即生效（无保存按钮）。
  * 合法地址立即写入 ApiClient、重置协议探测（http → https），并通知 VM 刷新会话状态。
  */
 @Composable
 private fun ServerConfigSection(compact: Boolean, onServerChanged: () -> Unit) {
     var expanded by remember { mutableStateOf(false) }
-    var input by remember { mutableStateOf(ApiClient.baseUrl) }
-    var status by remember { mutableStateOf("连接顺序：http → https（自动）") }
+    var input by remember { mutableStateOf(ApiClient.effectiveBaseUrl) }
+    var status by remember { mutableStateOf("当前：${ApiClient.effectiveBaseUrl}（http → https 自动）") }
     val fieldFocusRequester = remember { FocusRequester() }
     val buttonInteraction = remember { MutableInteractionSource() }
     val buttonFocused by buttonInteraction.collectIsFocusedAsState()
@@ -213,7 +311,7 @@ private fun ServerConfigSection(compact: Boolean, onServerChanged: () -> Unit) {
         val before = ApiClient.baseUrl
         if (ApiClient.setBaseUrl(input)) {
             if (ApiClient.baseUrl != before) onServerChanged()
-            status = "已生效：${ApiClient.baseUrl}（http → https 自动探测）"
+            status = "已生效：${ApiClient.effectiveBaseUrl}（http → https 自动探测）"
         } else {
             status = "地址无效，暂未生效"
         }
@@ -228,7 +326,7 @@ private fun ServerConfigSection(compact: Boolean, onServerChanged: () -> Unit) {
 
     LaunchedEffect(expanded) {
         if (expanded) {
-            input = ApiClient.baseUrl
+            input = ApiClient.effectiveBaseUrl
             kotlinx.coroutines.delay(120)
             runCatching { fieldFocusRequester.requestFocus() }
         }
@@ -277,7 +375,7 @@ private fun ServerConfigSection(compact: Boolean, onServerChanged: () -> Unit) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Text(
-                        text = ApiClient.baseUrl + if (ApiClient.isDefaultBaseUrl) "（缺省）" else "",
+                        text = ApiClient.effectiveBaseUrl + if (ApiClient.isDefaultBaseUrl) "（缺省）" else "",
                         fontSize = 13.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
@@ -322,7 +420,7 @@ private fun ServerConfigSection(compact: Boolean, onServerChanged: () -> Unit) {
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier
                         .focusable()
-                        .clickable { input = ApiClient.DEFAULT_BASE_URL }
+                        .clickable { input = "http://" + ApiClient.DEFAULT_BASE_URL }
                         .padding(horizontal = 6.dp, vertical = 4.dp)
                 )
             }

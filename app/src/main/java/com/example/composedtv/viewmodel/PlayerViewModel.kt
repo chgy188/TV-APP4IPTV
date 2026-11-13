@@ -112,9 +112,9 @@ enum class StartChannelMode(val value: Int) {
 /** 播放参数设置（由 MENU 设置抽屉调整，持久化保存） */
 data class PlaybackSettings(
     /** 直连候选的起播超时（毫秒）：超过该时长仍未 READY 则切换下一个候选。
-     *  默认 20s（设置抽屉里的"最长"可选项）：弱网 / 慢源也能稳定起播，不被过早切走；
+     *  默认 40s（设置抽屉里的"最长"可选项）：境外 CDN / 慢源首字节可能 20s+，不被过早切走；
      *  点播场景直连不设时限（见 PlayerEngine），此处仅影响直播直连。 */
-    val directTimeoutMs: Long = 20_000L,
+    val directTimeoutMs: Long = 40_000L,
     /** 代理候选的起播超时（毫秒）：代理路径多一跳、握手更慢，需比直连更长容忍。
      *  超过该时长仍未 READY 则切换下一个候选；网络差 / 代理慢时可调大，避免被误判为不可播 */
     val proxyTimeoutMs: Long = 10_000L,
@@ -143,8 +143,12 @@ data class PlaybackSettings(
             // 旧版（无用户后缀）数据一次性迁移到当前用户作用域
             ApiClient.migrateLegacyPref(context, PREF_NAME)
             val sp = context.getSharedPreferences(ApiClient.userSpName(PREF_NAME), Context.MODE_PRIVATE)
+            // 旧版默认 20s 对境外 CDN / 慢源过短，自动迁移到新的 40s 默认；
+            // 用户主动选的 6s / 10s 保持原值不变。
+            val savedDirect = sp.getLong(KEY_DIRECT_TIMEOUT, 40_000L)
+            val directTimeout = if (savedDirect == 20_000L) 40_000L else savedDirect
             return PlaybackSettings(
-                directTimeoutMs = sp.getLong(KEY_DIRECT_TIMEOUT, 20_000L),
+                directTimeoutMs = directTimeout,
                 proxyTimeoutMs = sp.getLong(KEY_PROXY_TIMEOUT, 10_000L),
                 rendererMode = RendererMode.fromValue(sp.getInt(KEY_RENDERER, RendererMode.AUTO.value)),
                 startChannelMode = StartChannelMode.fromValue(
@@ -275,7 +279,8 @@ object PlaybackSettingOptions {
     val directTimeoutOptions = listOf(
         6_000L to "6秒",
         10_000L to "10秒(网络差/源慢)",
-        20_000L to "20秒(极慢源/默认)"
+        20_000L to "20秒(极慢源)",
+        40_000L to "40秒(境外/慢源/默认)"
     )
     val proxyTimeoutOptions = listOf(
         7_000L to "7秒(网络好)",
@@ -446,7 +451,7 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
                             name = guestChannel.name,
                             url = guestChannel.url,
                             sourceId = guestChannel.id,
-                            country = "",
+                            country = guestChannel.country,
                             ua = guestChannel.ua,
                             rf = guestChannel.rf
                         )

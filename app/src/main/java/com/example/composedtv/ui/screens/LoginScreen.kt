@@ -62,17 +62,6 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.composedtv.viewmodel.PlayerViewModel
-import android.graphics.Bitmap
-import androidx.compose.foundation.Image
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.platform.LocalDensity
-import com.google.zxing.BarcodeFormat
-import com.google.zxing.EncodeHintType
-import com.google.zxing.qrcode.QRCodeWriter
-import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
-
-/** 登录界面展示的官网地址（扫码访问） */
-private const val WEBSITE_URL = "http://tvplayer.run4u.dpdns.org/"
 
 /**
  * 登录/注册界面
@@ -110,7 +99,6 @@ fun LoginScreen(
     ) {
         // 屏幕较矮（手机横屏）时启用紧凑布局；宽屏（TV）改为表单 + 二维码左右分栏，整屏不滚动
         val compact = maxHeight < 520.dp
-        val wide = maxWidth >= 600.dp
 
         // 登录表单（左栏内容）：捕获外部状态，供宽/窄两种布局复用，避免重复
         @Composable
@@ -304,120 +292,27 @@ fun LoginScreen(
             }
         }
 
-        // 宽屏（TV）：左表单 + 右二维码（两端对齐），整屏直接显示；窄屏：上下排列仍不滚动
-        if (wide) {
-            Row(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(
-                        horizontal = if (compact) 20.dp else 32.dp,
-                        vertical = if (compact) 16.dp else 24.dp
-                    ),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(
-                    modifier = Modifier.widthIn(max = 520.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 12.dp)
-                ) {
-                    LoginForm()
-                }
-                QrCard(compact = compact)
-            }
-        } else {
+        // 表单居中，整屏直接显示、不滚动（二维码已移到首页用户选择页）
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .imePadding()
+                .padding(
+                    horizontal = if (compact) 20.dp else 32.dp,
+                    vertical = if (compact) 12.dp else 24.dp
+                ),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
             Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .imePadding()
-                    .padding(
-                        horizontal = if (compact) 20.dp else 24.dp,
-                        vertical = if (compact) 12.dp else 20.dp
-                    ),
+                modifier = Modifier.widthIn(max = 520.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 12.dp)
             ) {
                 LoginForm()
-                QrCard(compact = compact)
             }
         }
 
-    }
-}
-
-/**
- * 二维码图片：用 ZXing 生成指定 URL 的二维码位图并渲染。
- * 失败时静默返回（不阻塞登录流程），保证复杂环境下界面仍可用。
- */
-@Composable
-private fun QrCodeImage(url: String, sizeDp: Int, modifier: Modifier = Modifier) {
-    val density = LocalDensity.current
-    val imageBitmap = remember(url, sizeDp) {
-        try {
-            val sizePx = with(density) { sizeDp.dp.toPx() }.toInt().coerceAtLeast(1)
-            val matrix = QRCodeWriter().encode(
-                url,
-                BarcodeFormat.QR_CODE,
-                sizePx,
-                sizePx,
-                mapOf(
-                    EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M,
-                    EncodeHintType.CHARACTER_SET to "UTF-8",
-                    EncodeHintType.MARGIN to 2
-                )
-            )
-            val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
-            for (x in 0 until sizePx) {
-                for (y in 0 until sizePx) {
-                    bmp.setPixel(
-                        x, y,
-                        if (matrix[x, y]) android.graphics.Color.BLACK
-                        else android.graphics.Color.WHITE
-                    )
-                }
-            }
-            bmp.asImageBitmap()
-        } catch (e: Exception) {
-            null
-        }
-    }
-    if (imageBitmap != null) {
-        Image(bitmap = imageBitmap, contentDescription = "官网二维码：$url", modifier = modifier)
-    }
-}
-
-/**
- * 官网二维码卡片：白底以保证可扫描，内含二维码 + 文案，供宽/窄两种布局复用。
- */
-@Composable
-private fun QrCard(compact: Boolean, modifier: Modifier = Modifier) {
-    Surface(
-        shape = RoundedCornerShape(12.dp),
-        color = Color.White,
-        modifier = modifier
-    ) {
-        Column(
-            modifier = Modifier.padding(14.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            QrCodeImage(
-                url = WEBSITE_URL,
-                sizeDp = if (compact) 130 else 180,
-                modifier = Modifier.size(if (compact) 130.dp else 180.dp)
-            )
-            Text(
-                text = "扫码访问官网",
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color.Black
-            )
-            Text(
-                text = WEBSITE_URL,
-                fontSize = 11.sp,
-                color = Color.DarkGray
-            )
-        }
     }
 }
 

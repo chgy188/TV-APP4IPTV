@@ -146,6 +146,9 @@ class PlayerEngine(private val context: Context) {
         /** 记忆"上次成功播放模式"的 SP 文件与 key 前缀 */
         private const val PREF_PLAY_MODE = "play_mode_cache"
         private const val KEY_LAST_MODE = "last_mode_"
+        private const val KEY_SOFT_FAIL = "soft_fail_"
+        /** 连续软失败达到该次数后才记忆代理，避免每次起播都白等一整轮直连超时 */
+        private const val MAX_SOFT_FAIL_BEFORE_PROXY = 2
         /** 记忆条目上限，超出则整体清空，避免长期运行无界增长 */
         private const val MAX_PLAY_MODE_ENTRIES = 500
     /**
@@ -181,7 +184,7 @@ class PlayerEngine(private val context: Context) {
     }
 
         // ===== 可被设置抽屉注入的播放参数（下方 var 为运行时值，此处为默认值） =====
-        private const val DEFAULT_DIRECT_TIMEOUT_MS = 20_000L  // 直连候选起播超时（可由设置抽屉注入）；默认取最长可选项 20s
+        private const val DEFAULT_DIRECT_TIMEOUT_MS = 40_000L  // 直连候选起播超时；境外/慢源首字节可能 20s+，默认放宽到 40s
         private const val DEFAULT_PROXY_TIMEOUT_MS = 10_000L  // 代理候选起播超时（可由设置抽屉注入）
         private const val DEFAULT_SMOOTH_PRIORITY = false      // 流畅优先（降分辨率）默认关
         private const val DEFAULT_AUTO_AV_SYNC = true          // 音画同步自动恢复默认开
@@ -492,14 +495,19 @@ class PlayerEngine(private val context: Context) {
     private var attemptStartedAt = 0L
     /** 连续"实际速率为 0 且仍在加载"的秒数，超阈值判停滞并切下一候选 */
     private var stallSeconds = 0
-    /** 停滞看门狗阈值(秒)：仅对直播生效；点播不因「暂无数据」判失败 */
-    private val STALL_FAIL_SEC = 12
+    /** 停滞看门狗阈值(秒)：仅对直播生效；点播不因「暂无数据」判失败。
+     *  境外 CDN / 弱网首次握手可能 20~30s 才吐首字节，放宽到 30s 避免把可用直连误杀。 */
+    private val STALL_FAIL_SEC = 30
     /** 本轮起播出现的明确错误（onPlayerError 的错误码 + 中文含义）；超时 / 无数据不算不可达 */
     private var lastPlayerErrorMessage: String? = null
     /** 点播「仍在缓冲」提示只弹一次，避免反复打扰 */
     private var softWaitHintShown = false
+    /** 本轮直连候选是否明确报错（onPlayerError）；只有它导致的代理成功才记入播放模式记忆 */
+    private var directHardFailed = false
+    /** 本轮代理是否用户主动指定（右键重载代理优先 / 强制代理），此时尊重选择并记忆 */
+    private var proxyPreferredByUser = false
     /** 直连候选的起播超时：超时即切换下一个（连接类错误会立即切换，不走这里）。
-     *  默认 20s（设置里的最长可选项）：弱网 / 慢源也能稳定起播，不被过早切走；
+     *  默认 40s（设置里的最长可选项）：境外 CDN / 慢源也能稳定起播，不被过早切走；
      *  点播（直连 / 代理）都不设时限（见 [startAttemptTimeout]），此处仅用于直播直连。
      *  可由设置抽屉注入（applyPlaybackSettings），默认 [DEFAULT_DIRECT_TIMEOUT_MS] */
     var directTimeoutMs = DEFAULT_DIRECT_TIMEOUT_MS
@@ -990,6 +998,39 @@ class PlayerEngine(private val context: Context) {
         }
     }
 
+    /** 清除该 URL 的播放模式记忆，让下次起播回到 [direct, proxy] 基准顺序重新探测 */
+    private fun removeLastMode(url: String) {
+        try {
+            modePrefs().edit().remove(KEY_LAST_MODE + modeKey(url)).apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "清除播放模式记忆失败: ${e.message}")
+        }
+    }
+
+    private fun modePrefs() = context.getSharedPreferences(
+        ApiClient.userSpName(PREF_PLAY_MODE), Context.MODE_PRIVATE
+    )
+
+    /** 记录一次「直连软失败」，返回累计次数 */
+    private fun bumpSoftFailCount(url: String): Int = try {
+        val sp = modePrefs()
+        val key = KEY_SOFT_FAIL + modeKey(url)
+        val n = sp.getInt(key, 0) + 1
+        sp.edit().putInt(key, n).apply()
+        n
+    } catch (e: Exception) {
+        MAX_SOFT_FAIL_BEFORE_PROXY
+    }
+
+    /** 直连成功 / 明确错误 / 用户主动选代理时清零软失败计数 */
+    private fun clearSoftFailCount(url: String) {
+        try {
+            modePrefs().edit().remove(KEY_SOFT_FAIL + modeKey(url)).apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "清除软失败计数失败: ${e.message}")
+        }
+    }
+
     private fun playUrl(
         url: String,
         country: String = "",
@@ -1013,13 +1054,15 @@ class PlayerEngine(private val context: Context) {
             return
         }
         // 外部媒体（forceDirect）：用户自有内容，强制直连、完全不走代理
+        proxyPreferredByUser = proxyFirst || forceProxy
         val attempts = if (forceDirect) {
             listOf("direct")
         } else if (forceProxy) {
             listOf("proxy")
         } else if (proxyFirst) {
             val base = planPlay(url, country)
-            if (base == listOf("direct")) base else listOf("proxy") + base
+            // 去重：base 通常已含 proxy，避免 [proxy, direct, proxy] 重复尝试
+            if (base == listOf("direct")) base else listOf("proxy") + base.filter { it != "proxy" }
         } else if (ignoreLastMode) {
             planPlay(url, country)
         } else {
@@ -1295,6 +1338,7 @@ class PlayerEngine(private val context: Context) {
         raceDecided = false
         lastPlayerErrorMessage = null
         softWaitHintShown = false
+        directHardFailed = false
         // 防御性释放：任何残留的候选或上一频道 player（仅存 _playerRef）都先释放，
         // 杜绝切台/重载时旧 ExoPlayer + 缓冲未回收导致的内存泄漏
         for (c in raceCandidates) safeRelease(c.exo)
@@ -1433,7 +1477,7 @@ class PlayerEngine(private val context: Context) {
 
     /**
      * 真实速率/已下载采样：每秒采样一次，把真实下载速率与累计字节写入状态供 UI 展示；
-     * 并内置停滞看门狗——加载中且真实速率持续为 0（排除前 4s 连接建立宽限期）超过阈值时，
+     * 并内置停滞看门狗——加载中且真实速率持续为 0（排除前 10s 连接建立宽限期）超过阈值时，
      * 仅对直播切到下一个候选；点播「暂无数据」可能只是慢 / 握手 / 解析容器，不算失败，只记日志。
      */
     private fun startConnStatsSampler() {
@@ -1453,7 +1497,7 @@ class PlayerEngine(private val context: Context) {
                 DebugDiagnostics.setConnInfo(kbps, total / 1_000_000f, _state.value.currentLoadUrl)
                 val loadingNow = _state.value.isLoading
                 val elapsed = System.currentTimeMillis() - attemptStartedAt
-                if (loadingNow && kbps <= 0 && elapsed > 4_000L) {
+                if (loadingNow && kbps <= 0 && elapsed > 10_000L) {
                     stallSeconds++
                     if (stallSeconds >= STALL_FAIL_SEC) {
                         stallSeconds = 0
@@ -1531,6 +1575,7 @@ class PlayerEngine(private val context: Context) {
                 DebugDiagnostics.onError("race/${cand.attempt}", error)
                 // 明确错误：记录原因，只有这类失败才允许最终提示「无法播放」
                 lastPlayerErrorMessage = "${error.errorCodeName} ${playbackErrorMeaning(error)}"
+                if (cand.attempt == "direct") directHardFailed = true
                 // 串行：当前尝试失败 → 立即切换下一个（连接类错误无需等待超时）
                 stopAttemptTimeout()
                 tryNextAttempt(url, hardError = true)
@@ -1597,8 +1642,32 @@ class PlayerEngine(private val context: Context) {
             }
         }
         Log.d(TAG, "起播成功: ${winner.attempt}")
-        // 记忆本次成功模式：下次起播直接优先该模式，省去先试错一次
-        saveLastMode(currentPlayingUrl, winner.attempt)
+        // 播放模式记忆规则（避免「一次慢网络就把频道永久钉死在代理」，也避免每次都白等一整轮超时）：
+        // - 直连成功：记 direct 并清零软失败计数，覆盖旧的 proxy 记忆
+        // - 用户主动选代理 / 直连明确 onPlayerError：确实需要代理，直接记 proxy
+        // - 仅超时 / 零数据看门狗这类软失败：前几次仍从直连开始重试；
+        //   连续 MAX_SOFT_FAIL_BEFORE_PROXY 次确认直连不通后才记 proxy（手动重载可强制回直连）
+        val url = currentPlayingUrl
+        when {
+            winner.attempt != "proxy" -> {
+                clearSoftFailCount(url)
+                saveLastMode(url, winner.attempt)
+            }
+            proxyPreferredByUser || directHardFailed -> {
+                clearSoftFailCount(url)
+                saveLastMode(url, winner.attempt)
+            }
+            else -> {
+                val fails = bumpSoftFailCount(url)
+                if (fails >= MAX_SOFT_FAIL_BEFORE_PROXY) {
+                    saveLastMode(url, "proxy")
+                    Log.d(TAG, "直连连续 $fails 次软失败，记忆为代理优先（手动重载可强制回直连）")
+                } else {
+                    removeLastMode(url)
+                    Log.d(TAG, "代理由软失败触发($fails/$MAX_SOFT_FAIL_BEFORE_PROXY)，暂不记忆，下次仍先试直连")
+                }
+            }
+        }
 
         // 串行模式：不再并行复活代理（那会引入第二路解码，正是小内存设备 OOM 的主因）。
         // 播放期卡顿不再自动重载，交由用户手动处理（音画同步自动恢复除外）。

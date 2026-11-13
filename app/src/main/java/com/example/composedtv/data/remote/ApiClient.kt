@@ -46,6 +46,12 @@ object ApiClient {
     /** 带协议的完整地址（供 hlsProxyUrl 与请求模板使用），初始按 http 优先 */
     private var activeBaseUrl: String = "http://$DEFAULT_BASE_URL"
 
+    /**
+     * 展示用的完整服务器地址：`http://<配置地址>`（用户显式写 https:// 时保留 https）。
+     * 与实际请求地址 [activeBaseUrl] 分离：不随协议探测结果变化，供服务器信息、登录页二维码使用。
+     */
+    val effectiveBaseUrl: String get() = defaultActiveUrl(baseUrl)
+
     private var prefs: SharedPreferences? = null
     /** 应用 Context（由 init 注入，用于访问 filesDir） */
     private var appContext: Context? = null
@@ -128,7 +134,7 @@ object ApiClient {
     /**
      * 规范化服务器地址：
      * - 可只填 IP / 域名 / host:port / 带路径前缀；此时不带协议，由请求层按 http → https 自动探测
-     * - 也可显式写 http(s):// 固定协议
+     * - 写 `http://` 前缀等同于不写（仍自动探测），只有显式 `https://` 才固定协议
      * - 去尾斜杠，拒绝空格、查询串、片段与非法主机名
      * 返回 null 表示地址不可用。
      */
@@ -148,7 +154,8 @@ object ApiClient {
         val port = if (uri.port > 0) ":${uri.port}" else ""
         val path = (uri.path ?: "").trimEnd('/')
         val core = "$host$port$path"
-        return if (hasScheme) "$scheme://$core" else core
+        // http:// 只是展示前缀，不固定协议（仍按 http → https 探测）；显式 https:// 才固定
+        return if (hasScheme && scheme == "https") "https://$core" else core
     }
 
     /**
