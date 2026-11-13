@@ -1303,6 +1303,24 @@ class PlayerViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * 登录页切换后台服务器后调用：旧服务器的 token / 用户列表 / 上次登录名已在 ApiClient 中清除，
+     * 这里同步刷新 UI 状态并丢弃旧节目栏与播放列表，避免带着旧服务器的数据进入播放界面。
+     */
+    fun onServerChanged() {
+        _uiState.value = _uiState.value.copy(
+            storedUsers = ApiClient.getStoredUsers(),
+            lastLoginUsername = ApiClient.getLastLoginUsername(),
+            pendingLoginMessage = null,
+            errorMessage = null,
+            sidePanel = SidePanelData(),
+            initialChannelLoaded = false
+        )
+        currentPlaylist = emptyList()
+        currentPlaylistOrigin = PlaylistOrigin()
+        reloadUserScopedSettings()
+    }
+
+    /**
      * 准备进入登录界面：可传入用户名用于预填（点击已登录用户卡片时）。
      * 复用 lastLoginUsername 字段承载「待登录用户名」，LoginScreen 会把它显示为预填值。
      * 传 null 时清空，让用户手动输入。

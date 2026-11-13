@@ -31,6 +31,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -39,6 +40,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material.ripple.rememberRipple
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -63,6 +65,9 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import com.example.composedtv.data.remote.ApiClient
 import com.example.composedtv.viewmodel.PlayerViewModel
 import android.graphics.Bitmap
 import androidx.compose.foundation.Image
@@ -98,6 +103,10 @@ fun LoginScreen(
     var rememberMe by remember(defaultRememberMe) { mutableStateOf(defaultRememberMe) }
     var isLoading by remember { mutableStateOf(false) }
     var errorMsg by remember(loginMessage) { mutableStateOf(loginMessage) }
+    // 后台服务器地址设置
+    var currentServer by remember { mutableStateOf(ApiClient.baseUrl) }
+    var showServerDialog by remember { mutableStateOf(false) }
+    var serverNotice by remember { mutableStateOf<String?>(null) }
     // 密码框聚焦请求器：选中上次用户名后自动聚焦到密码框
     val passwordFocusRequester = remember { androidx.compose.ui.focus.FocusRequester() }
     // 已记住用户名时默认收起用户名输入框（仅输密码即可），腾出垂直空间，
@@ -286,6 +295,21 @@ fun LoginScreen(
                 }
             }
 
+            // 当前后台服务器 + 「更改服务器」入口
+            ServerEntry(
+                current = currentServer,
+                compact = compact,
+                onClick = { showServerDialog = true }
+            )
+            if (serverNotice != null) {
+                Text(
+                    text = serverNotice!!,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontSize = 12.sp,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+
             // 遥控器操作说明（手机上隐藏，节省空间）
             if (!compact) {
                 Spacer(modifier = Modifier.height(12.dp))
@@ -342,6 +366,25 @@ fun LoginScreen(
                 LoginForm()
                 QrCard(compact = compact)
             }
+        }
+
+        if (showServerDialog) {
+            ServerSettingsDialog(
+                compact = compact,
+                current = currentServer,
+                onDismiss = { showServerDialog = false },
+                onChanged = {
+                    // 旧服务器会话已被清除，登录表单回到「新账号输入」状态
+                    currentServer = ApiClient.baseUrl
+                    serverNotice = "服务器已切换为 ${ApiClient.baseUrl}，请重新登录"
+                    errorMsg = null
+                    username = ""
+                    password = ""
+                    editingUser = true
+                    vm.onServerChanged()
+                    showServerDialog = false
+                }
+            )
         }
     }
 }
@@ -418,6 +461,163 @@ private fun QrCard(compact: Boolean, modifier: Modifier = Modifier) {
                 fontSize = 11.sp,
                 color = Color.DarkGray
             )
+        }
+    }
+}
+
+/** 当前服务器信息行：点击打开「更改服务器」对话框，兼容 D-pad 焦点与触摸点击 */
+@Composable
+private fun ServerEntry(current: String, compact: Boolean, onClick: () -> Unit) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isFocused by interactionSource.collectIsFocusedAsState()
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .scale(if (isFocused) 1.02f else 1f)
+            .focusable(interactionSource = interactionSource)
+            .clickable(
+                interactionSource = interactionSource,
+                indication = rememberRipple(),
+                onClick = onClick
+            ),
+        shape = RoundedCornerShape(8.dp),
+        color = if (isFocused) MaterialTheme.colorScheme.primaryContainer
+                else MaterialTheme.colorScheme.surface,
+        contentColor = if (isFocused) MaterialTheme.colorScheme.onPrimaryContainer
+                       else MaterialTheme.colorScheme.onSurface
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = if (compact) 6.dp else 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.Settings,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "当前服务器",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = current + if (ApiClient.isDefaultBaseUrl) "（默认）" else "",
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Text(
+                text = "更改",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary
+            )
+        }
+    }
+}
+
+/**
+ * 「更改服务器」对话框：支持域名或完整 http(s) 地址，可保存 / 恢复默认 / 取消。
+ * 地址真正变化时由 [ApiClient.setBaseUrl] 清理旧服务器会话与缓存，再回调刷新界面状态。
+ */
+@Composable
+private fun ServerSettingsDialog(
+    compact: Boolean,
+    current: String,
+    onDismiss: () -> Unit,
+    onChanged: () -> Unit
+) {
+    var input by remember(current) { mutableStateOf(current) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val focusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(120)
+        runCatching { focusRequester.requestFocus() }
+    }
+
+    fun applyInput() {
+        val before = ApiClient.baseUrl
+        if (!ApiClient.setBaseUrl(input)) {
+            error = "地址格式不正确，请输入域名或 http(s):// 开头的完整地址"
+            return
+        }
+        if (ApiClient.baseUrl == before) onDismiss() else onChanged()
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            dismissOnBackPress = true,
+            dismissOnClickOutside = true,
+            usePlatformDefaultWidth = false
+        )
+    ) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier
+                .widthIn(max = 520.dp)
+                .padding(24.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "更改服务器",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    text = "当前：$current",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                InputField(
+                    value = input,
+                    onValueChange = { input = it; error = null },
+                    label = "服务器地址",
+                    icon = Icons.Default.Settings,
+                    isPassword = false,
+                    compact = compact,
+                    modifier = Modifier.focusRequester(focusRequester),
+                    onEnter = { applyInput() }
+                )
+                Text(
+                    text = "可填域名或完整地址，例如 tv.robindev.cc.cd 或 http://192.168.1.10:8787",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "切换后会清除当前登录状态与本地缓存，需重新登录。",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (error != null) {
+                    Text(
+                        text = error!!,
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    ActionButton(text = "保存", primary = true, compact = compact) { applyInput() }
+                    ActionButton(text = "恢复默认", primary = false, compact = compact) {
+                        val before = ApiClient.baseUrl
+                        ApiClient.resetBaseUrl()
+                        if (ApiClient.baseUrl == before) onDismiss() else onChanged()
+                    }
+                    ActionButton(text = "取消", primary = false, compact = compact, onClick = onDismiss)
+                }
+            }
         }
     }
 }

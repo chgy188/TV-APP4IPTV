@@ -12,6 +12,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.net.URI
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -28,7 +29,13 @@ object ApiClient {
 
     private const val TAG = "ApiClient"
 
-    var baseUrl: String = "https://tv.run4u.dpdns.org"
+    /** 后台 API 默认地址；用户可在登录页「更改服务器」中覆盖 */
+    const val DEFAULT_BASE_URL = "https://tv.robindev.cc.cd"
+    private const val KEY_BASE_URL = "base_url"
+
+    /** 当前生效的 API 地址（init 时从本地配置恢复） */
+    var baseUrl: String = DEFAULT_BASE_URL
+        private set
 
     private var prefs: SharedPreferences? = null
     /** 应用 Context（由 init 注入，用于访问 filesDir） */
@@ -60,8 +67,78 @@ object ApiClient {
         val ctx = context.applicationContext
         prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         appContext = ctx
+        // 恢复用户在登录页自定义的服务器地址；本地无配置或配置非法时使用默认地址
+        baseUrl = normalizeBaseUrl(prefs?.getString(KEY_BASE_URL, null)) ?: DEFAULT_BASE_URL
         // 清理过期的每日缓存（昨天及以前的）
         cleanOldDailyCache()
+    }
+
+    /* ====================== 服务器地址设置 ====================== */
+
+    /** 是否正在使用默认服务器地址 */
+    val isDefaultBaseUrl: Boolean get() = baseUrl.equals(DEFAULT_BASE_URL, ignoreCase = true)
+
+    /**
+     * 规范化服务器地址：
+     * - 只填域名/IP 时自动补 `https://`
+     * - 去掉末尾斜杠，保留可自定义的路径前缀与端口
+     * - 仅允许 http/https，拒绝空格、查询串、片段与非法主机名
+     * 返回 null 表示地址不可用。
+     */
+    fun normalizeBaseUrl(raw: String?): String? {
+        val s = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        if (s.any { it.isWhitespace() }) return null
+        val withScheme = if (s.contains("://")) s else "https://$s"
+        val uri = try {
+            URI(withScheme)
+        } catch (e: Exception) {
+            return null
+        }
+        val scheme = uri.scheme?.lowercase(Locale.US)
+        if (scheme != "http" && scheme != "https") return null
+        val host = uri.host ?: return null
+        if (host.isBlank() || uri.userInfo != null || uri.query != null || uri.fragment != null) return null
+        val port = if (uri.port > 0) ":${uri.port}" else ""
+        val path = (uri.path ?: "").trimEnd('/')
+        return "$scheme://$host$port$path"
+    }
+
+    /**
+     * 保存并切换后台 API 地址；地址非法或未初始化时返回 false。
+     * 地址真的变化时，会清除旧服务器的登录态、用户列表与缓存，避免把旧 token 带到新服务器。
+     */
+    fun setBaseUrl(raw: String): Boolean {
+        val normalized = normalizeBaseUrl(raw) ?: return false
+        val p = prefs ?: return false
+        p.edit().putString(KEY_BASE_URL, normalized).apply()
+        if (normalized == baseUrl) return true
+        baseUrl = normalized
+        clearServerScopedData()
+        Log.d(TAG, "API 服务器已切换为 $baseUrl")
+        return true
+    }
+
+    /** 恢复默认服务器地址，并清除旧服务器的会话与缓存 */
+    fun resetBaseUrl() {
+        prefs?.edit()?.remove(KEY_BASE_URL)?.apply()
+        if (baseUrl != DEFAULT_BASE_URL) {
+            baseUrl = DEFAULT_BASE_URL
+            clearServerScopedData()
+            Log.d(TAG, "API 服务器已恢复默认 $baseUrl")
+        }
+    }
+
+    /** 切换服务器后清掉只属于旧服务器的数据 */
+    private fun clearServerScopedData() {
+        token = null
+        currentUser = null
+        prefs?.edit()
+            ?.remove(KEY_STORED_USERS)
+            ?.remove(KEY_LAST_LOGIN_USERNAME)
+            ?.apply()
+        invalidateCache(channels = true, favorites = true, sources = true)
+        // 每日磁盘缓存按天命名，当天文件仍可能被误当作新服务器数据，故全部删除
+        runCatching { dailyCacheRoot()?.listFiles()?.forEach { f -> f.deleteRecursively() } }
     }
 
     /* ====================== 每日磁盘缓存（按用户隔离） ====================== */
