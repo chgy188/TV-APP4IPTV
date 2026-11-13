@@ -12,6 +12,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.net.URI
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
@@ -29,13 +30,21 @@ object ApiClient {
 
     private const val TAG = "ApiClient"
 
-    /** 后台 API 默认地址；用户可在登录页「更改服务器」中覆盖 */
-    const val DEFAULT_BASE_URL = "https://tv.robindev.cc.cd"
+    /**
+     * 后台服务器缺省值（纯 IP，不带协议）。
+     * 未显式指定协议时，所有请求按 http → https 顺序自动尝试，成功后记住该协议。
+     */
+    const val DEFAULT_BASE_URL = "144.24.81.84"
     private const val KEY_BASE_URL = "base_url"
 
-    /** 当前生效的 API 地址（init 时从本地配置恢复） */
+    /** 用户配置的服务器地址：纯 host[:port][/path]，或显式带 http(s):// 的完整地址 */
     var baseUrl: String = DEFAULT_BASE_URL
         private set
+
+    /** 最近一次连接成功的协议；null 表示尚未探测，严格按 http → https 顺序 */
+    private var activeScheme: String? = null
+    /** 带协议的完整地址（供 hlsProxyUrl 与请求模板使用），初始按 http 优先 */
+    private var activeBaseUrl: String = "http://$DEFAULT_BASE_URL"
 
     private var prefs: SharedPreferences? = null
     /** 应用 Context（由 init 注入，用于访问 filesDir） */
@@ -67,30 +76,68 @@ object ApiClient {
         val ctx = context.applicationContext
         prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         appContext = ctx
-        // 恢复用户在登录页自定义的服务器地址；本地无配置或配置非法时使用默认地址
+        // 恢复用户自定义的服务器地址；本地无配置或配置非法时使用缺省 IP
         baseUrl = normalizeBaseUrl(prefs?.getString(KEY_BASE_URL, null)) ?: DEFAULT_BASE_URL
+        activeScheme = null
+        activeBaseUrl = defaultActiveUrl(baseUrl)
         // 清理过期的每日缓存（昨天及以前的）
         cleanOldDailyCache()
     }
 
     /* ====================== 服务器地址设置 ====================== */
 
-    /** 是否正在使用默认服务器地址 */
+    /** 是否正在使用缺省服务器地址 */
     val isDefaultBaseUrl: Boolean get() = baseUrl.equals(DEFAULT_BASE_URL, ignoreCase = true)
+
+    /** 拆出用户显式指定的协议；返回 (协议?, 不含协议的地址) */
+    private fun splitServer(server: String): Pair<String?, String> {
+        val idx = server.indexOf("://")
+        if (idx < 0) return null to server
+        val s = server.substring(0, idx).lowercase(Locale.US)
+        return if (s == "http" || s == "https") s to server.substring(idx + 3) else null to server
+    }
+
+    /** 未探测出协议前的默认完整地址：显式协议则用之，否则按 http 优先 */
+    private fun defaultActiveUrl(server: String): String {
+        val (scheme, core) = splitServer(server)
+        return scheme?.let { server } ?: "http://$core"
+    }
+
+    /** 本次连接要尝试的协议顺序：成功过的协议优先，随后严格 http → https */
+    private fun schemeCandidates(): List<String> {
+        val (explicit, _) = splitServer(baseUrl)
+        val ordered = explicit?.let { listOf(it) } ?: listOf("http", "https")
+        return (listOfNotNull(activeScheme) + ordered).distinct()
+    }
+
+    /** 保留 host / port / path / query，只替换协议，生成按序尝试的 URL 列表 */
+    private fun schemeVariants(url: String): List<String> {
+        val idx = url.indexOf("://")
+        if (idx < 0) return listOf(url)
+        val tail = url.substring(idx)
+        return schemeCandidates().map { "$it$tail" }
+    }
+
+    /** 记录成功协议，并同步 hlsProxyUrl 使用的完整地址 */
+    private fun applyActiveScheme(scheme: String) {
+        activeScheme = scheme
+        val (explicit, core) = splitServer(baseUrl)
+        activeBaseUrl = if (explicit != null) baseUrl else "$scheme://$core"
+    }
 
     /**
      * 规范化服务器地址：
-     * - 只填域名/IP 时自动补 `https://`
-     * - 去掉末尾斜杠，保留可自定义的路径前缀与端口
-     * - 仅允许 http/https，拒绝空格、查询串、片段与非法主机名
+     * - 可只填 IP / 域名 / host:port / 带路径前缀；此时不带协议，由请求层按 http → https 自动探测
+     * - 也可显式写 http(s):// 固定协议
+     * - 去尾斜杠，拒绝空格、查询串、片段与非法主机名
      * 返回 null 表示地址不可用。
      */
     fun normalizeBaseUrl(raw: String?): String? {
-        val s = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val s = raw?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return null
         if (s.any { it.isWhitespace() }) return null
-        val withScheme = if (s.contains("://")) s else "https://$s"
+        val hasScheme = s.contains("://")
         val uri = try {
-            URI(withScheme)
+            URI(if (hasScheme) s else "http://$s")
         } catch (e: Exception) {
             return null
         }
@@ -100,12 +147,13 @@ object ApiClient {
         if (host.isBlank() || uri.userInfo != null || uri.query != null || uri.fragment != null) return null
         val port = if (uri.port > 0) ":${uri.port}" else ""
         val path = (uri.path ?: "").trimEnd('/')
-        return "$scheme://$host$port$path"
+        val core = "$host$port$path"
+        return if (hasScheme) "$scheme://$core" else core
     }
 
     /**
-     * 保存并切换后台 API 地址；地址非法或未初始化时返回 false。
-     * 地址真的变化时，会清除旧服务器的登录态、用户列表与缓存，避免把旧 token 带到新服务器。
+     * 保存并切换后台服务器；地址非法或未初始化时返回 false。
+     * 地址真的变化时会重置协议探测（重新按 http → https 尝试），并清除旧服务器的登录态与缓存。
      */
     fun setBaseUrl(raw: String): Boolean {
         val normalized = normalizeBaseUrl(raw) ?: return false
@@ -113,18 +161,22 @@ object ApiClient {
         p.edit().putString(KEY_BASE_URL, normalized).apply()
         if (normalized == baseUrl) return true
         baseUrl = normalized
+        activeScheme = null
+        activeBaseUrl = defaultActiveUrl(normalized)
         clearServerScopedData()
-        Log.d(TAG, "API 服务器已切换为 $baseUrl")
+        Log.d(TAG, "API 服务器已切换为 $baseUrl（按 http→https 探测）")
         return true
     }
 
-    /** 恢复默认服务器地址，并清除旧服务器的会话与缓存 */
+    /** 恢复缺省服务器地址，并清除旧服务器的会话与缓存 */
     fun resetBaseUrl() {
         prefs?.edit()?.remove(KEY_BASE_URL)?.apply()
         if (baseUrl != DEFAULT_BASE_URL) {
             baseUrl = DEFAULT_BASE_URL
+            activeScheme = null
+            activeBaseUrl = defaultActiveUrl(DEFAULT_BASE_URL)
             clearServerScopedData()
-            Log.d(TAG, "API 服务器已恢复默认 $baseUrl")
+            Log.d(TAG, "API 服务器已恢复缺省 $baseUrl")
         }
     }
 
@@ -402,19 +454,19 @@ object ApiClient {
 
     fun hlsProxyUrl(playUrl: String): String {
         val enc = URLEncoder.encode(playUrl, "UTF-8")
-        return "$baseUrl/api/hls?url=$enc"
+        return "$activeBaseUrl/api/hls?url=$enc"
     }
 
     /* ====================== 基础请求 ====================== */
 
     private fun authedGet(path: String): Request.Builder {
-        val b = Request.Builder().url("$baseUrl$path").get()
+        val b = Request.Builder().url("$activeBaseUrl$path").get()
         token?.let { b.header("Authorization", "Bearer $it") }
         return b
     }
 
     private fun authedSend(path: String, method: String, body: JSONObject?): Request.Builder {
-        val b = Request.Builder().url("$baseUrl$path").method(method,
+        val b = Request.Builder().url("$activeBaseUrl$path").method(method,
             if (method == "GET" || method == "DELETE") null
             else body?.toString()?.toRequestBody(JSON)
         )
@@ -423,27 +475,47 @@ object ApiClient {
         return b
     }
 
-    private fun exec(builder: Request.Builder): JSONObject {
-        client.newCall(builder.build()).execute().use { resp ->
+    /**
+     * 按 http → https 顺序连接后台。
+     * - 用户未写协议：首次严格 http → https；成功后记住协议，后续优先用该协议（失败仍回退到全序）
+     * - 用户显式写了 http(s)://：固定用该协议
+     * - 只有 IOException（连不上 / TLS 握手失败 / 超时）才换协议；
+     *   HTTP 4xx/5xx 说明协议已连通，属于业务错误，直接抛出不换协议。
+     */
+    private fun executeWithFallback(builder: Request.Builder): String {
+        val req = builder.build()
+        var lastIo: IOException? = null
+        for (url in schemeVariants(req.url.toString())) {
+            val attempt = req.newBuilder().url(url).build()
+            try {
+                val text = executeOnce(attempt)
+                applyActiveScheme(attempt.url.scheme)
+                return text
+            } catch (e: IOException) {
+                lastIo = e
+                Log.w(TAG, "${attempt.url.scheme} 连接失败，尝试下一个协议: ${e.message}")
+            }
+        }
+        throw lastIo ?: RuntimeException("无法连接服务器 $baseUrl")
+    }
+
+    private fun executeOnce(req: Request): String {
+        client.newCall(req).execute().use { resp ->
             val text = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) {
                 val msg = runCatching { JSONObject(text).optString("error", text) }.getOrDefault(text)
                 throw RuntimeException("HTTP ${resp.code}: $msg")
             }
-            return if (text.isBlank()) JSONObject() else JSONObject(text)
+            return text
         }
     }
 
-    private fun execArray(builder: Request.Builder): JSONArray {
-        client.newCall(builder.build()).execute().use { resp ->
-            val text = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) {
-                val msg = runCatching { JSONObject(text).optString("error", text) }.getOrDefault(text)
-                throw RuntimeException("HTTP ${resp.code}: $msg")
-            }
-            return parseArray(text)
-        }
+    private fun exec(builder: Request.Builder): JSONObject {
+        val text = executeWithFallback(builder)
+        return if (text.isBlank()) JSONObject() else JSONObject(text)
     }
+
+    private fun execArray(builder: Request.Builder): JSONArray = parseArray(executeWithFallback(builder))
 
     private fun parseStatus(v: Any?): Int = when (v) {
         is Int -> v

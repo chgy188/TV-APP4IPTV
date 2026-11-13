@@ -1,0 +1,69 @@
+server {
+    listen 80;
+    server_name _;   # 接受任意域名/IP 访问
+
+    root /var/www/iptv;
+    index index.html;
+
+    # Service Worker 要求同源，确保 sw.js 不被缓存太久
+    location = /sw.js {
+        add_header Cache-Control "no-cache";
+        add_header Service-Worker-Allowed "/";
+    }
+
+    # PWA manifest
+    location = /manifest.webmanifest {
+        add_header Cache-Control "no-cache";
+        add_header Content-Type "application/manifest+json";
+    }
+
+    # API 代理地址配置文件（分离部署核心）
+    location = /config.js {
+        add_header Cache-Control "no-cache";
+    }
+
+    location = /api-base.js {
+        add_header Cache-Control "no-cache";
+    }
+
+    # 静态资源长期缓存（带版本号 v=xxx 的 JS/CSS）
+    location ~* \.(js|css|png|jpg|svg|ico|woff2?)$ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # ===== 新增：API 反代到后端 Worker =====
+    location ^~ /api/ {
+        proxy_pass https://tv.robindev.cc.cd;   # 末尾不带 /，保留 /api/ 路径
+        proxy_ssl_server_name on;               # 必须：向 Cloudflare 发 SNI
+        proxy_ssl_verify off;                   # VPS 根证书链完整可改 on
+        proxy_set_header Host tv.robindev.cc.cd;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;                    # HLS 分片 / 导出 m3u 流式转发
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+
+        # 暴露给外部前端 / App：统一下发 CORS 头
+        proxy_hide_header Access-Control-Allow-Origin;
+        proxy_hide_header Access-Control-Allow-Methods;
+        proxy_hide_header Access-Control-Allow-Headers;
+        add_header Access-Control-Allow-Origin "*" always;
+        add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Authorization, Content-Type, X-Requested-With" always;
+
+        # CORS 预检：直接返回 204，不发往 worker
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin "*" always;
+            add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Authorization, Content-Type, X-Requested-With" always;
+            return 204;
+        }
+    }
+
+    # SPA 回退：所有非文件路径返回 index.html
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

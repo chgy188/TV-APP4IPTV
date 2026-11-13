@@ -20,12 +20,16 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -34,23 +38,29 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import com.example.composedtv.ui.components.ambientGradientBackdrop
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.composedtv.data.remote.ApiClient
 import com.example.composedtv.data.remote.StoredUser
 
 /**
- * 用户选择界面：显示已登录用户、游客、登录入口
+ * 用户选择界面：显示已登录用户、游客、登录入口，以及用户卡下方的服务器配置入口
  *
  * 关键：TvSurface 在触摸模式下不响应 click，手机/触屏设备上点击无反应。
  * 这里改用 Material3 Surface + clickable + 焦点放大，同时兼容 D-pad 和触摸。
@@ -61,7 +71,8 @@ fun UserSelectionScreen(
     onSelectUser: (String) -> Unit,
     onToggleRemember: (String) -> Unit,
     onSelectGuest: () -> Unit,
-    onSelectLogin: () -> Unit
+    onSelectLogin: () -> Unit,
+    onServerChanged: () -> Unit
 ) {
     // 首屏焦点：优先落在第一个已登录用户卡片；没有已登录用户时落在游客卡片，
     // 避免 TV 端打开界面时需要先按方向键才能出现焦点。
@@ -115,45 +126,54 @@ fun UserSelectionScreen(
             )
         }
 
-        // 中部：所有用户（已登录 + 游客 + 登录入口）统一横向滚动排
-        LazyRow(
+        // 中部：用户卡片横排，服务器配置按钮紧贴卡片下方
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .align(Alignment.Center)
-                .padding(horizontal = if (compact) 20.dp else 32.dp),
-            horizontalArrangement = Arrangement.spacedBy(if (compact) 12.dp else 16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            contentPadding = PaddingValues(vertical = if (compact) 4.dp else 8.dp)
+                .align(Alignment.Center),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            itemsIndexed(storedUsers) { index, user ->
-                UserCard(
-                    username = user.username,
-                    rememberPwd = user.rememberPwd,
-                    compact = compact,
-                    modifier = if (index == 0) Modifier.focusRequester(firstUserFocusRequester) else Modifier,
-                    onSelect = { onSelectUser(user.username) },
-                    onToggleRemember = { onToggleRemember(user.username) }
-                )
+            LazyRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = if (compact) 20.dp else 32.dp),
+                horizontalArrangement = Arrangement.spacedBy(if (compact) 12.dp else 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                contentPadding = PaddingValues(vertical = if (compact) 4.dp else 8.dp)
+            ) {
+                itemsIndexed(storedUsers) { index, user ->
+                    UserCard(
+                        username = user.username,
+                        rememberPwd = user.rememberPwd,
+                        compact = compact,
+                        modifier = if (index == 0) Modifier.focusRequester(firstUserFocusRequester) else Modifier,
+                        onSelect = { onSelectUser(user.username) },
+                        onToggleRemember = { onToggleRemember(user.username) }
+                    )
+                }
+                item {
+                    ActionCard(
+                        icon = Icons.Default.PlayArrow,
+                        title = "游客模式",
+                        subtitle = "直接观看默认频道",
+                        compact = compact,
+                        modifier = Modifier.focusRequester(guestFocusRequester),
+                        onClick = onSelectGuest
+                    )
+                }
+                item {
+                    ActionCard(
+                        icon = Icons.Default.Star,
+                        title = "登录 / 注册",
+                        subtitle = "登录后可管理收藏",
+                        compact = compact,
+                        onClick = onSelectLogin
+                    )
+                }
             }
-            item {
-                ActionCard(
-                    icon = Icons.Default.PlayArrow,
-                    title = "游客模式",
-                    subtitle = "直接观看默认频道",
-                    compact = compact,
-                    modifier = Modifier.focusRequester(guestFocusRequester),
-                    onClick = onSelectGuest
-                )
-            }
-            item {
-                ActionCard(
-                    icon = Icons.Default.Star,
-                    title = "登录 / 注册",
-                    subtitle = "登录后可管理收藏",
-                    compact = compact,
-                    onClick = onSelectLogin
-                )
-            }
+
+            Spacer(modifier = Modifier.height(if (compact) 8.dp else 12.dp))
+            ServerConfigSection(compact = compact, onServerChanged = onServerChanged)
         }
 
         // 底部遥控器/键盘操作说明，固定贴底
@@ -173,6 +193,145 @@ fun UserSelectionScreen(
                 "返回" to "退出"
             )
         )
+    }
+}
+
+/**
+ * 服务器配置入口：点击展开文本栏，输入即生效（无保存按钮）。
+ * 合法地址立即写入 ApiClient、重置协议探测（http → https），并通知 VM 刷新会话状态。
+ */
+@Composable
+private fun ServerConfigSection(compact: Boolean, onServerChanged: () -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    var input by remember { mutableStateOf(ApiClient.baseUrl) }
+    var status by remember { mutableStateOf("连接顺序：http → https（自动）") }
+    val fieldFocusRequester = remember { FocusRequester() }
+    val buttonInteraction = remember { MutableInteractionSource() }
+    val buttonFocused by buttonInteraction.collectIsFocusedAsState()
+
+    fun applyNow() {
+        val before = ApiClient.baseUrl
+        if (ApiClient.setBaseUrl(input)) {
+            if (ApiClient.baseUrl != before) onServerChanged()
+            status = "已生效：${ApiClient.baseUrl}（http → https 自动探测）"
+        } else {
+            status = "地址无效，暂未生效"
+        }
+    }
+
+    // 输入短防抖后即刻应用：避免逐字符反复清理会话与磁盘缓存，同时无需「保存」按钮
+    LaunchedEffect(input, expanded) {
+        if (!expanded) return@LaunchedEffect
+        kotlinx.coroutines.delay(250)
+        applyNow()
+    }
+
+    LaunchedEffect(expanded) {
+        if (expanded) {
+            input = ApiClient.baseUrl
+            kotlinx.coroutines.delay(120)
+            runCatching { fieldFocusRequester.requestFocus() }
+        }
+    }
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = if (compact) 20.dp else 32.dp)
+    ) {
+        Surface(
+            modifier = Modifier
+                .widthIn(max = 420.dp)
+                .scale(if (buttonFocused) 1.03f else 1f)
+                .focusable(interactionSource = buttonInteraction)
+                .clickable(
+                    interactionSource = buttonInteraction,
+                    indication = androidx.compose.material.ripple.rememberRipple(),
+                    onClick = {
+                        if (expanded) applyNow()
+                        expanded = !expanded
+                    }
+                ),
+            shape = RoundedCornerShape(8.dp),
+            color = if (buttonFocused) MaterialTheme.colorScheme.primaryContainer
+                    else MaterialTheme.colorScheme.surface,
+            contentColor = if (buttonFocused) MaterialTheme.colorScheme.onPrimaryContainer
+                           else MaterialTheme.colorScheme.onSurface
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = if (compact) 6.dp else 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Settings,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "服务器",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = ApiClient.baseUrl + if (ApiClient.isDefaultBaseUrl) "（缺省）" else "",
+                        fontSize = 13.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Text(
+                    text = if (expanded) "收起" else "更改",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+
+        if (expanded) {
+            Row(
+                modifier = Modifier
+                    .widthIn(max = 520.dp)
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                BasicTextField(
+                    value = input,
+                    onValueChange = { input = it },
+                    modifier = Modifier
+                        .weight(1f)
+                        .focusRequester(fieldFocusRequester),
+                    singleLine = true,
+                    textStyle = TextStyle(
+                        color = MaterialTheme.colorScheme.onSurface,
+                        fontSize = 14.sp
+                    ),
+                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done)
+                )
+                Text(
+                    text = "恢复缺省",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier
+                        .focusable()
+                        .clickable { input = ApiClient.DEFAULT_BASE_URL }
+                        .padding(horizontal = 6.dp, vertical = 4.dp)
+                )
+            }
+            Text(
+                text = status,
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
     }
 }
 

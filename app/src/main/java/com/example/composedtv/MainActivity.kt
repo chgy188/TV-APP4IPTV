@@ -205,7 +205,8 @@ private fun AppContent(
                 onSelectLogin = {
                     vm.prepareLoginWithUsername(null)
                     screen = Screen.Login
-                }
+                },
+                onServerChanged = { vm.onServerChanged() }
             )
         }
 
