@@ -268,7 +268,7 @@ fun PlayerScreen(
     val isVod = externalUri != null || !playerState.isLive
     var vodControlsVisible by remember { mutableStateOf(true) }
     var vodControlsAutoHideKey by remember { mutableStateOf(0) }
-    /** 控制条按钮焦点索引：null=无按钮聚焦，0..5 对应 «10s / ⏸ / 10s» / 列表 / 收藏 / 字幕 */
+    /** 控制条按钮焦点索引：null=无按钮聚焦，0..6 对应 «10s / ⏸ / 10s» / 列表 / 收藏 / 字幕 / 重载 */
     var vodButtonFocusIndex by remember { mutableStateOf<Int?>(null) }
     var vodPosition by remember { mutableStateOf(0L) }
     var vodDuration by remember { mutableStateOf(0L) }
@@ -496,7 +496,7 @@ fun PlayerScreen(
                     !uiState.sidePanelVisible && !uiState.settingsVisible &&
                     isVod && vodControlsVisible && vodButtonFocusIndex != null && event.type == KeyEventType.KeyDown -> {
                         val key = event.key.nativeKeyCode
-                        val btnCount = 6 // «10s / ⏸ / 10s» / 列表 / 收藏 / 字幕
+                        val btnCount = 7 // «10s / ⏸ / 10s» / 列表 / 收藏 / 字幕 / 重载
                         when (key) {
                             KeyEvent.KEYCODE_DPAD_LEFT -> {
                                 vodButtonFocusIndex = ((vodButtonFocusIndex!! - 1) + btnCount) % btnCount
@@ -526,6 +526,9 @@ fun PlayerScreen(
                                     }
                                     4 -> engine.toggleFavorite()
                                     5 -> openSubtitleChooser()
+                                    // 点播没有直播的「右键重载」：控制条提供唯一手动重连入口，
+                                    // 保存当前进度并重起播（再按一次切换到代理优先）
+                                    6 -> engine.manualReload()
                                 }
                                 vodControlsVisible = true
                                 vodControlsAutoHideKey++
@@ -960,6 +963,7 @@ fun PlayerScreen(
                 },
                 onFavorite = { engine.toggleFavorite(); vodControlsAutoHideKey++ },
                 onSubtitle = { openSubtitleChooser() },
+                onReload = { engine.manualReload(); vodControlsAutoHideKey++ },
                 modifier = Modifier.align(Alignment.BottomCenter)
             )
         }
@@ -1318,6 +1322,7 @@ private fun VodControlBar(
     onOpenPlaylist: () -> Unit,
     onFavorite: () -> Unit,
     onSubtitle: () -> Unit,
+    onReload: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -1364,6 +1369,7 @@ private fun VodControlBar(
             Text("/", color = Color(0x66FFFFFF), fontSize = 12.sp)
             Text(formatTime(durationMs), color = Color(0xCCFFFFFF), fontSize = 12.sp)
             CtlFocusButton("字幕", isFocused = focusedIndex == 5) { onSubtitle() }
+            CtlFocusButton("重载", isFocused = focusedIndex == 6) { onReload() }
             Spacer(Modifier.fillMaxWidth())
         }
     }

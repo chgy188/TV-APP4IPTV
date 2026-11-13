@@ -492,11 +492,15 @@ class PlayerEngine(private val context: Context) {
     private var attemptStartedAt = 0L
     /** 连续"实际速率为 0 且仍在加载"的秒数，超阈值判停滞并切下一候选 */
     private var stallSeconds = 0
-    /** 停滞看门狗阈值(秒)：加载中且真实速率持续为 0 超过该值即切下一候选（解决点播直连无限卡住） */
+    /** 停滞看门狗阈值(秒)：仅对直播生效；点播不因「暂无数据」判失败 */
     private val STALL_FAIL_SEC = 12
+    /** 本轮起播出现的明确错误（onPlayerError 的错误码 + 中文含义）；超时 / 无数据不算不可达 */
+    private var lastPlayerErrorMessage: String? = null
+    /** 点播「仍在缓冲」提示只弹一次，避免反复打扰 */
+    private var softWaitHintShown = false
     /** 直连候选的起播超时：超时即切换下一个（连接类错误会立即切换，不走这里）。
      *  默认 20s（设置里的最长可选项）：弱网 / 慢源也能稳定起播，不被过早切走；
-     *  点播场景直连不设时限（见 [startAttemptTimeout]），此处仅用于直播直连。
+     *  点播（直连 / 代理）都不设时限（见 [startAttemptTimeout]），此处仅用于直播直连。
      *  可由设置抽屉注入（applyPlaybackSettings），默认 [DEFAULT_DIRECT_TIMEOUT_MS] */
     var directTimeoutMs = DEFAULT_DIRECT_TIMEOUT_MS
     /** 代理候选专属起播超时：代理路径多一跳、握手更慢，给更长容忍，避免被误判为不可播。
@@ -762,6 +766,21 @@ class PlayerEngine(private val context: Context) {
             }
             Log.d(TAG, "refineLiveFromPlayer: $rawUrl -> isLive=$finalLive (exoLive=$exoLive)")
         }
+    }
+
+    /**
+     * 起播缓冲阶段的「其实这是点播」判定。
+     * URL 启发式会把含 #EXT-X-ENDLIST 的点播型 m3u8 初判为直播，但播放器解析出
+     * 有限时长且非 live 后即可确认是点播，从而同样不设超时、不因缓冲慢报错。
+     */
+    private fun isCurrentlyVodLike(): Boolean {
+        if (!isLiveStream) return true
+        val p = player ?: return false
+        val u = currentPlayingUrl.lowercase()
+        val hlsLike = u.contains(".m3u8") || u.contains(".m3u") || u.contains(".ts") || u.contains(".flv")
+        if (!hlsLike) return false
+        val d = p.duration
+        return d != C.TIME_UNSET && d > 0 && !p.isCurrentMediaItemLive()
     }
 
     /** 当前播放位置（ms）；直播返回 0 */
@@ -1188,6 +1207,9 @@ class PlayerEngine(private val context: Context) {
                 if (player === p) {
                     _firstFrameRendered.value = true
                     finishBufferSampling()
+                    // 真正出画即代表起播成功：无条件撤掉任何残留的失败提示，
+                    // 避免「错误提示后画面开始播放、提示却一直不消失」。
+                    updateState(isLoading = false, isPlaying = true, error = null)
                 }
             }
 
@@ -1271,6 +1293,8 @@ class PlayerEngine(private val context: Context) {
     private fun startRace(url: String, attempts: List<String>) {
         raceActive = true
         raceDecided = false
+        lastPlayerErrorMessage = null
+        softWaitHintShown = false
         // 防御性释放：任何残留的候选或上一频道 player（仅存 _playerRef）都先释放，
         // 杜绝切台/重载时旧 ExoPlayer + 缓冲未回收导致的内存泄漏
         for (c in raceCandidates) safeRelease(c.exo)
@@ -1284,16 +1308,39 @@ class PlayerEngine(private val context: Context) {
         tryNextAttempt(url)
     }
 
-    /** 尝试 [currentAttempts] 中的下一个；全部用尽则走 [handlePlayFailure]（切台） */
-    private fun tryNextAttempt(url: String) {
+    /**
+     * 尝试 [currentAttempts] 中的下一个。
+     * @param hardError 是否来自明确错误（onPlayerError / 播放器构造失败）；超时与「暂无数据」属于软失败。
+     * 候选用尽时：点播的软失败不算失败，保留仍在缓冲的 player 继续等待；只有明确错误才提示错误。
+     */
+    private fun tryNextAttempt(url: String, hardError: Boolean = false) {
         val nextIndex = currentAttemptIndex + 1
         if (nextIndex >= currentAttempts.size) {
+            stopAttemptTimeout()
+            updateState(loadMode = null, loadTimeoutMs = 0, loadRemainMs = 0)
+            // 已经出画 / 播放就绪：忽略迟到的超时或看门狗回调，并清掉残留的错误提示
+            if (_firstFrameRendered.value || player?.playbackState == Player.STATE_READY) {
+                updateState(isLoading = false, isPlaying = true, error = null)
+                return
+            }
+            // 点播缓冲慢 ≠ 不可达。不置 raceDecided、不释放 player，让它随后 READY 时
+            // 照常走 onRaceWin；否则会出现「画面已出、错误提示却永远不消失」。
+            if (isCurrentlyVodLike() && !hardError) {
+                raceActive = false
+                connStatsJob?.cancel()
+                connStatsJob = null
+                updateState(isLoading = true, error = null)
+                if (!softWaitHintShown) {
+                    softWaitHintShown = true
+                    showHint("缓冲较慢，仍在加载中")
+                }
+                Log.w(TAG, "点播候选用尽但无明确错误，继续等待出画: $url")
+                return
+            }
             Log.w(TAG, "串行起播：所有尝试均失败，走失败处理 url=$url")
             raceActive = false
             raceDecided = true
-            stopAttemptTimeout()
-            updateState(loadMode = null, loadTimeoutMs = 0, loadRemainMs = 0)
-            handlePlayFailure()
+            handlePlayFailure(hardError = hardError || lastPlayerErrorMessage != null)
             return
         }
         // 递增 token：使上一个尝试的 listener 立即失效，避免已释放 player 的回调串扰
@@ -1342,7 +1389,8 @@ class PlayerEngine(private val context: Context) {
             )
             raceCandidates = emptyList()
             setPlayerRef(null)
-            tryNextAttempt(url)
+            lastPlayerErrorMessage = "播放器创建失败：${t.javaClass.simpleName}"
+            tryNextAttempt(url, hardError = true)
             return
         }
         setPlayerRef(cand.exo)
@@ -1351,15 +1399,13 @@ class PlayerEngine(private val context: Context) {
         startAttemptTimeout(url, myToken)
     }
 
-    /** 单个尝试的起播超时：超过阈值仍未 READY → 切换下一个尝试；代理候选用更长超时 */
+    /** 单个尝试的起播超时（仅直播）：超过阈值仍未 READY → 切换下一个尝试；代理候选用更长超时 */
     private fun startAttemptTimeout(url: String, token: Int) {
         val attempt = currentAttempts.getOrNull(currentAttemptIndex) ?: return
-        // 点播直连不设时限：不启动超时协程，直至出画或连接类错误（不会因超时被切走）
-        val timeout = when {
-            attempt == "proxy" -> proxyTimeoutMs
-            isLiveStream -> directTimeoutMs
-            else -> return
-        }
+        // 点播的直连与代理都不设时间阈值：慢缓冲只继续等待，直至真正出画或
+        // onPlayerError 明确报错，绝不因「等得久」被切走 / 误报无法播放。
+        if (!isLiveStream) return
+        val timeout = if (attempt == "proxy") proxyTimeoutMs else directTimeoutMs
         attemptTimeoutJob?.cancel()
         attemptTimeoutJob = scope.launch {
             // 每秒刷新剩余时间供 UI 倒计时；倒计时归零即切换下一个候选。
@@ -1373,6 +1419,13 @@ class PlayerEngine(private val context: Context) {
                 remainMs -= step
             }
             if (token != racePlayToken || raceDecided) return@launch
+            // 到期时若已解析出「有限时长且非 live」，说明是点播型 HLS：慢缓冲不算失败，
+            // 取消时限继续等出画（点播从不因等得久被切走 / 报错）。
+            if (isCurrentlyVodLike()) {
+                Log.d(TAG, "点播型 HLS 缓冲较慢，取消时限继续等待: $url")
+                updateState(loadTimeoutMs = 0, loadRemainMs = 0)
+                return@launch
+            }
             Log.w(TAG, "串行尝试超时(${timeout}ms)未起播，切换下一个: $attempt")
             tryNextAttempt(url)
         }
@@ -1380,8 +1433,8 @@ class PlayerEngine(private val context: Context) {
 
     /**
      * 真实速率/已下载采样：每秒采样一次，把真实下载速率与累计字节写入状态供 UI 展示；
-     * 并内置停滞看门狗——加载中且真实速率持续为 0（排除前 4s 连接建立宽限期）超过阈值，
-     * 判定连接已停滞（无数据），自动切到下一个候选（点播直连无超时，靠它避免无限卡住）。
+     * 并内置停滞看门狗——加载中且真实速率持续为 0（排除前 4s 连接建立宽限期）超过阈值时，
+     * 仅对直播切到下一个候选；点播「暂无数据」可能只是慢 / 握手 / 解析容器，不算失败，只记日志。
      */
     private fun startConnStatsSampler() {
         connStatsJob?.cancel()
@@ -1403,10 +1456,15 @@ class PlayerEngine(private val context: Context) {
                 if (loadingNow && kbps <= 0 && elapsed > 4_000L) {
                     stallSeconds++
                     if (stallSeconds >= STALL_FAIL_SEC) {
-                        Log.w(TAG, "连接停滞看门狗：加载中长时间无数据传输，切下一候选 url=${_state.value.currentLoadUrl}")
                         stallSeconds = 0
-                        tryNextAttempt(currentPlayingUrl)
-                        break
+                        if (isCurrentlyVodLike()) {
+                            // 点播：没数据可能只是慢 / 握手 / 解析容器，不是不可达，不切候选也不报错
+                            Log.d(TAG, "点播缓冲暂无数据传输，继续等待: $currentPlayingUrl")
+                        } else {
+                            Log.w(TAG, "连接停滞看门狗：加载中长时间无数据传输，切下一候选 url=${_state.value.currentLoadUrl}")
+                            tryNextAttempt(currentPlayingUrl)
+                            break
+                        }
                     }
                 } else {
                     stallSeconds = 0
@@ -1471,9 +1529,11 @@ class PlayerEngine(private val context: Context) {
                 }
                 Log.e(TAG, "${cand.attempt} onPlayerError: ${error.errorCodeName} url=$url", error)
                 DebugDiagnostics.onError("race/${cand.attempt}", error)
+                // 明确错误：记录原因，只有这类失败才允许最终提示「无法播放」
+                lastPlayerErrorMessage = "${error.errorCodeName} ${playbackErrorMeaning(error)}"
                 // 串行：当前尝试失败 → 立即切换下一个（连接类错误无需等待超时）
                 stopAttemptTimeout()
-                tryNextAttempt(url)
+                tryNextAttempt(url, hardError = true)
             }
         })
     }
@@ -1532,6 +1592,8 @@ class PlayerEngine(private val context: Context) {
             if (currentPlayingUrl == fallbackUrl && !_firstFrameRendered.value) {
                 _firstFrameRendered.value = true
                 finishBufferSampling()
+                // 纯音频 / 不回调首帧的设备：起播已成功，同样清掉残留错误
+                updateState(error = null, isLoading = false)
             }
         }
         Log.d(TAG, "起播成功: ${winner.attempt}")
@@ -1818,6 +1880,8 @@ class PlayerEngine(private val context: Context) {
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                // 已被切台 / 重载取代的旧 player 的迟到错误，不得污染当前播放状态
+                if (_playerRef.value !== exo) return
                 val cause = error.cause
                 if (cause is androidx.media3.exoplayer.source.BehindLiveWindowException) {
                     // 直播滑出窗口：自动恢复（带节流/升级，避免弱网高清频道"频繁解码器重启"死循环）
@@ -1876,27 +1940,56 @@ class PlayerEngine(private val context: Context) {
         currentAttemptIndex = -1
     }
 
-    private fun handlePlayFailure() {
+    /**
+     * 候选用尽后的失败处理。
+     * @param hardError 是否确有明确不可达错误；点播的软失败（只是缓冲慢）保持加载态，不报错。
+     */
+    private fun handlePlayFailure(hardError: Boolean = true) {
         stopAttemptTimeout()
+        // 画面已出 / 播放就绪：忽略迟到的失败回调，并清掉任何残留的错误提示
+        if (_firstFrameRendered.value || player?.playbackState == Player.STATE_READY) {
+            updateState(isLoading = false, isPlaying = true, error = null)
+            return
+        }
         if (playlist.isEmpty()) {
             updateState(error = "无法播放", isLoading = false)
             return
         }
         // 点播（VOD）不自动切台：直播源常抖动/缺失，候选用尽后切下一台是合理的容错；
         // 但点播是具体节目，自动切到列表下一个会"偷偷换片"，应直接报错交用户手动处理（换源/重载）。
-        if (!isLiveStream) {
-            Log.w(TAG, "点播播放失败，不自动切台: $currentPlayingUrl")
-            updateState(error = "点播播放失败：${currentPlayingUrl}", isLoading = false, isPlaying = false)
+        if (isCurrentlyVodLike()) {
+            if (!hardError) {
+                // 缓冲慢不等于不可达：不提示错误，继续等当前 player 出画
+                Log.w(TAG, "点播缓冲较慢，不提示错误，继续等待: $currentPlayingUrl")
+                updateState(isLoading = true, error = null)
+                return
+            }
+            Log.w(TAG, "点播明确播放失败，不自动切台: $currentPlayingUrl")
+            // 释放仍在缓冲的候选，避免「报错后画面又出来」却没有监听器接管
+            releasePendingCandidates()
+            updateState(
+                error = "点播无法播放：${lastPlayerErrorMessage ?: "连接失败"}",
+                isLoading = false,
+                isPlaying = false
+            )
             return
         }
         // 直播：所有候选（直连/代理）串行用尽即切下一台；FLV 重试与 legacy 代理补试已并入串行链路，
         // 不再单独处理。
         consecutiveErrors++
         if (consecutiveErrors >= playlist.size) {
+            releasePendingCandidates()
             updateState(error = "所有频道均无法播放", isLoading = false, isPlaying = false)
             return
         }
         playNext()
+    }
+
+    /** 释放候选用尽后仍在缓冲的 player，防止无人接管的「野画面」 */
+    private fun releasePendingCandidates() {
+        for (c in raceCandidates) safeRelease(c.exo)
+        raceCandidates = emptyList()
+        setPlayerRef(null)
     }
 
 
